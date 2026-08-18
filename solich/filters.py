@@ -8,10 +8,13 @@ import django_filters
 from django import forms
 from django.core.paginator import Page, Paginator
 from django.db import models
+from django.db.models import Value
+from django.db.models.functions import Coalesce, Concat
+from django.utils.translation import gettext_lazy as _
 from django_filters.filterset import FILTER_FOR_DBFIELD_DEFAULTS
 
 from base.methods import reload_queryset
-from .solich_middlewares import _thread_locals
+from solich.solich_middlewares import _thread_locals
 from solich_views.templatetags.generic_template_filters import getattribute
 
 FILTER_FOR_DBFIELD_DEFAULTS[models.ForeignKey][
@@ -23,23 +26,20 @@ def filter_by_name(queryset, name, value):
     """
     Filter queryset by first name or last name.
     """
-    # Split the search value into first name and last name
-    parts = value.split()
-    first_name = parts[0]
-    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+    qs = queryset
+    value = " ".join(value.split())
 
-    # Filter the queryset by first name and last name
-    if first_name and last_name:
-        queryset = queryset.filter(
-            employee_id__employee_first_name__icontains=first_name,
-            employee_id__employee_last_name__icontains=last_name,
+    queryset = queryset.annotate(
+        full_name=Concat(
+            Coalesce("employee_id__employee_first_name", Value("")),
+            Value(" "),
+            Coalesce("employee_id__employee_last_name", Value("")),
         )
-    elif first_name:
-        queryset = queryset.filter(
-            employee_id__employee_first_name__icontains=first_name
-        )
-    elif last_name:
-        queryset = queryset.filter(employee_id__employee_last_name__icontains=last_name)
+    )
+
+    queryset = queryset.filter(full_name__icontains=value)
+
+    queryset = (queryset | qs.filter(employee_id__badge_id__icontains=value)).distinct()
 
     return queryset
 
@@ -47,37 +47,94 @@ def filter_by_name(queryset, name, value):
 class FilterSet(django_filters.FilterSet):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
         reload_queryset(self.form.fields)
+
+        default_input_class = "oh-input w-100"
+        select_class = "oh-select oh-select-2"
+        checkbox_class = "oh-switch__checkbox"
+
         for field_name, field in self.form.fields.items():
-            filter_widget = self.filters[field_name]
-            widget = filter_widget.field.widget
-            if isinstance(
-                widget, (forms.NumberInput, forms.EmailInput, forms.TextInput)
-            ):
-                field.widget.attrs.update({"class": "oh-input w-100"})
-            elif isinstance(widget, (forms.Select,)):
-                field.widget.attrs.update(
+            widget = field.widget
+            label = _(field.label) if field.label else ""
+
+            # Date field
+            if isinstance(widget, forms.DateInput):
+                widget.input_type = "date"
+                widget.format = "%Y-%m-%d"
+                field.input_formats = ["%Y-%m-%d"]
+
+                existing_class = widget.attrs.get("class", default_input_class)
+                widget.attrs.update(
                     {
-                        "class": "oh-select oh-select-2 select2-hidden-accessible",
-                        "id": uuid.uuid4(),
+                        "class": f"{existing_class} form-control",
+                        "placeholder": label,
                     }
                 )
-            elif isinstance(widget, (forms.Textarea)):
-                field.widget.attrs.update({"class": "oh-input w-100"})
+
+            # Time field
+            elif isinstance(widget, forms.TimeInput):
+                widget.input_type = "time"
+                widget.format = "%H:%M"
+                field.input_formats = ["%H:%M"]
+
+                existing_class = widget.attrs.get("class", default_input_class)
+                widget.attrs.update(
+                    {
+                        "class": f"{existing_class} form-control",
+                        "placeholder": label,
+                    }
+                )
+
+            # Number, Email, Text, File, URL fields
             elif isinstance(
                 widget,
                 (
-                    forms.CheckboxInput,
-                    forms.CheckboxSelectMultiple,
+                    forms.NumberInput,
+                    forms.EmailInput,
+                    forms.TextInput,
+                    forms.FileInput,
+                    forms.URLInput,
                 ),
             ):
-                field.widget.attrs.update({"class": "oh-switch__checkbox"})
-            elif isinstance(widget, (forms.ModelChoiceField)):
-                field.widget.attrs.update(
+                existing_class = widget.attrs.get("class", default_input_class)
+                widget.attrs.update(
                     {
-                        "class": "oh-select oh-select-2 select2-hidden-accessible",
+                        "class": f"{existing_class} form-control",
+                        "placeholder": _(field.label.title()) if field.label else "",
                     }
                 )
+
+            # Select fields
+            elif isinstance(widget, forms.Select):
+                if not isinstance(field, forms.ModelMultipleChoiceField):
+                    field.empty_label = _("---Choose {label}---").format(label=label)
+                existing_class = widget.attrs.get("class", select_class)
+                widget.attrs.update(
+                    {
+                        "class": existing_class,
+                        "id": str(uuid.uuid4()),
+                    }
+                )
+
+            # Textarea
+            elif isinstance(widget, forms.Textarea):
+                existing_class = widget.attrs.get("class", default_input_class)
+                widget.attrs.update(
+                    {
+                        "class": f"{existing_class} form-control",
+                        "placeholder": label,
+                        "rows": 2,
+                        "cols": 40,
+                    }
+                )
+
+            # Checkbox types
+            elif isinstance(
+                widget, (forms.CheckboxInput, forms.CheckboxSelectMultiple)
+            ):
+                existing_class = widget.attrs.get("class", checkbox_class)
+                widget.attrs.update({"class": existing_class})
 
 
 class SolichPaginator(Paginator):
@@ -106,8 +163,13 @@ class SolichFilterSet(FilterSet):
     SolichFilterSet
     """
 
+    verbose_name: dict = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        for key, value in self.verbose_name.items():
+            self.form.fields[key].label = value
+
         request = getattr(_thread_locals, "request", None)
         if request:
             setattr(request, "is_filtering", True)
@@ -127,4 +189,3 @@ class SolichFilterSet(FilterSet):
 
         ids = list(filter(None, map(_icontains, queryset)))
         return queryset.filter(id__in=ids)
-

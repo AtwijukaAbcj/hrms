@@ -16,4 +16,3 @@ def paginator_qry(qryset, page_number):
     paginator = Paginator(qryset, get_pagination())
     qryset = paginator.get_page(page_number)
     return qryset
-

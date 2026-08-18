@@ -57,8 +57,10 @@ coverage.xml
 # Django stuff:
 *.log
 local_settings.py
-db.sqlite3
-db.sqlite3-journal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Flask stuff:
 instance/
@@ -130,9 +132,9 @@ dmypy.json
 *.pyc
 
 # migration files
-**/migrations/**
-!**/migrations
-!**/migrations/__init__.py
+#**/migrations/**
+#!**/migrations
+#!**/migrations/__init__.py
 
 # media file
 media/
@@ -148,8 +150,16 @@ whoosh_index/
 
 #VSCode
 .vscode/
-TestDB_Solich.sqlite3
-.env
-__pycache__/
-*.pyc
-staticfiles/
+
+#PyCharm
+.idea/
+
+#macOS
+.DS_Store
+
+# Claude Code (never commit AI tooling configs to public repo)
+.claude/
+CLAUDE.md
+.mcp.json
+.mcp.safe.json
+.claudeignore

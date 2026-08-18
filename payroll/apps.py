@@ -3,6 +3,7 @@ App configuration for the 'payroll' app.
 """
 
 from django.apps import AppConfig
+from django.conf import settings
 from django.db.models.signals import post_migrate
 
 
@@ -16,14 +17,13 @@ class PayrollConfig(AppConfig):
 
     def ready(self) -> None:
         ready = super().ready()
-        try:
-            from payroll.scheduler import auto_payslip_generate
+        from django.urls import include, path
 
-            auto_payslip_generate()
-        except:
-            """
-            Migrations are not affected
-            """
+        from solich.urls import urlpatterns
+        from payroll import scheduler, signals
 
+        settings.APPS.append("payroll")
+        urlpatterns.append(
+            path("payroll/", include("payroll.urls.urls")),
+        )
         return ready
-

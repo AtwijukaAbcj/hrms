@@ -5,17 +5,45 @@ This page is used to register filter for recruitment models
 
 """
 
+import ast
 import uuid
 
 import django_filters
 from django import forms
+from django.db.models import Q
+from django.utils.translation import gettext_lazy as _
+
+
+def _filter_has_referral(qs, name, value):
+    if value:
+        return qs.filter(referral__isnull=False)
+    return qs.filter(referral__isnull=True)
+
+
+def _filter_source_not_set(qs, name, value):
+    if value:
+        return qs.filter(Q(source__isnull=True) | Q(source=""), referral__isnull=True)
+    return qs
+
+
+def _filter_recruitment_by_obj_id(qs, name, value):
+    try:
+        return qs.filter(id=int(value))
+    except (ValueError, TypeError):
+        return qs
+
 
 from base.filters import FilterSet
+from solich.filters import SolichFilterSet, filter_by_name
 from recruitment.models import (
     Candidate,
     InterviewSchedule,
+    LinkedInAccount,
     Recruitment,
     RecruitmentSurvey,
+    RecruitmentSurveyAnswer,
+    RejectReason,
+    Skill,
     SkillZone,
     SkillZoneCandidate,
     Stage,
@@ -25,7 +53,7 @@ from recruitment.models import (
 # from django.forms.widgets import Boo
 
 
-class CandidateFilter(FilterSet):
+class CandidateFilter(SolichFilterSet):
     """
     Filter set class for Candidate model
 
@@ -34,7 +62,25 @@ class CandidateFilter(FilterSet):
     """
 
     name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
-    # for pipeline use
+    search = django_filters.CharFilter(method="search_by_name", lookup_expr="icontains")
+    has_referral = django_filters.BooleanFilter(
+        method=_filter_has_referral,
+        widget=django_filters.widgets.BooleanWidget(),
+    )
+    source_not_set = django_filters.BooleanFilter(
+        method=_filter_source_not_set,
+        widget=django_filters.widgets.BooleanWidget(),
+    )
+
+    # start_onboard = django_filters.CharFilter(
+    #     method="start_onboard_method", lookup_expr="icontains"
+    # )
+
+    candidate = django_filters.ModelMultipleChoiceFilter(
+        queryset=Candidate.objects.all(),
+        field_name="name",
+    )
+
     candidate_name = django_filters.CharFilter(
         method="pipeline_search", lookup_expr="icontains"
     )
@@ -67,6 +113,30 @@ class CandidateFilter(FilterSet):
     )
     schedule_date = django_filters.DateFilter(
         field_name="schedule_date",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    hired_date = django_filters.DateFilter(
+        field_name="hired_date",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    joining_date_from = django_filters.DateFilter(
+        field_name="joining_date",
+        lookup_expr="gte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    joining_date_till = django_filters.DateFilter(
+        field_name="joining_date",
+        lookup_expr="lte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    onboarding_end_date_from = django_filters.DateFilter(
+        field_name="onboarding_stage__onboarding_end_date",
+        lookup_expr="gte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    onboarding_end_date_till = django_filters.DateFilter(
+        field_name="onboarding_stage__onboarding_end_date",
+        lookup_expr="lte",
         widget=forms.DateInput(attrs={"type": "date"}),
     )
     interview_date = django_filters.DateFilter(
@@ -104,6 +174,17 @@ class CandidateFilter(FilterSet):
         ).distinct()
         return queryset
 
+    def search_by_name(self, queryset, _, value):
+        """
+        search by name method
+        """
+        queryset = (
+            queryset.filter(name__icontains=value)
+            | queryset.filter(stage_id__stage__icontains=value)
+            | queryset.filter(stage_id__recruitment_id__title__icontains=value)
+        )
+        return queryset.distinct()
+
     class Meta:
         """
         Meta class to add the additional info
@@ -125,6 +206,7 @@ class CandidateFilter(FilterSet):
             "gender",
             "start_onboard",
             "hired",
+            "converted",
             "canceled",
             "is_active",
             "recruitment_id__company_id",
@@ -144,13 +226,111 @@ class CandidateFilter(FilterSet):
             "offer_letter_status",
             "candidate_rating__rating",
             "candidate_interview__employee_id",
+            "source",
         ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.form.fields["is_active"].initial = True
-        for field in self.form.fields.keys():
-            self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
+
+        form_fields = self.form.fields
+        form_fields["is_active"].initial = True
+
+        for field in form_fields:
+            form_fields[field].widget.attrs["id"] = str(uuid.uuid4())
+
+        self._update_field_labels(form_fields)
+        choices = []
+        try:
+            survey_answers = RecruitmentSurveyAnswer.objects.all()
+            for survey in survey_answers:
+                candidate = survey.candidate_id
+                answer_json = survey.answer_json
+
+                # Parse JSON if stored as string
+                if isinstance(answer_json, str):
+                    try:
+                        answer_json = ast.literal_eval(answer_json)
+                    except Exception:
+                        continue
+
+                # Extract questions & answers
+                for question, answer_list in answer_json.items():
+                    if question == "csrfmiddlewaretoken":
+                        continue
+
+                    answer = (
+                        ", ".join(answer_list)
+                        if isinstance(answer_list, list)
+                        else str(answer_list)
+                    )
+
+                    choices.append(
+                        (
+                            candidate.pk,
+                            f"Q: {question} || Ans: {answer} || {candidate.get_full_name()}",
+                        )
+                    )
+        except:
+            pass
+
+        # Add filter dynamically
+        survey_answer_by = django_filters.MultipleChoiceFilter(
+            choices=choices,
+            field_name="recruitmentsurveyanswer__candidate_id",
+            label=_("Survey Answer By"),
+        )
+        self.filters["survey_answer_by"] = survey_answer_by
+        self.form.fields["survey_answer_by"] = survey_answer_by.field
+        self.form.fields["survey_answer_by"].widget.attrs.update(
+            {
+                "data-placeholder": _("Select survey answers..."),
+                "class": "survey-select w-100",
+                "style": "width:100% !important;",
+            }
+        )
+
+    def _update_field_labels(self, form_fields):
+        """Helper method to update field labels from model verbose names"""
+
+        models = {
+            "recruitment": Recruitment(),
+            "interview": InterviewSchedule(),
+            "skill_zone": SkillZoneCandidate(),
+        }
+
+        interview_date_label = (
+            models["interview"]._meta.get_field("interview_date").verbose_name
+        )
+
+        field_label_map = {
+            "interview_date": interview_date_label,
+            "scheduled_from": f"{interview_date_label} From",
+            "scheduled_till": f"{interview_date_label} Till",
+            "rejected_candidate__reject_reason_id": _("Rejection Reason"),
+            "job_position_id__department_id": _("Department"),
+            "stage_id__stage_type": _("Stage Type"),
+            "stage_id__stage_managers": _("Stage Managers"),
+            "skillzonecandidate_set__skill_zone_id": models["skill_zone"]
+            ._meta.get_field("skill_zone_id")
+            .verbose_name,
+            "start_date": models["recruitment"]
+            ._meta.get_field("start_date")
+            .verbose_name,
+            "end_date": models["recruitment"]._meta.get_field("end_date").verbose_name,
+            "recruitment_id__company_id": models["recruitment"]
+            ._meta.get_field("company_id")
+            .verbose_name,
+            "recruitment_id__closed": models["recruitment"]
+            ._meta.get_field("closed")
+            .verbose_name,
+            "recruitment_id__recruitment_managers": models["recruitment"]
+            ._meta.get_field("recruitment_managers")
+            .verbose_name,
+        }
+
+        for field_name, label in field_label_map.items():
+            if field_name in form_fields:
+                form_fields[field_name].label = label
 
     def filter_mail_sent(self, queryset, name, value):
         return queryset.filter(onboarding_portal__isnull=(not value))
@@ -166,7 +346,7 @@ BOOLEAN_CHOICES = (
 )
 
 
-class RecruitmentFilter(FilterSet):
+class RecruitmentFilter(SolichFilterSet):
     """
     Filter set class for Recruitment model
 
@@ -181,12 +361,6 @@ class RecruitmentFilter(FilterSet):
         field_name="title", method="onboarding_search"
     )
     description = django_filters.CharFilter(lookup_expr="icontains")
-    start_date = django_filters.DateFilter(
-        field_name="start_date", widget=forms.DateInput(attrs={"type": "date"})
-    )
-    end_date = django_filters.DateFilter(
-        field_name="end_date", widget=forms.DateInput(attrs={"type": "date"})
-    )
     start_from = django_filters.DateFilter(
         field_name="start_date",
         lookup_expr="gte",
@@ -204,6 +378,7 @@ class RecruitmentFilter(FilterSet):
             (False, "No"),
         ]
     )
+    obj_id = django_filters.CharFilter(method=_filter_recruitment_by_obj_id)
 
     class Meta:
         """
@@ -216,13 +391,19 @@ class RecruitmentFilter(FilterSet):
             "company_id",
             "title",
             "is_event_based",
-            "start_date",
-            "end_date",
             "closed",
             "is_active",
             "is_published",
             "job_position_id",
+            "open_positions",
         ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        start_date_verbose = self.Meta.model._meta.get_field("start_date").verbose_name
+        end_date_verbose = self.Meta.model._meta.get_field("end_date").verbose_name
+        self.form.fields["start_from"].label = f"{start_date_verbose} From"
+        self.form.fields["end_till"].label = f"{end_date_verbose} Till"
 
     def filter_by_name(self, queryset, _, value):
         """
@@ -233,9 +414,12 @@ class RecruitmentFilter(FilterSet):
         first_name = parts[0]
         last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-        job_queryset = queryset.filter(
-            open_positions__job_position__icontains=value
-        ) | queryset.filter(title__icontains=value)
+        job_queryset = (
+            queryset.filter(open_positions__job_position__icontains=value)
+            | queryset.filter(title__icontains=value)
+            | queryset.filter(stage_set__stage__icontains=value)
+            | queryset.filter(stage_set__candidate__name__icontains=value)
+        )
         if first_name and last_name:
             queryset = queryset.filter(
                 recruitment_managers__employee_first_name__icontains=first_name,
@@ -278,7 +462,37 @@ class RecruitmentFilter(FilterSet):
         return queryset.distinct()
 
 
-class StageFilter(FilterSet):
+class SkillsFilter(FilterSet):
+
+    search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+
+    class Meta:
+        model = Skill
+        fields = [
+            "title",
+        ]
+
+
+class RejectReasonFilter(FilterSet):
+
+    search = django_filters.CharFilter(method="filter_search")
+
+    class Meta:
+        model = RejectReason
+        fields = [
+            "title",
+        ]
+
+    def filter_search(self, queryset, _, value):
+        value = (value or "").strip()
+        if not value:
+            return queryset
+        return queryset.filter(
+            Q(title__icontains=value) | Q(description__icontains=value)
+        )
+
+
+class StageFilter(SolichFilterSet):
     """
     Filter set class for Stage model
 
@@ -307,31 +521,32 @@ class StageFilter(FilterSet):
 
     def filter_by_name(self, queryset, _, value):
         """
-        Filter queryset by first name or last name.
+        Filter queryset by stage title, recruitment title, managers, or candidates.
         """
-        # Split the search value into first name and last name
+        from django.db.models import Q
+
+        value = (value or "").strip()
+        if not value:
+            return queryset
+
         parts = value.split()
         first_name = parts[0]
         last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-        recruitment_query = queryset.filter(recruitment_id__title__icontains=value)
-        # Filter the queryset by first name and last name
-        stage_queryset = queryset.filter(stage__icontains=value)
+
+        query = (
+            Q(stage__icontains=value)
+            | Q(recruitment_id__title__icontains=value)
+            | Q(candidate__name__icontains=value)
+        )
         if first_name and last_name:
-            queryset = queryset.filter(
+            query |= Q(
                 stage_managers__employee_first_name__icontains=first_name,
                 stage_managers__employee_last_name__icontains=last_name,
             )
         elif first_name:
-            queryset = queryset.filter(
-                stage_managers__employee_first_name__icontains=first_name
-            )
-        elif last_name:
-            queryset = queryset.filter(
-                stage_managers__employee_last_name__icontains=last_name
-            )
+            query |= Q(stage_managers__employee_first_name__icontains=first_name)
 
-        queryset = queryset | stage_queryset | recruitment_query
-        return queryset
+        return queryset.filter(query).distinct()
 
     def pipeline_search(self, queryset, _, value):
         """
@@ -345,7 +560,7 @@ class StageFilter(FilterSet):
         return queryset.distinct()
 
 
-class SurveyFilter(FilterSet):
+class SurveyFilter(SolichFilterSet):
     """
     SurveyFIlter
     """
@@ -405,8 +620,8 @@ class CandidateReGroup:
         ("joining_date", "Date Joining"),
         ("probation_end", "Probation End"),
         ("offer_letter_status", "Offer Letter Status"),
-        ("rejected_candidate__reject_reason_id", "Reject Reason"),
-        ("skillzonecandidate_set__skill_zone_id", "Skill Zone"),
+        ("rejected_candidate__reject_reason_id", "Rejection Reason"),
+        ("skillzonecandidate_set__skill_zone_id", "Talent Pool"),
     ]
 
 
@@ -432,7 +647,7 @@ class SkillZoneFilter(FilterSet):
         ]
 
 
-class SkillZoneCandFilter(FilterSet):
+class SkillZoneCandFilter(SolichFilterSet):
     """
     Skillzone Candidate FIlter
     """
@@ -452,6 +667,7 @@ class SkillZoneCandFilter(FilterSet):
         field_name="candidate__id__joining_date",
         lookup_expr="gte",
         widget=forms.DateInput(attrs={"type": "date"}),
+        label=_("Joining From"),
     )
     probation_end = django_filters.DateFilter(
         field_name="candidate__id__probation_end",
@@ -461,11 +677,13 @@ class SkillZoneCandFilter(FilterSet):
         field_name="candidate__id__probation_end",
         lookup_expr="lte",
         widget=forms.DateInput(attrs={"type": "date"}),
+        label=_("Probation Till"),
     )
     probation_end_from = django_filters.DateFilter(
         field_name="candidate__id__probation_end",
         lookup_expr="gte",
         widget=forms.DateInput(attrs={"type": "date"}),
+        label=_("Probation From"),
     )
     schedule_date = django_filters.DateFilter(
         field_name="candidate__id__schedule_date",
@@ -475,6 +693,7 @@ class SkillZoneCandFilter(FilterSet):
         field_name="candidate__id__joining_date",
         lookup_expr="lte",
         widget=forms.DateInput(attrs={"type": "date"}),
+        label=_("Joining Till"),
     )
     recruitment = django_filters.CharFilter(
         field_name="candidate__id__recruitment_id__title", lookup_expr="icontains"
@@ -484,11 +703,13 @@ class SkillZoneCandFilter(FilterSet):
         field_name="candidate__id__onboarding_portal",
         method="filter_mail_sent",
         widget=django_filters.widgets.BooleanWidget(),
+        label=_("Portal Sent"),
     )
     joining_set = django_filters.BooleanFilter(
         field_name="candidate__id__joining_date",
         method="filter_joining_set",
         widget=django_filters.widgets.BooleanWidget(),
+        label=_("Joining Set"),
     )
 
     class Meta:
@@ -536,7 +757,7 @@ class SkillZoneCandFilter(FilterSet):
 
     def cand_search(self, queryset, _, value):
         """
-        This method to include candidate when search skill zone
+        This method to include candidate when search talent pool
         """
         return (
             queryset.filter(candidate_id__name__icontains=value)
@@ -544,7 +765,7 @@ class SkillZoneCandFilter(FilterSet):
         ).distinct()
 
 
-class InterviewFilter(FilterSet):
+class InterviewFilter(SolichFilterSet):
     """
     Filter set class for Candidate model
 
@@ -561,10 +782,6 @@ class InterviewFilter(FilterSet):
         lookup_expr="gte",
         widget=forms.DateInput(attrs={"type": "date"}),
     )
-    # schedule_date = django_filters.DateFilter(
-    #     field_name="interview_date",
-    #     widget=forms.DateInput(attrs={"type": "date"}),
-    # )
     scheduled_till = django_filters.DateFilter(
         field_name="interview_date",
         lookup_expr="lte",
@@ -581,37 +798,35 @@ class InterviewFilter(FilterSet):
             "candidate_id",
             "employee_id",
             "interview_date",
-            # "recruitment",
-            # "recruitment_id",
-            # "stage_id",
-            # "schedule_date",
-            # "email",
-            # "mobile",
-            # "country",
-            # "state",
-            # "city",
-            # "zip",
-            # "gender",
-            # "start_onboard",
-            # "hired",
-            # "canceled",
-            # "is_active",
-            # "recruitment_id__company_id",
-            # "job_position_id",
-            # "recruitment_id__closed",
-            # "recruitment_id__is_active",
-            # "job_position_id__department_id",
-            # "recruitment_id__recruitment_managers",
-            # "stage_id__stage_managers",
-            # "stage_id__stage_type",
-            # "joining_date",
-            # "skillzonecandidate_set__skill_zone_id",
-            # "skillzonecandidate_set__candidate_id",
-            # "portal_sent",
-            # "joining_set",
-            # "rejected_candidate__reject_reason_id",
-            # "offer_letter_status",
-            # "candidate_rating__rating",
-            # "candidate_interview__employee_id",
         ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.form["scheduled_from"].label = (
+            f"{self.Meta.model()._meta.get_field('interview_date').verbose_name} From"
+        )
+        self.form["scheduled_till"].label = (
+            f"{self.Meta.model()._meta.get_field('interview_date').verbose_name} Till"
+        )
+
+
+class LinkedInAccountFilter(FilterSet):
+    """LinkedInAccount filter"""
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = LinkedInAccount
+        fields = ["username", "email", "company_id"]
+
+    def search_method(self, queryset, _, value: str):
+        """Method is used to search through LinkedInAccount"""
+        values = value.split(" ")
+        empty = queryset.model.objects.none()
+        for split in values:
+            empty = (
+                empty
+                | (queryset.filter(username__icontains=split))
+                | (queryset.filter(email__icontains=split))
+            )
+        return empty.distinct()

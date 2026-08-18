@@ -18,15 +18,23 @@ from django.template.loader import render_to_string
 from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm as BaseForm
-from base.methods import reload_queryset
+from base.forms import ModelForm as SolichModelForm
+from base.methods import (
+    filtersubordinatesemployeemodel,
+    is_reportingmanager,
+    reload_queryset,
+)
+from base.models import Company
 from employee.filters import EmployeeFilter
-from employee.models import Department, JobPosition
+from solich import solich_middlewares
 from solich_widgets.widgets.solich_multi_select_field import SolichMultiSelectField
 from solich_widgets.widgets.select_widgets import SolichMultiSelectWidget
 from pms.models import (
     AnonymousFeedback,
+    BonusPointSetting,
     Comment,
     Employee,
+    EmployeeBonusPoint,
     EmployeeKeyResult,
     EmployeeObjective,
     Feedback,
@@ -45,7 +53,7 @@ def validate_date(start_date, end_date):
     Validates that the start date is before or equal to the end date.
     """
     if start_date and end_date and start_date > end_date:
-        raise forms.ValidationError("The start date must be before the end date.")
+        raise forms.ValidationError(_("The start date must be before the end date."))
 
 
 def set_date_field_initial(instance):
@@ -97,6 +105,7 @@ class ObjectiveForm(BaseForm):
             "assignees",
             "start_date",
             "archive",
+            "self_employee_progress_update",
         ]
         exclude = ["is_active"]
 
@@ -114,7 +123,7 @@ class ObjectiveForm(BaseForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=False,
                 instance=self.instance,
@@ -127,7 +136,7 @@ class ObjectiveForm(BaseForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=False,
                 instance=self.instance,
@@ -169,10 +178,10 @@ class ObjectiveForm(BaseForm):
         start_date = cleaned_data.get("start_date")
         managers = cleaned_data.get("managers")
         if not managers or managers == None:
-            raise forms.ValidationError("Managers is a required field")
+            raise forms.ValidationError(_("Managers is a required field"))
         if add_assignees:
             if not assignees.exists() or start_date is None:
-                raise forms.ValidationError("Assign employees and start date")
+                raise forms.ValidationError(_("Assign employees and start date"))
         start_date = cleaned_data.get("start_date")
         end_date = cleaned_data.get("end_date")
         # Check that start date is before end date
@@ -296,6 +305,7 @@ class EmployeeObjectiveCreateForm(BaseForm):
     key_result_id = forms.ModelMultipleChoiceField(
         queryset=KeyResult.objects.all().exclude(archive=True),
         label=_("Key result"),
+        required=False,
         widget=forms.SelectMultiple(
             attrs={
                 "class": "oh-select oh-select-2 select2-hidden-accessible",
@@ -304,7 +314,21 @@ class EmployeeObjectiveCreateForm(BaseForm):
         ),
     )
     objective_id = forms.ModelChoiceField(
-        queryset=Objective.objects.all().exclude(archive=True), required=True
+        queryset=Objective.objects.all()
+        .exclude(archive=True)
+        .exclude(is_template=True),
+        required=True,
+        label=_("Objective"),
+        widget=forms.Select(
+            attrs={
+                "hx-include": "#empObjectiveCreateForm",
+                "hx-target": "#id_key_result_id_parent_div",
+                "hx-select": "#id_key_result_id_parent_div",
+                "hx-swap": "outerHTML",
+                "hx-trigger": "change",
+                "hx-get": "/pms/get-objective-keyresult",
+            }
+        ),
     )
 
     class Meta:
@@ -318,28 +342,41 @@ class EmployeeObjectiveCreateForm(BaseForm):
             "objective_id",
             "key_result_id",
             "start_date",
-            "end_date",
             "status",
             "archive",
         ]
-        exclude = ["is_active"]
         widgets = {
             "start_date": forms.DateInput(
                 attrs={"class": "oh-input w-100", "type": "date"}
-            ),
-            "end_date": forms.DateInput(
-                attrs={"class": "oh-input w-100", "type": "date"}
-            ),
+            )
         }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["key_result_id"].choices = list(
-            self.fields["key_result_id"].choices
-        )
-        self.fields["key_result_id"].choices.append(
-            ("create_new_key_result", "Create new Key result")
-        )
+        request = getattr(solich_middlewares._thread_locals, "request", None)
+
+        if request.user.has_perm("pms.add_keyresult"):
+            self.fields["key_result_id"].choices = list(
+                self.fields["key_result_id"].choices
+            )
+            self.fields["key_result_id"].choices.append(
+                ("create_new_key_result", "Create new Key result")
+            )
+        if request.user.has_perm("pms.add_employeeobjective") or is_reportingmanager(
+            request
+        ):
+            employees = filtersubordinatesemployeemodel(
+                request,
+                queryset=Employee.objects.filter(is_active=True),
+                perm="pms.add_employeeobjective",
+            )
+            self.fields["employee_id"].queryset = employees | Employee.objects.filter(
+                employee_user_id=request.user
+            )
+        else:
+            self.fields["employee_id"].queryset = Employee.objects.filter(
+                employee_user_id=request.user
+            )
 
     def as_p(self):
         """
@@ -380,12 +417,16 @@ class EmployeeKeyResultForm(BaseForm):
             "target_value",
             "start_date",
             "end_date",
-            # 'archive',
         ]
         widgets = {
             "employee_objective_id": forms.HiddenInput(),
             "start_date": forms.DateInput(
-                attrs={"class": "oh-input w-100", "type": "date"}
+                attrs={
+                    "class": "oh-input w-100",
+                    "type": "date",
+                    "required": True,
+                    "onchange": "startDateChange()",
+                }
             ),
             "end_date": forms.DateInput(
                 attrs={"class": "oh-input w-100", "type": "date"}
@@ -402,29 +443,31 @@ class EmployeeKeyResultForm(BaseForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        request = getattr(solich_middlewares._thread_locals, "request", None)
         if self.initial.get("employee_objective_id"):
-            if type(self.initial.get("employee_objective_id")) == int:
-                self.verbose_name = EmployeeObjective.objects.get(
-                    id=(self.initial.get("employee_objective_id"))
-                ).employee_id
+            if (
+                type(self.initial.get("employee_objective_id")) == int
+                or type(self.initial.get("employee_objective_id")) == str
+            ):
+                self.verbose_name = str(
+                    EmployeeObjective.objects.get(
+                        id=int(self.initial.get("employee_objective_id"))
+                    ).employee_id
+                )
             else:
-                self.verbose_name = self.initial.get(
-                    "employee_objective_id"
-                ).employee_id
-
-        reload_queryset(self.fields)
-        self.fields["key_result_id"].choices = list(
-            self.fields["key_result_id"].choices
-        )
-        self.fields["key_result_id"].choices.append(
-            ("create_new_key_result", "Create new Key result")
-        )
-
-
-from base.forms import ModelForm as MF
+                self.verbose_name = str(
+                    self.initial.get("employee_objective_id").employee_id
+                )
+        if request.user.has_perm("pms.add_keyresult") or is_reportingmanager(request):
+            self.fields["key_result_id"].choices = list(
+                self.fields["key_result_id"].choices
+            )
+            self.fields["key_result_id"].choices.append(
+                ("create_new_key_result", "Create new Key result")
+            )
 
 
-class KRForm(MF):
+class KRForm(SolichModelForm):
     """
     A form used for creating KeyResult object
     """
@@ -442,11 +485,6 @@ class KRForm(MF):
             "target_value",
             "duration",
             "company_id",
-            "archive",
-        ]
-        exclude = [
-            "history",
-            "objects",
         ]
 
     def as_p(self):
@@ -594,7 +632,7 @@ class KeyResultForm(ModelForm):
             and value > other_value
         ):
             raise forms.ValidationError(
-                "Current value cannot be greater than target value"
+                _("Current value cannot be greater than target value")
             )
         elif (
             value is not None
@@ -603,7 +641,7 @@ class KeyResultForm(ModelForm):
             and value < other_value
         ):
             raise forms.ValidationError(
-                "Target value cannot be less than current value"
+                _("Target value cannot be less than current value")
             )
         return value
 
@@ -619,156 +657,188 @@ class KeyResultForm(ModelForm):
         # date comparing with objective start and end date
         if employee_objective_id and start_date and end_date:
             if start_date < employee_objective_id.start_date:
-                raise ValidationError("Start date should be after Objective start date")
+                raise ValidationError(
+                    _("Start date should be after Objective start date")
+                )
 
             if end_date > employee_objective_id.end_date:
-                raise ValidationError("End date should be below Objective end date")
+                raise ValidationError(_("End date should be below Objective end date"))
         else:
-            raise forms.ValidationError("Employee Objective not found")
+            raise forms.ValidationError(_("Employee Objective not found"))
         # target value and current value comparison
         if target_value <= 0:
-            raise ValidationError("Target value should be greater than zero")
+            raise ValidationError(_("Target value should be greater than zero"))
         if current_value > target_value:
             raise forms.ValidationError(
-                "Current value cannot be greater than target value"
+                _("Current value cannot be greater than target value")
             )
         return cleaned_data
 
 
-class FeedbackForm(ModelForm):
+class FeedbackForm(SolichModelForm):
     """
-    A form used for creating and updating Feedback objects.
+    FeedbackForm for better performance.
     """
 
     period = forms.ModelChoiceField(
-        queryset=Period.objects.all(),
+        queryset=Period.objects.none(),
+        label=_("Period"),
         empty_label="",
-        widget=forms.Select(
-            attrs={
-                "class": " oh-select--period-change ",
-                "style": "width:100%; display:none;",
-            }
-        ),
+        widget=forms.Select(attrs={"class": "oh-select--period-change"}),
         required=False,
     )
 
     class Meta:
-        """
-        A nested class that specifies the model,fields and exclude fields for the form.
-        """
-
         model = Feedback
-        fields = "__all__"
-        exclude = ["status", "archive", "is_active"]
+        fields = [
+            "review_cycle",
+            "employee_id",
+            "manager_id",
+            "subordinate_id",
+            "colleague_id",
+            "start_date",
+            "end_date",
+            "question_template_id",
+            "employee_key_results_id",
+            "cyclic_feedback",
+            "cyclic_feedback_days_count",
+            "cyclic_feedback_period",
+        ]
+        # fields = "__all__"
+        exclude = [
+            "status",
+            "archive",
+            "is_active",
+            "cyclic_next_start_date",
+            "cyclic_next_end_date",
+        ]
+
+        labels = {
+            "manager_id": _("Manager"),
+            "employee_id": _("Employee"),
+            "colleague_id": _("Colleague"),
+            "question_template_id": _("Question Template"),
+            "employee_key_results_id": _("Key Result"),
+            "cyclic_feedback": _("Is Cyclic Feedback"),
+            # "cyclic_feedback_period":_("")
+        }
 
         widgets = {
+            "employee_key_results_id": forms.SelectMultiple(
+                attrs={
+                    "class": "oh-select oh-select-2 w-100",
+                    "multiple": "multiple",
+                    "style": "width:100%; display:none;",
+                    "required": False,
+                }
+            ),
             "review_cycle": forms.TextInput(
                 attrs={"placeholder": _("Enter a title"), "class": "oh-input w-100"}
             ),
             "start_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
+                attrs={"type": "date", "class": "oh-input w-100"}
             ),
             "end_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
-            ),
-            "employee_id": forms.Select(
-                attrs={
-                    "class": " oh-select--employee-change",
-                    "style": "width:100%; display:none;",
-                    "required": "false",
-                },
-            ),
-            "manager_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select-2 ",
-                    "style": "width:100%; display:none;",
-                    "required": "false",
-                },
-            ),
-            "colleague_id": forms.SelectMultiple(
-                attrs={
-                    "class": "oh-select oh-select-2 w-100",
-                    "multiple": "multiple",
-                    "style": "width:100%; display:none;",
-                }
-            ),
-            "subordinate_id": forms.SelectMultiple(
-                attrs={
-                    "class": "oh-select oh-select-2 w-100",
-                    "multiple": "multiple",
-                    "style": "width:100%; display:none;",
-                }
-            ),
-            "question_template_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select--lg oh-select-no-search",
-                    "style": "width:100%; display:none;",
-                    "required": "false",
-                }
+                attrs={"type": "date", "class": "oh-input w-100"}
             ),
             "cyclic_feedback": forms.CheckboxInput(
                 attrs={
                     "class": "oh-switch__checkbox",
-                }
-            ),
-            "cyclic_feedback_period": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select--lg oh-select-no-search",
-                    "style": "width:100%; display:none;",
-                }
-            ),
-            "cyclic_feedback_days_count": forms.NumberInput(
-                attrs={
-                    "class": "oh-input",
+                    "onchange": "changeCyclicFeedback(this)",
                 }
             ),
         }
 
     def __init__(self, *args, **kwargs):
         """
-        Initializes the feedback form instance.
-        If an instance is provided, sets the initial value for the form's date fields.
+        Initializes the form and queryset filtering.
         """
-
-        instance = kwargs.get("instance")
-        employee = kwargs.pop(
-            "employee", None
-        )  # access the logged-in user's information
-        if instance:
-            kwargs["initial"] = set_date_field_initial(instance)
+        request = getattr(solich_middlewares._thread_locals, "request", None)
         super().__init__(*args, **kwargs)
-        self.fields["subordinate_id"] = SolichMultiSelectField(
-            queryset=Employee.objects.all(),
-            widget=SolichMultiSelectWidget(
-                filter_route_name="employee-widget-filter",
-                filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
-                filter_template_path="employee_filters.html",
-                instance=self.instance,
-            ),
-            label="Subordinates",
-        )
-        reload_queryset(self.fields)
-        self.fields["period"].choices = list(self.fields["period"].choices)
-        self.fields["period"].choices.append(("create_new_period", "Create new period"))
+        # if instance:
+        #     kwargs["initial"] = set_date_field_initial(instance)
 
-        if instance:
-            self.fields["employee_id"].widget.attrs.update(
-                {"class": "oh-select oh-select-2"}
+        user = request.user if request else None
+        user_perms = user.get_all_permissions() if user else set()
+
+        self.fields["period"].queryset = Period.objects.all()
+        self.fields["period"].widget.attrs.update({"class": "w-100"})
+
+        if user and ("pms.add_period" in user_perms or is_reportingmanager(request)):
+            self.fields["period"].choices = [
+                *self.fields["period"].choices,
+                ("create_new_period", "Create new period"),
+            ]
+
+        employee_queryset = Employee.objects.none()
+        if user and ("pms.add_feedback" in user_perms or is_reportingmanager(request)):
+            employee_queryset = filtersubordinatesemployeemodel(
+                request,
+                Employee.objects.all(),
+                perm="pms.add_feedback",
             )
-        employees = Employee.objects.filter(
-            is_active=True, employee_work_info__reporting_manager_id=employee
+
+        self.fields["employee_id"].queryset = (
+            employee_queryset | Employee.objects.filter(employee_user_id=request.user)
         )
-        if employee and employees:
-            department = employee.employee_work_info.department_id
-            employees = Employee.objects.filter(
-                is_active=True, employee_work_info__department_id=department
+        self.fields["employee_id"].widget.attrs["onchange"] = "get_collegues($(this))"
+
+        reload_queryset(self.fields)
+        selected_employee_id = self.data.get("employee_id") if self.data else None
+        if not selected_employee_id and self.instance and self.instance.pk:
+            selected_employee_id = self.instance.employee_id_id
+
+        self.fields["employee_key_results_id"].queryset = (
+            EmployeeKeyResult.objects.filter(
+                employee_objective_id__employee_id=selected_employee_id
             )
-            # manager level access
-            self.fields["employee_id"].queryset = employees
-            self.fields["manager_id"].queryset = employees
-            self.fields["colleague_id"].queryset = employees
-            self.fields["subordinate_id"].queryset = employees
+            if selected_employee_id
+            else EmployeeKeyResult.objects.none()
+        )
+
+        if self.instance and self.instance.pk:
+            employee = self.instance.employee_id
+            reporting_manager = (
+                getattr(employee.employee_work_info, "reporting_manager_id", None)
+                if employee
+                and hasattr(employee, "employee_work_info")
+                and employee.employee_work_info
+                else None
+            )
+            subordinates = Employee.objects.filter(
+                is_active=True, employee_work_info__reporting_manager_id=employee
+            )
+            department = employee.get_department()
+
+            exclude_ids = [employee.id]
+            if reporting_manager:
+                exclude_ids.append(reporting_manager.id)
+
+            colleagues = Employee.objects.filter(
+                is_active=True, employee_work_info__department_id=department
+            ).exclude(id__in=exclude_ids)
+
+            self.fields["colleague_id"].queryset = colleagues
+            self.fields["subordinate_id"].queryset = subordinates
+            self.fields["manager_id"].queryset = (
+                Employee.objects.filter(id=reporting_manager.id)
+                if reporting_manager
+                else Employee.objects.none()
+            )
+
+        # # Solich multi-select filter for subordinates
+        # self.fields["subordinate_id"] = SolichMultiSelectField(
+        #     queryset=Employee.objects.all(),
+        #     widget=SolichMultiSelectWidget(
+        #         filter_route_name="employee-widget-filter",
+        #         filter_class=EmployeeFilter,
+        #         filter_instance_context_name="f",
+        #         filter_template_path="employee_filters.html",
+        #         instance=self.instance,
+        #         required=False,
+        #     ),
+        #     label=_("Subordinates"),
+        # )
 
     def clean(self):
         """
@@ -776,9 +846,7 @@ class FeedbackForm(ModelForm):
         Ensures that the start date is before the end date and validates the start date.
         """
         super().clean()
-        emps = self.data.getlist("subordinate_id")
-        if emps:
-            self.errors.pop("subordinate_id", None)
+        self.errors.pop("subordinate_id", None)
         cleaned_data = super().clean()
         start_date = cleaned_data.get("start_date")
         end_date = cleaned_data.get("end_date")
@@ -796,13 +864,16 @@ class QuestionTemplateForm(ModelForm):
     Form for creating or updating a question template instance
     """
 
+    cols = {"question_template": 12, "company_id": 12}
+
     question_template = forms.CharField(
+        label=_("Question Template"),
         widget=forms.TextInput(
             attrs={
                 "class": "oh-input oh-input--small oh-input--res-height w-100",
                 "placeholder": _("For Developer"),
             }
-        )
+        ),
     )
 
     class Meta:
@@ -817,11 +888,18 @@ class QuestionTemplateForm(ModelForm):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         reload_queryset(self.fields)
+        self.fields["company_id"].required = True
         self.fields["company_id"].widget.attrs.update(
             {
                 "class": "oh-select oh-select-2 w-100",
             }
         )
+        if not self.instance.pk:
+            from base.auth_backends import resolve_company_id_for_new_record
+
+            company_id = resolve_company_id_for_new_record()
+            if company_id:
+                self.initial["company_id"] = Company.objects.filter(id=company_id)
 
     def as_p(self):
         """
@@ -888,8 +966,9 @@ class QuestionForm(ModelForm):
         widgets = {
             "question_type": forms.Select(
                 attrs={
-                    "class": "oh-select oh-select--sm oh-select-no-search oh-select--qa-change w-100",
+                    "class": "oh-select oh-select--sm oh-select--qa-change w-100",
                     "required": True,
+                    "onchange": "questionTypeChange($(this))",
                 }
             )
         }
@@ -980,6 +1059,7 @@ class PeriodForm(ModelForm):
             kwargs["initial"] = set_date_field_initial(instance)
         super().__init__(*args, **kwargs)
         reload_queryset(self.fields)
+        self.fields["company_id"].required = True
         self.fields["company_id"].widget.attrs.update(
             {
                 "class": "oh-select oh-select-2 w-100",
@@ -1002,6 +1082,15 @@ class PeriodForm(ModelForm):
 
 
 class AnonymousFeedbackForm(BaseForm):
+    cols = {
+        "feedback_subject": 12,
+        "based_on": 12,
+        "feedback_description": 12,
+        "employee_id": 12,
+        "department_id": 12,
+        "job_position_id": 12,
+    }
+
     class Meta:
         model = AnonymousFeedback
         fields = "__all__"
@@ -1009,6 +1098,13 @@ class AnonymousFeedbackForm(BaseForm):
 
 
 class MeetingsForm(BaseForm):
+
+    cols = {
+        "employee_id": 12,
+        "manager": 12,
+        "answer_employees": 12,
+        "question_template": 12,
+    }
     date = forms.DateTimeField(
         widget=forms.DateTimeInput(
             attrs={"class": "oh-input w-100", "type": "datetime-local"}
@@ -1025,7 +1121,7 @@ class MeetingsForm(BaseForm):
         Render the form fields as HTML table rows with Bootstrap styling.
         """
         context = {"form": self}
-        table_html = render_to_string("attendance_form.html", context)
+        table_html = render_to_string("solich_form.html", context)
         return table_html
 
     def clean(self):
@@ -1044,30 +1140,31 @@ class MeetingsForm(BaseForm):
             if ids:
                 self.errors.pop("employee_id", None)
 
-        if (
-            cleaned_data["date"].date() <= datetime.datetime.now().date()
-            and cleaned_data["date"].time() < datetime.datetime.now().time()
-        ):
-            raise ValidationError("Date and time cannot be in the past")
+        if cleaned_data["answer_employees"] and not cleaned_data["question_template"]:
+            raise ValidationError(
+                {
+                    "question_template": _(
+                        "Question template is required when answer employees are choosed"
+                    )
+                }
+            )
 
         return cleaned_data
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            employees = Employee.objects.filter(id__in=self.instance.employee_id.all())
-            self.fields["answer_employees"].queryset = employees
-        else:
-            self.fields["employee_id"] = SolichMultiSelectField(
-                queryset=Employee.objects.filter(employee_work_info__isnull=False),
-                widget=SolichMultiSelectWidget(
-                    filter_route_name="employee-widget-filter",
-                    filter_class=EmployeeFilter,
-                    filter_instance_contex_name="f",
-                    filter_template_path="employee_filters.html",
-                ),
-                label=_("Employees"),
-            )
+        self.fields["employee_id"] = SolichMultiSelectField(
+            queryset=Employee.objects.filter(employee_work_info__isnull=False),
+            widget=SolichMultiSelectWidget(
+                filter_route_name="employee-widget-filter",
+                filter_class=EmployeeFilter,
+                filter_instance_context_name="f",
+                filter_template_path="employee_filters.html",
+                form=self,
+                instance=self.instance,
+            ),
+            label=_("Employees"),
+        )
         try:
             if self.data.getlist("employee_id"):
                 employees = Employee.objects.filter(
@@ -1077,3 +1174,239 @@ class MeetingsForm(BaseForm):
         except:
             pass
 
+
+class MeetingResponseForm(ModelForm):
+    """
+    Meeting response form
+    """
+
+    cols = {"response": 12}
+
+    class Meta:
+        model = Meetings
+        fields = ["response"]
+        widgets = {
+            "response": forms.Textarea(attrs={"data-summernote": ""}),
+        }
+
+
+class BonusPointSettingForm(SolichModelForm):
+    """
+    BonusPointSetting form
+    """
+
+    model = forms.ChoiceField(
+        choices=BonusPointSetting.MODEL_CHOICES,
+        widget=forms.Select(
+            attrs={
+                "onchange": "ModelChange($(this))",
+            }
+        ),
+    )
+
+    class Meta:
+        model = BonusPointSetting
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        reload_queryset(self.fields)
+        self.fields["company_id"].widget.attrs.update(
+            {"class": "oh-select oh-select-2 w-100"}
+        )
+        # Always required: signals.py uses this to decide who receives the
+        # bonus point, so a blank value silently awards nobody.
+        self.fields["applicable_for"].required = True
+
+    def clean(self):
+        cleaned_data = super().clean()
+        model = cleaned_data.get("model")
+        applicable_for = cleaned_data.get("applicable_for")
+
+        if model in ["pms.models.EmployeeObjective", "pms.models.EmployeeKeyResult"]:
+            if applicable_for != "owner":
+                raise ValidationError(
+                    _("For Objective and Key Result, 'Applicable For' must be 'Owner'.")
+                )
+            if cleaned_data.get("bonus_for") != "Closed":
+                raise ValidationError(
+                    _("For Objective and Key Result, 'Bonus For' must be 'Closing'.")
+                )
+        if model in ["project.models.Task", "project.models.Project"]:
+            if applicable_for == "owner":
+                raise ValidationError(
+                    _(
+                        "For Task and Project, 'Applicable For' must be 'Members' or 'Managers'."
+                    )
+                )
+        if cleaned_data.get("points", 0) <= 0:
+            raise ValidationError(_("Bonus point must be greater than zero"))
+
+        return cleaned_data
+
+
+class EmployeeBonusPointForm(SolichModelForm):
+    """
+    EmployeeBonusPoint form
+    """
+
+    class Meta:
+        model = EmployeeBonusPoint
+        fields = "__all__"
+        exclude = ["bonus_point_id", "instance", "is_active"]
+
+    def __init__(self, *args, **kwargs):
+        request = getattr(solich_middlewares._thread_locals, "request", None)
+        super().__init__(*args, **kwargs)
+        if request.GET.get("employee_id"):
+            employee = Employee.objects.filter(id=request.GET["employee_id"])
+            if employee:
+                self.fields["employee_id"].queryset = employee
+                self.initial["employee_id"] = employee.first()
+
+    def clean(self):
+        cleaned_data = super().clean()
+        bonus_point = cleaned_data.get("bonus_point")
+        if bonus_point <= 0:
+            raise forms.ValidationError(
+                {"bonus_point": _("Point should be greater than zero.")}
+            )
+        return cleaned_data
+
+
+class EmployeeFeedbackForm(SolichModelForm):
+
+    cols = {"others_id": 12}
+
+    class Meta:
+        model = Feedback
+        fields = ["others_id"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["others_id"] = SolichMultiSelectField(
+            queryset=Employee.objects.filter(employee_work_info__isnull=False),
+            widget=SolichMultiSelectWidget(
+                filter_route_name="employee-widget-filter",
+                filter_class=EmployeeFilter,
+                filter_instance_context_name="f",
+                filter_template_path="employee_filters.html",
+                form=self,
+                instance=self.instance,
+            ),
+            label=_("Employees"),
+        )
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if isinstance(self.fields["others_id"], SolichMultiSelectField):
+            self.errors.pop("others_id", None)
+
+            employee_data = self.fields["others_id"].queryset.filter(
+                id__in=self.data.getlist("others_id")
+            )
+
+            cleaned_data["others_id"] = employee_data
+
+        return cleaned_data
+
+
+class BulkFeedbackForm(SolichModelForm):
+    """Form for creating feedback in bulk"""
+
+    title = forms.CharField(required=True, label=_("Title"))
+    employee_ids = forms.ModelMultipleChoiceField(
+        queryset=Employee.objects.filter(is_active=True), required=True
+    )
+    other_employees = forms.ModelMultipleChoiceField(
+        queryset=Employee.objects.filter(is_active=True),
+        required=False,
+        label=_("Other employees"),
+        help_text=_("Employees need to sent feedback request."),
+    )
+    include_manager = forms.BooleanField(
+        initial=True,
+        required=False,
+    )
+    include_subordinates = forms.BooleanField(
+        initial=True, required=False, label=_("Include all subordinates")
+    )
+    include_colleagues = forms.BooleanField(
+        initial=True, required=False, label=_("Include all colleagues")
+    )
+    include_keyresult = forms.BooleanField(
+        initial=True,
+        required=False,
+        label=_("Include all keyresults"),
+        help_text=_("Include all keyresults assigned to the employee."),
+    )
+    period = forms.ModelChoiceField(
+        queryset=Period.objects.all(),
+        label=_("Period"),
+        required=False,
+        widget=forms.Select(
+            attrs={
+                "onchange": "periodChange($(this))",
+            }
+        ),
+    )
+
+    class Meta:
+        model = Feedback
+        fields = [
+            "title",
+            "employee_ids",
+            "status",
+            "other_employees",
+            "include_manager",
+            "include_subordinates",
+            "include_colleagues",
+            "include_keyresult",
+            "question_template_id",
+            "cyclic_feedback",
+            "cyclic_feedback_period",
+            "cyclic_feedback_days_count",
+            "period",
+            "start_date",
+            "end_date",
+        ]
+        widgets = {
+            "start_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input w-100"}
+            ),
+            "end_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input w-100"}
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["employee_ids"] = SolichMultiSelectField(
+            queryset=Employee.objects.filter(employee_work_info__isnull=False),
+            widget=SolichMultiSelectWidget(
+                filter_route_name="employee-widget-filter",
+                filter_class=EmployeeFilter,
+                filter_instance_context_name="f",
+                filter_template_path="employee_filters.html",
+                form=self,
+                instance=self.instance,
+                required=True,
+            ),
+            label=_("Employees"),
+        )
+        self.fields["status"].initial = "Not Started"
+        self.fields["cyclic_feedback"].widget.attrs["onchange"] = "cyclicFeedback()"
+        self.fields["title"].widget.attrs["autocomplete"] = "off"
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if isinstance(self.fields["employee_ids"], SolichMultiSelectField):
+            self.errors.pop("employee_ids", None)
+
+            employee_data = self.fields["employee_ids"].queryset.filter(
+                id__in=self.data.getlist("employee_ids")
+            )
+
+            cleaned_data["employee_ids"] = employee_data
+
+        return cleaned_data

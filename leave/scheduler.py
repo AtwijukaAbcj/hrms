@@ -1,21 +1,21 @@
-import calendar
-import datetime as dt
-from datetime import datetime, timedelta
+import sys
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from dateutil.relativedelta import relativedelta
 
-today = datetime.now()
+from solich.signals import post_scheduler, pre_scheduler
 
 
 def leave_reset():
+    pre_scheduler.send(sender=leave_reset)
     from leave.models import LeaveType
 
+    today = datetime.now()
     today_date = today.date()
     leave_types = LeaveType.objects.filter(reset=True)
     # Looping through filtered leave types with reset is true
     for leave_type in leave_types:
-        # #Looping through all available leaves
+        # Looping through all available leaves
         available_leaves = leave_type.employee_available_leave.all()
 
         for available_leave in available_leaves:
@@ -29,38 +29,39 @@ def leave_reset():
                 )
                 available_leave.reset_date = new_reset_date
                 available_leave.save()
-            if expired_date == today_date:
+            if expired_date and expired_date <= today_date:
                 new_expired_date = available_leave.set_expired_date(
                     available_leave=available_leave, assigned_date=today_date
                 )
                 available_leave.expired_date = new_expired_date
                 available_leave.save()
 
-
-def recurring_holiday():
-    from leave.models import Holiday
-
-    recurring_holidays = Holiday.objects.filter(recurring=True)
-    # Looping through all recurring holiday
-    for recurring_holiday in recurring_holidays:
-        start_date = recurring_holiday.start_date
-        end_date = recurring_holiday.end_date
-        new_start_date = dt.date(start_date.year + 1, start_date.month, start_date.day)
-        new_end_date = dt.date(end_date.year + 1, end_date.month, end_date.day)
-        # Checking that end date is not none
-        if end_date is None:
-            # checking if that start date is day before today
-            if start_date == (today - timedelta(days=1)).date():
-                recurring_holiday.start_date = new_start_date
-        elif end_date == (today - timedelta(days=1)).date():
-            recurring_holiday.start_date = new_start_date
-            recurring_holiday.end_date = new_end_date
-        recurring_holiday.save()
+        if (
+            leave_type.carryforward_expire_date
+            and leave_type.carryforward_expire_date <= today_date
+        ):
+            leave_type.carryforward_expire_date = leave_type.set_expired_date(
+                today_date
+            )
+            leave_type.save()
+    post_scheduler.send(
+        sender=leave_reset,
+        **{
+            "today": today,
+            "today_date": today_date,
+            "leave_types": leave_types,
+        }
+    )
 
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(leave_reset, "interval", hours=4)
-scheduler.add_job(recurring_holiday, "interval", hours=4)
+if not any(
+    cmd in sys.argv
+    for cmd in ["makemigrations", "migrate", "compilemessages", "flush", "shell"]
+):
+    """
+    Initializes and starts background tasks using APScheduler when the server is running.
+    """
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(leave_reset, "interval", hours=4)
 
-scheduler.start()
-
+    scheduler.start()

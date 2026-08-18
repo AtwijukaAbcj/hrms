@@ -23,4 +23,3 @@ admin.site.register(
         OffboardingStage,
     ]
 )
-

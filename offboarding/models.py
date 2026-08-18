@@ -1,10 +1,16 @@
+import json
+from ast import literal_eval
 from collections.abc import Iterable
 from datetime import date, timedelta
+from urllib.parse import urlencode
 
-from django.contrib.auth.models import User
+from django.apps import apps
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+from django.urls import reverse, reverse_lazy
+from django.utils.timesince import timesince
 from django.utils.translation import gettext_lazy as _
 
 from base.solich_company_manager import SolichCompanyManager
@@ -12,10 +18,11 @@ from base.models import Company
 from employee.models import Employee
 from solich import solich_middlewares
 from solich.solich_middlewares import _thread_locals
-from solich.models import SolichModel
+from solich.methods import get_solich_model_class
+from solich.models import SolichModel, upload_path
 from solich_audit.models import SolichAuditInfo, SolichAuditLog
+from solich_views.cbv_methods import render_template
 from notifications.signals import notify
-from payroll.models.models import Contract
 
 # Create your models here.
 
@@ -31,9 +38,12 @@ class Offboarding(SolichModel):
     managers = models.ManyToManyField(Employee)
     status = models.CharField(max_length=10, default="ongoing", choices=statuses)
     company_id = models.ForeignKey(
-        Company, on_delete=models.CASCADE, null=True, editable=False
+        Company,
+        on_delete=models.CASCADE,
+        null=True,
+        verbose_name="Company",
     )
-    objects = SolichCompanyManager()
+    objects = SolichCompanyManager("company_id")
 
     def __str__(self):
         return self.title
@@ -88,6 +98,33 @@ class OffboardingStage(SolichModel):
         """
         return self.type == "archived"
 
+    def get_delete_url(self):
+        """
+        This method is used to get delete url
+        """
+        query = urlencode(
+            {
+                "model": "offboarding.OffboardingStage",
+                "pk": str(self.pk),
+                "reload_target": "#applyFilter",
+            }
+        )
+        return f"{reverse('generic-delete')}?{query}"
+
+    def get_update_url(self):
+        """
+        This method is used to get update url
+        """
+        return f'{reverse_lazy("create-offboarding-stage", kwargs={"pk": self.pk})}?offboarding_id={self.offboarding_id.pk}'
+
+    def get_add_employee_url(self):
+        """
+        This method is used to get add employee url
+        """
+        url = f'{reverse_lazy("add-offboarding-employee")}?stage_id={self.id}'
+
+        return url
+
 
 @receiver(post_save, sender=Offboarding)
 def create_initial_stage(sender, instance, created, **kwargs):
@@ -107,7 +144,7 @@ class OffboardingStageMultipleFile(SolichModel):
     OffboardingStageMultipleFile
     """
 
-    attachment = models.FileField(upload_to="offboarding/attachments")
+    attachment = models.FileField(upload_to=upload_path)
 
 
 class OffboardingEmployee(SolichModel):
@@ -115,7 +152,7 @@ class OffboardingEmployee(SolichModel):
     OffboardingEmployee model / Employee on stage
     """
 
-    units = [("day", "days"), ("month", "Month")]
+    UNIT = [("day", "days"), ("month", "Month")]
     employee_id = models.OneToOneField(
         Employee, on_delete=models.CASCADE, verbose_name="Employee"
     )
@@ -123,15 +160,206 @@ class OffboardingEmployee(SolichModel):
         OffboardingStage, on_delete=models.CASCADE, verbose_name="Stage", null=True
     )
     notice_period = models.IntegerField(null=True)
-    unit = models.CharField(max_length=10, choices=units, default="month", null=True)
-    notice_period_starts = models.DateField(null=True)
-    notice_period_ends = models.DateField(null=True, blank=True)
+    unit = models.CharField(max_length=10, choices=UNIT, default="month", null=True)
+    notice_period_starts = models.DateField(
+        null=True, verbose_name=_("Notice Period Starts")
+    )
+    notice_period_ends = models.DateField(
+        null=True, blank=True, verbose_name=_("Notice Period Ends")
+    )
     objects = SolichCompanyManager(
         related_company_field="employee_id__employee_work_info__company_id"
     )
 
     def __str__(self) -> str:
         return self.employee_id.get_full_name()
+
+    def detail_subtitle(self):
+        """
+        Return subtitle containing both department and job position information.
+        """
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def detail_view_task_custom(self):
+        """
+        This method for get custom column for stage in detail view.
+        """
+        tasks = self.employeetask_set.all()
+
+        return render_template(
+            path="cbv/exit_process/detail_view_tasks.html",
+            context={
+                "instance": self,
+                "tasks": tasks,
+            },
+        )
+
+    def get_individual_url(self):
+        """
+        This method is used to get individual view url
+        """
+        return f'{reverse_lazy("offboarding-individual-view", kwargs={"pk": self.pk})}'
+
+    def get_notice_period_col(self):
+        """
+        This method for get custom column for notice period in detail view.
+        """
+
+        notice_period_ends = self.notice_period_ends
+        today = date.today()
+
+        if notice_period_ends:
+            col = (
+                _("today")
+                if notice_period_ends == today
+                else (
+                    _("Notice period ended")
+                    if notice_period_ends < today
+                    else (
+                        _("In") + " " + timesince(today, notice_period_ends)
+                        if notice_period_ends
+                        else ""
+                    )
+                )
+            )
+
+        return col if notice_period_ends else ""
+
+    def get_stage_col(self):
+        """
+        This method for get custom column for stage in Pipeline view.
+        """
+        from offboarding.forms import StageSelectForm
+
+        return render_template(
+            path="cbv/exit_process/pipeline_stage_col.html",
+            context={
+                "employee": self,
+                "stage_form": StageSelectForm(
+                    offboarding=self.stage_id.offboarding_id,
+                    initial={"stage_id": self.stage_id.pk},
+                ),
+                "stages": self.stage_id.offboarding_id.offboardingstage_set.all(),
+            },
+        )
+
+    def pending_required_tasks(self, stage=None):
+        """
+        Required offboarding tasks assigned to this employee in ``stage``
+        (defaults to the employee's current stage) that are not yet completed.
+        """
+        print(self)
+        stage = stage or self.stage_id
+        completed_task_ids = EmployeeTask.objects.filter(
+            employee_id=self,
+            task_id__stage_id=stage,
+            status="completed",
+        ).values_list("task_id", flat=True)
+        return (
+            OffboardingTask.objects.filter(
+                stage_id=stage,
+                is_required=True,
+                employeetask__employee_id=self,
+            )
+            .exclude(id__in=completed_task_ids)
+            .distinct()
+        )
+
+    def get_task_status_col(self):
+        """
+        This method for get custom column for task status in Pipeline view.
+        """
+        completed_tasks = self.employeetask_set.filter(status="completed").count()
+        total_tasks = self.employeetask_set.all().count()
+
+        task_status = f"{completed_tasks} / {total_tasks}"
+        col = f"""
+            <div class="oh-checkpoint-badge oh-checkpoint-badge--primary" title="{_('Completed')} {completed_tasks} {_('of')} {total_tasks} {_('tasks')}">
+                {task_status}
+            </div>
+        """
+        return col
+
+    def get_action_col(self):
+        """
+        This method for get custom column for action in Pipeline view.
+        """
+        return render_template(
+            path="cbv/exit_process/pipeline_action_col.html",
+            context={"employee": self, "stage": self.stage_id},
+        )
+
+    def __getattribute__(self, name):
+        if name.startswith("get_") and name.endswith("_task"):
+            task_id = literal_eval(name[4:-5])
+            task = EmployeeTask.objects.filter(
+                task_id__id=task_id,
+                employee_id_id=self.id,
+                task_id__stage_id=self.stage_id,
+            ).first()
+
+            return render_template(
+                "cbv/exit_process/tasks_cols.html",
+                {"instance": self, "task": task, "task_id": task_id},
+            )
+        value = super().__getattribute__(name)
+
+        return value
+
+    def ordered_group_json(self):
+        """
+        This method is used to get ordered group json
+        """
+        Offboarding = self.stage_id.offboarding_id
+        offboarding_stages = Offboarding.offboardingstage_set.all().order_by("sequence")
+        ordered_group_json = json.dumps(
+            [
+                {
+                    "id": stage.id,
+                    "stage": stage.title,
+                }
+                for stage in offboarding_stages
+            ]
+        )
+        return ordered_group_json
+
+    def get_archive_title(self):
+        """
+        This method is used to get title for the archive in actions
+        """
+        return "Archive" if self.employee_id.is_active else "Un-Archive"
+
+    def get_mail_send_url(self):
+        """
+        This method is used to get the mail send url
+        """
+        return f'{reverse_lazy("send-mail-employee", kwargs={"emp_id": self.pk})}'
+
+    def get_notes_url(self):
+        """
+        This method is used to get the employee note view url
+        """
+        return (
+            f'{reverse_lazy("view-offboarding-note", kwargs={"employee_id": self.pk})}'
+        )
+
+    def get_archive_url(self):
+        """
+        This method is used to get the mail send url
+        """
+        return f'{reverse_lazy("employee-archive", kwargs={"obj_id": self.pk})}'
+
+    def get_edit_url(self):
+        """
+        This method is used to get the mail send url
+        """
+        return f'{reverse_lazy("add-employee", kwargs={"pk": self.pk})}?stage_id={self.stage_id.id}'
+
+    def get_managing_record_url(self):
+        """
+        This method is used to get the mail send url
+        """
+        return f'{reverse_lazy("get-manager-in")}?employee_id={self.employee_id.id}&offboarding=True'
 
 
 class ResignationLetter(SolichModel):
@@ -149,7 +377,7 @@ class ResignationLetter(SolichModel):
     )
     title = models.CharField(max_length=100, null=True)
     description = models.TextField(null=True, max_length=255)
-    planned_to_leave_on = models.DateField()
+    planned_to_leave_on = models.DateField(verbose_name=_("Planned To Leave On"))
     status = models.CharField(max_length=10, choices=statuses, default="requested")
     offboarding_employee_id = models.ForeignKey(
         OffboardingEmployee, on_delete=models.CASCADE, editable=False, null=True
@@ -157,12 +385,131 @@ class ResignationLetter(SolichModel):
     objects = SolichCompanyManager(
         related_company_field="employee_id__employee_work_info__company_id"
     )
+    history = SolichAuditLog(
+        related_name="history_set",
+        bases=[
+            SolichAuditInfo,
+        ],
+    )
+
+    def get_status(self):
+        """
+        Display status
+        """
+        return dict(self.statuses).get(self.status)
+
+    def get_status_badge(self):
+        """
+        Display status as a styled badge for the detail view.
+        """
+        badge_colors = {
+            "requested": "#808080",
+            "approved": "#8db600",
+            "rejected": "#ff0000",
+        }
+        label = dict(self.statuses).get(self.status, self.status)
+        color = badge_colors.get(self.status, "#808080")
+        return (
+            f'<span style="background-color:{color}; color:#fff; '
+            f'padding:3px 10px; border-radius:4px; font-size:0.8rem;">'
+            f"{label}</span>"
+        )
+
+    def option_column(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/resignation/options.html",
+            context={"instance": self},
+        )
+
+    def actions_column(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/resignation/actions.html",
+            context={"instance": self},
+        )
+
+    def description_col(self):
+        """
+        This method for get custome column .
+        """
+
+        return render_template(
+            path="cbv/resignation/description.html",
+            context={"instance": self},
+        )
+
+    def detail_description_col(self):
+        """
+        This method for get custome column .
+        """
+
+        return render_template(
+            path="cbv/resignation/detail_description.html",
+            context={"instance": self},
+        )
+
+    def resignation_subtitle(self):
+        """
+        Detail view subtitle
+        """
+
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def get_detail_url(self):
+        """
+        Detail view url
+        """
+        url = reverse_lazy("resignation-requests-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def get_detail_tab_url(self):
+        """
+        Detail view url
+        """
+        url = reverse_lazy(
+            "tab-resignation-requests-detail-view", kwargs={"pk": self.pk}
+        )
+        return url
+
+    def clean(self):
+        super().clean()
+        if self.pk:
+            original = (
+                ResignationLetter.objects.filter(pk=self.pk)
+                .values_list("status", flat=True)
+                .first()
+            )
+            if original == "rejected":
+                raise ValidationError(
+                    _("A rejected resignation letter cannot be modified.")
+                )
+        if self.employee_id_id:
+            existing = ResignationLetter.objects.filter(
+                employee_id=self.employee_id_id,
+                status__in=["requested", "approved"],
+            )
+            if self.pk:
+                existing = existing.exclude(pk=self.pk)
+            if existing.exists():
+                raise ValidationError(
+                    _(
+                        "A resignation letter for this employee is already in "
+                        "'Requested' or 'Approved' status."
+                    )
+                )
 
     def save(self, *args, **kwargs):
+        self.full_clean()
         super().save(*args, **kwargs)
         if self.status == "approved":
             pass
-
         return
 
     def to_offboarding_employee(
@@ -183,16 +530,21 @@ class ResignationLetter(SolichModel):
             .filter(offboarding_id=offboarding)
             .first()
         )
-        contract_notice_end_date = Contract.objects.filter(
-            employee_id=self.employee_id, contract_status="active"
-        ).first()
+        default_notice_end = (
+            get_solich_model_class(
+                app_label="payroll", model="payrollgeneralsetting"
+            ).objects.first()
+            if apps.is_installed("payroll")
+            else None
+        )
+
         try:
-            notice_period_ends = (
-                notice_period_starts
-                + timedelta(contract_notice_end_date.notice_period_in_days)
-                if contract_notice_end_date
-                else notice_period_ends
-            )
+            if not notice_period_ends:
+                notice_period_ends = (
+                    notice_period_starts + timedelta(default_notice_end.notice_period)
+                    if default_notice_end
+                    else notice_period_ends
+                )
         except:
             notice_period_ends = notice_period_ends
 
@@ -233,6 +585,7 @@ class OffboardingTask(SolichModel):
         null=True,
         blank=True,
     )
+    is_required = models.BooleanField(default=False, verbose_name=_("Is Required"))
 
     class Meta:
         unique_together = ["title", "stage_id"]
@@ -295,7 +648,7 @@ class ExitReason(SolichModel):
     title = models.CharField(max_length=50)
     description = models.TextField(max_length=255)
     offboarding_employee_id = models.ForeignKey(
-        OffboardingEmployee, on_delete=models.PROTECT
+        OffboardingEmployee, on_delete=models.CASCADE
     )
     attachments = models.ManyToManyField(OffboardingStageMultipleFile)
 
@@ -313,7 +666,7 @@ class OffboardingNote(SolichModel):
         Employee, on_delete=models.SET_NULL, null=True, editable=False
     )
     employee_id = models.ForeignKey(
-        OffboardingEmployee, on_delete=models.PROTECT, null=True, editable=False
+        OffboardingEmployee, on_delete=models.CASCADE, null=True, editable=False
     )
     stage_id = models.ForeignKey(
         OffboardingStage, on_delete=models.PROTECT, null=True, editable=False
@@ -339,4 +692,4 @@ class OffboardingGeneralSetting(SolichModel):
 
     resignation_request = models.BooleanField(default=False)
     company_id = models.ForeignKey(Company, on_delete=models.CASCADE, null=True)
-
+    objects = SolichCompanyManager("company_id")

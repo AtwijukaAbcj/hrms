@@ -7,6 +7,7 @@ This module is used to write dashboard related views
 import datetime
 
 from django.core import serializers
+from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils.translation import gettext_lazy as _
@@ -104,8 +105,8 @@ def dashboard(request):
         if stage_chart_count >= 1:
             stage_chart_count = 1
 
-    onboarding_count = Candidate.objects.filter(start_onboard=True)
-    onboarding_count = onboarding_count.count()
+    accepted = Candidate.objects.filter(offer_letter_status="accepted")
+    accepted_count = accepted.count()
 
     recruitment_manager_mapping = {}
 
@@ -126,7 +127,9 @@ def dashboard(request):
         else:
             total_vacancy += openings.vacancy
 
-    hired_candidates = candidates.filter(hired=True)
+    hired_candidates = candidates.filter(
+        Q(hired=True) | Q(stage_id__stage_type="hired")
+    ).distinct()
     total_candidates = len(candidates)
     total_hired_candidates = len(hired_candidates)
     conversion_ratio = 0
@@ -139,19 +142,21 @@ def dashboard(request):
         hired_ratio = f"{((total_hired_candidates / total_vacancy) * 100):.1f}"
         total_candidate_ratio = f"{((total_candidates / total_vacancy) * 100):.1f}"
     if total_hired_candidates != 0:
-        acceptance_ratio = f"{((onboarding_count / total_hired_candidates) * 100):.1f}"
+        acceptance_ratio = f"{((accepted_count / total_hired_candidates) * 100):.1f}"
 
     skill_zone = SkillZone.objects.filter(is_active=True)
     return render(
         request,
-        "dashboard/dashboard.html",
+        "recruitment/dashboard.html",
         {
             "ongoing_recruitments": ongoing_recruitments,
             "total_candidate_ratio": total_candidate_ratio,
             "total_hired_candidates": total_hired_candidates,
             "conversion_ratio": conversion_ratio,
             "acceptance_ratio": acceptance_ratio,
-            "onboard_candidates": hired_candidates.filter(start_onboard=True),
+            "onboard_candidates": hired_candidates.filter(
+                onboarding_stage__isnull=False
+            ),
             "job_data": job_data,
             "total_vacancy": total_vacancy,
             "recruitment_manager_mapping": recruitment_manager_mapping,
@@ -159,7 +164,9 @@ def dashboard(request):
             "joining": joining,
             "dep_vacancy": dep_vacancy,
             "stage_chart_count": stage_chart_count,
-            "onboarding_count": onboarding_count,
+            "onboarding_count": hired_candidates.filter(
+                onboarding_stage__isnull=False
+            ).count(),
             "total_candidates": total_candidates,
             "skill_zone": skill_zone,
         },
@@ -172,7 +179,11 @@ def dashboard_pipeline(request):
     """
     This method is used generate recruitment dataset for the dashboard
     """
-    recruitment_obj = Recruitment.objects.filter(closed=False)
+    import datetime as _dt
+
+    today = _dt.date.today()
+    # Exclude future recruitments (start_date > today) — they have no candidates yet
+    recruitment_obj = Recruitment.objects.filter(closed=False, start_date__lte=today)
     data_set = []
     labels = [type[1] for type in Stage.stage_types]
     for rec in recruitment_obj:
@@ -187,36 +198,40 @@ def dashboard_pipeline(request):
                     {rec.start_date}"""
                     ),
                     "data": data,
+                    "id": rec.id,
                 }
             )
-    return JsonResponse(
-        {"dataSet": data_set, "labels": labels, "message": _("No data Found...")}
+    response = JsonResponse(
+        {
+            "dataSet": data_set,
+            "labels": labels,
+            "message": _("No records available at the moment."),
+        }
     )
+    response["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
 
 
 @login_required
 @manager_can_enter(perm="recruitment.view_recruitment")
 def dashboard_hiring(request):
     """
-    This method is used generate employee joining status for the dashboard
+    This method is used generate hired candidate count per month for the dashboard
     """
 
-    selected_year = request.GET.get("id")
+    selected_year = int(request.GET.get("id") or datetime.date.today().year)
 
-    employee_info = EmployeeWorkInformation.objects.filter(
-        date_joining__year=selected_year
+    hired_candidates = Candidate.objects.filter(
+        hired=True,
+        joining_date__year=selected_year,
+        joining_date__isnull=False,
     )
 
-    # Create a list to store the count of employees for each month
-    employee_count_per_month = [0] * 12  # Initialize with zeros for all months
+    candidate_count_per_month = [0] * 12
 
-    # Count the number of employees who joined in each month for the selected year
-    for info in employee_info:
-        if isinstance(info.date_joining, datetime.date):
-            month_index = info.date_joining.month - 1  # Month index is zero-based
-            employee_count_per_month[
-                month_index
-            ] += 1  # Increment the count for the corresponding month
+    for candidate in hired_candidates:
+        month_index = candidate.joining_date.month - 1
+        candidate_count_per_month[month_index] += 1
 
     labels = [
         _("January"),
@@ -235,8 +250,8 @@ def dashboard_hiring(request):
 
     data_set = [
         {
-            "label": _("Employees joined in %(year)s") % {"year": selected_year},
-            "data": employee_count_per_month,
+            "label": _("Hired in %(year)s") % {"year": selected_year},
+            "data": candidate_count_per_month,
             "backgroundColor": "rgba(236, 131, 25)",
         }
     ]
@@ -274,6 +289,7 @@ def dashboard_vacancy(_request):
     return JsonResponse({"dataSet": data_set, "labels": label})
 
 
+@login_required
 def get_open_position(request):
     """
     This is an ajax method to render the open position to the recruitment
@@ -281,8 +297,11 @@ def get_open_position(request):
     Returns:
         obj: it returns the list of job positions
     """
-    rec_id = request.GET["recId"]
-    recruitment_obj = Recruitment.objects.get(id=rec_id)
+    rec_id = request.GET.get("recId")
+    recruitment_obj = Recruitment.find(rec_id)
+    if not recruitment_obj:
+        return JsonResponse({"openPositions": [], "recruitmentInfo": None})
+
     queryset = recruitment_obj.open_positions.all()
     job_info = serializers.serialize("json", queryset)
     rec_info = serializers.serialize("json", [recruitment_obj])
@@ -309,7 +328,7 @@ def candidate_status(_request):
     joined_candidates = Candidate.objects.filter(offer_letter_status="joined").count()
 
     data_set = []
-    labels = ["Not Sent", "Sent", "Accepted", "Rejected", "Joined"]
+    labels = [_("Not Sent"), _("Sent"), _("Accepted"), _("Rejected"), _("Joined")]
     data = [
         not_sent_candidates,
         sent_candidates,
@@ -333,4 +352,3 @@ def candidate_status(_request):
     # labels = [label for label, d in zip(labels, data) if d != 0]
 
     return JsonResponse({"dataSet": data_set, "labels": labels})
-

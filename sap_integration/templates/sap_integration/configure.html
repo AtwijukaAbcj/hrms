@@ -1,0 +1,109 @@
+{% extends 'index.html' %}
+{% load static widget_tweaks %}
+
+{% block title %}Configure SAP Integration{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-8 offset-md-2">
+            <h1>Configure SAP Integration</h1>
+            <hr>
+
+            {% if messages %}
+            <div class="alert alert-info alert-dismissible fade show" role="alert">
+                {% for message in messages %}
+                    {{ message }}
+                {% endfor %}
+                <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+                    <span aria-hidden="true">&times;</span>
+                </button>
+            </div>
+            {% endif %}
+
+            <form method="post" class="form">
+                {% csrf_token %}
+                
+                <fieldset class="form-group">
+                    <legend class="border-bottom mb-4">SAP Connection Details</legend>
+                    
+                    <div class="form-group">
+                        {{ form.SAP_URL.label_tag }}
+                        {% include 'widget_tweaks/bootstrap.html' with field=form.SAP_URL %}
+                        {% if form.SAP_URL.help_text %}
+                            <small class="form-text text-muted">{{ form.SAP_URL.help_text|safe }}</small>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-group">
+                        {{ form.SAP_USERNAME.label_tag }}
+                        {% include 'widget_tweaks/bootstrap.html' with field=form.SAP_USERNAME %}
+                    </div>
+
+                    <div class="form-group">
+                        {{ form.SAP_PASSWORD.label_tag }}
+                        {% include 'widget_tweaks/bootstrap.html' with field=form.SAP_PASSWORD %}
+                        <small class="form-text text-muted">Leave blank to keep current password</small>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="form-group">
+                                {{ form.SAP_CLIENT.label_tag }}
+                                {% include 'widget_tweaks/bootstrap.html' with field=form.SAP_CLIENT %}
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="form-group">
+                                {{ form.SAP_LANGUAGE.label_tag }}
+                                {% include 'widget_tweaks/bootstrap.html' with field=form.SAP_LANGUAGE %}
+                            </div>
+                        </div>
+                    </div>
+                </fieldset>
+
+                <fieldset class="form-group">
+                    <legend class="border-bottom mb-4">Sync Configuration</legend>
+                    
+                    <div class="form-group">
+                        <div class="form-check">
+                            {{ form.AUTO_SYNC }}
+                            {{ form.AUTO_SYNC.label_tag }}
+                            <small class="form-text text-muted d-block">Enable automatic synchronization at specified intervals</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        {{ form.SYNC_INTERVAL.label_tag }}
+                        {% include 'widget_tweaks/bootstrap.html' with field=form.SYNC_INTERVAL %}
+                        <small class="form-text text-muted">Interval in seconds between automatic syncs</small>
+                    </div>
+
+                    <div class="form-group">
+                        {{ form.EMPLOYEE_ENTITY.label_tag }}
+                        {% include 'widget_tweaks/bootstrap.html' with field=form.EMPLOYEE_ENTITY %}
+                        <small class="form-text text-muted">SAP OData entity name for employees</small>
+                    </div>
+                </fieldset>
+
+                <fieldset class="form-group">
+                    <legend class="border-bottom mb-4">Status</legend>
+                    
+                    <div class="form-group">
+                        <div class="form-check">
+                            {{ form.IS_ACTIVE }}
+                            {{ form.IS_ACTIVE.label_tag }}
+                            <small class="form-text text-muted d-block">Enable or disable SAP integration</small>
+                        </div>
+                    </div>
+                </fieldset>
+
+                <div class="form-group">
+                    <button class="btn btn-primary" type="submit">Save Configuration</button>
+                    <a href="{% url 'sap_integration:dashboard' %}" class="btn btn-secondary">Cancel</a>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

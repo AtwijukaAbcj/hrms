@@ -1,4 +1,5 @@
 import calendar
+import sys
 from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -11,7 +12,7 @@ def update_rotating_work_type_assign(rotating_work_type, new_date):
     """
     Here will update the employee work information details and send notification
     """
-    from django.contrib.auth.models import User
+    from solich_auth.models import SolichUser
 
     employee = rotating_work_type.employee_id
     employee_work_info = employee.employee_work_info
@@ -40,7 +41,7 @@ def update_rotating_work_type_assign(rotating_work_type, new_date):
     rotating_work_type.current_work_type = rotating_work_type.next_work_type
     rotating_work_type.next_work_type = next_work_type
     rotating_work_type.save()
-    bot = User.objects.filter(username="Solich Bot").first()
+    bot = SolichUser.objects.filter(username="Solich Bot").first()
     if bot is not None:
         employee = rotating_work_type.employee_id
         notify.send(
@@ -64,7 +65,6 @@ def work_type_rotate_after(rotating_work_work_type):
     date_today = datetime.now()
     switch_date = rotating_work_work_type.next_change_date
     if switch_date.strftime("%Y-%m-%d") == date_today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
         new_date = date_today + timedelta(days=rotating_work_work_type.rotate_after_day)
         update_rotating_work_type_assign(rotating_work_work_type, new_date)
     return
@@ -77,7 +77,6 @@ def work_type_rotate_weekend(rotating_work_type):
     date_today = datetime.now()
     switch_date = rotating_work_type.next_change_date
     if switch_date.strftime("%Y-%m-%d") == date_today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
         day = datetime.now().strftime("%A").lower()
         switch_day = rotating_work_type.rotate_every_weekend
         if day == switch_day:
@@ -94,7 +93,6 @@ def work_type_rotate_every(rotating_work_type):
     switch_date = rotating_work_type.next_change_date
     day_date = rotating_work_type.rotate_every
     if switch_date.strftime("%Y-%m-%d") == date_today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
         if day_date == switch_date.strftime("%d").lstrip("0"):
             new_date = date_today.replace(month=date_today.month + 1)
             update_rotating_work_type_assign(rotating_work_type, new_date)
@@ -130,8 +128,9 @@ def update_rotating_shift_assign(rotating_shift, new_date):
     """
     Here will update the employee work information and send notification
     """
-    from django.contrib.auth.models import User
+    from solich_auth.models import SolichUser
 
+    next_shift_index = 0
     employee = rotating_shift.employee_id
     employee_work_info = employee.employee_work_info
     rotating_shift_id = rotating_shift.rotating_shift_id
@@ -155,7 +154,7 @@ def update_rotating_shift_assign(rotating_shift, new_date):
     rotating_shift.current_shift = rotating_shift.next_shift
     rotating_shift.next_shift = next_shift
     rotating_shift.save()
-    bot = User.objects.filter(username="Solich Bot").first()
+    bot = SolichUser.objects.filter(username="Solich Bot").first()
     if bot is not None:
         employee = rotating_shift.employee_id
         notify.send(
@@ -172,25 +171,23 @@ def update_rotating_shift_assign(rotating_shift, new_date):
     return
 
 
-def shift_rotate_after_day(rotating_shift, today=datetime.now()):
+def shift_rotate_after_day(rotating_shift, today):
     """
     This method for rotate shift based on after day
     """
     switch_date = rotating_shift.next_change_date
-    if switch_date.strftime("%Y-%m-%d") == today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
+    if switch_date == today:
         new_date = today + timedelta(days=rotating_shift.rotate_after_day)
         update_rotating_shift_assign(rotating_shift, new_date)
     return
 
 
-def shift_rotate_weekend(rotating_shift, today=datetime.now()):
+def shift_rotate_weekend(rotating_shift, today):
     """
     This method for rotate shift based on weekend
     """
     switch_date = rotating_shift.next_change_date
-    if switch_date.strftime("%Y-%m-%d") == today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
+    if switch_date == today:
         day = today.strftime("%A").lower()
         switch_day = rotating_shift.rotate_every_weekend
         if day == switch_day:
@@ -199,20 +196,19 @@ def shift_rotate_weekend(rotating_shift, today=datetime.now()):
     return
 
 
-def shift_rotate_every(rotating_shift, today=datetime.now()):
+def shift_rotate_every(rotating_shift, today):
     """
     This method for rotate shift based on every month
     """
     switch_date = rotating_shift.next_change_date
     day_date = rotating_shift.rotate_every
-    if switch_date.strftime("%Y-%m-%d") == today.strftime("%Y-%m-%d"):
-        # calculate the next work type switch date
+    if switch_date == today:
         if day_date == switch_date.strftime("%d").lstrip("0"):
             new_date = today.replace(month=today.month + 1)
             update_rotating_shift_assign(rotating_shift, new_date)
         elif day_date == "last":
-            year = today.strftime("%Y")
-            month = today.strftime("%m")
+            year = today.year
+            month = today.month
             last_day = calendar.monthrange(int(year), int(month) + 1)[1]
             new_date = datetime(int(year), int(month) + 1, last_day)
             update_rotating_shift_assign(rotating_shift, new_date)
@@ -227,18 +223,29 @@ def rotate_shift():
     from base.models import RotatingShiftAssign
 
     rotating_shifts = RotatingShiftAssign.objects.filter(is_active=True)
-    today = datetime.date
-    for rotating_shift in rotating_shifts:
+    today = datetime.now().date()
+    r_shifts = rotating_shifts.filter(start_date__lte=today)
+    rotating_shifts_modified = None
+    for r_shift in r_shifts:
+        emp_shift = rotating_shifts.filter(
+            employee_id=r_shift.employee_id, start_date__lte=today
+        ).exclude(id=r_shift.id)
+        rotating_shifts_modified = rotating_shifts.exclude(
+            id__in=emp_shift.values_list("id", flat=True)
+        )
+        emp_shift.update(is_active=False)
+
+    for rotating_shift in rotating_shifts_modified:
         based_on = rotating_shift.based_on
         # after day condition
         if based_on == "after":
-            shift_rotate_after_day(rotating_shift)
+            shift_rotate_after_day(rotating_shift, today)
         # weekly condition
         elif based_on == "weekly":
-            shift_rotate_weekend(rotating_shift)
+            shift_rotate_weekend(rotating_shift, today)
         # monthly condition
         elif based_on == "monthly":
-            shift_rotate_every(rotating_shift)
+            shift_rotate_every(rotating_shift, today)
 
     return
 
@@ -247,9 +254,8 @@ def switch_shift():
     """
     This method change employees shift information regards to the shift request
     """
-    from django.contrib.auth.models import User
-
     from base.models import ShiftRequest
+    from solich_auth.models import SolichUser
 
     today = date.today()
 
@@ -265,7 +271,7 @@ def switch_shift():
             request.approved = True
             request.shift_changed = True
             request.save()
-            bot = User.objects.filter(username="Solich Bot").first()
+            bot = SolichUser.objects.filter(username="Solich Bot").first()
             if bot is not None:
                 employee = request.employee_id
                 notify.send(
@@ -286,9 +292,8 @@ def undo_shift():
     """
     This method undo previous employees shift information regards to the shift request
     """
-    from django.contrib.auth.models import User
-
     from base.models import ShiftRequest
+    from solich_auth.models import SolichUser
 
     today = date.today()
     # here will get all the active shift requests
@@ -307,7 +312,7 @@ def undo_shift():
             # making the instance in-active
             request.is_active = False
             request.save()
-            bot = User.objects.filter(username="Solich Bot").first()
+            bot = SolichUser.objects.filter(username="Solich Bot").first()
             if bot is not None:
                 employee = request.employee_id
                 notify.send(
@@ -328,9 +333,8 @@ def switch_work_type():
     """
     This method change employees work type information regards to the work type request
     """
-    from django.contrib.auth.models import User
-
     from base.models import WorkTypeRequest
+    from solich_auth.models import SolichUser
 
     today = date.today()
     work_type_requests = WorkTypeRequest.objects.filter(
@@ -347,7 +351,7 @@ def switch_work_type():
         request.approved = True
         request.work_type_changed = True
         request.save()
-        bot = User.objects.filter(username="Solich Bot").first()
+        bot = SolichUser.objects.filter(username="Solich Bot").first()
         if bot is not None:
             employee = request.employee_id
             notify.send(
@@ -368,9 +372,8 @@ def undo_work_type():
     """
     This method undo previous employees work type information regards to the work type request
     """
-    from django.contrib.auth.models import User
-
     from base.models import WorkTypeRequest
+    from solich_auth.models import SolichUser
 
     today = date.today()
     # here will get all the active work type requests
@@ -389,7 +392,7 @@ def undo_work_type():
         # making the instance is in-active
         request.is_active = False
         request.save()
-        bot = User.objects.filter(username="Solich Bot").first()
+        bot = SolichUser.objects.filter(username="Solich Bot").first()
         if bot is not None:
             employee = request.employee_id
             notify.send(
@@ -406,67 +409,117 @@ def undo_work_type():
     return
 
 
-scheduler = BackgroundScheduler()
+def recurring_holiday():
+    from .models import Holidays
 
-# Set the initial start time to the current time
-start_time = datetime.now()
+    recurring_holidays = Holidays.objects.filter(recurring=True)
+    today = datetime.now()
+    # Looping through all recurring holiday
+    for recurring_holiday in recurring_holidays:
+        start_date = recurring_holiday.start_date
+        end_date = recurring_holiday.end_date
+        new_start_date = date(start_date.year + 1, start_date.month, start_date.day)
+        new_end_date = date(end_date.year + 1, end_date.month, end_date.day)
+        # Checking that end date is not none
+        if end_date is None:
+            # checking if that start date is day before today
+            if start_date == (today - timedelta(days=1)).date():
+                recurring_holiday.start_date = new_start_date
+        elif end_date == (today - timedelta(days=1)).date():
+            recurring_holiday.start_date = new_start_date
+            recurring_holiday.end_date = new_end_date
+        recurring_holiday.save()
 
-# Add jobs with next_run_time set to the end of the previous job
-try:
-    scheduler.add_job(rotate_shift, "interval", minutes=5, id="job1")
-except:
-    pass
 
-try:
-    scheduler.add_job(
-        rotate_work_type,
-        "interval",
-        minutes=5,
-        id="job2",
+def sync_roster_shifts():
+    """
+    Daily at 00:05 — sync published roster entries to employee work info.
+    For each employee with a published non-off roster entry dated today,
+    update their EmployeeWorkInformation.shift_id to match.
+    """
+    from base.models import Roster
+    from employee.models import EmployeeWorkInformation
+
+    today = date.today()
+    entries = (
+        Roster.objects.filter(date=today, is_published=True, is_off=False)
+        .select_related("employee", "shift")
+        .exclude(shift__isnull=True)
     )
-except:
-    pass
-
-try:
-    scheduler.add_job(
-        undo_shift,
-        "interval",
-        minutes=5,
-        id="job3",
-    )
-except:
-    pass
-
-try:
-    scheduler.add_job(
-        switch_shift,
-        "interval",
-        minutes=5,
-        id="job4",
-    )
-except:
-    pass
-
-try:
-    scheduler.add_job(
-        undo_work_type,
-        "interval",
-        minutes=5,
-        id="job6",
-    )
-except:
-    pass
-
-try:
-    scheduler.add_job(
-        switch_work_type,
-        "interval",
-        minutes=5,
-        id="job5",
-    )
-except:
-    pass
+    for entry in entries:
+        try:
+            work_info = EmployeeWorkInformation.objects.filter(
+                employee_id=entry.employee
+            ).first()
+            if work_info and work_info.shift_id != entry.shift:
+                work_info.shift_id = entry.shift
+                work_info.save(update_fields=["shift_id"])
+        except Exception:
+            pass
 
 
-# scheduler.start()
+if not any(
+    cmd in sys.argv
+    for cmd in ["makemigrations", "migrate", "compilemessages", "flush", "shell"]
+):
+    scheduler = BackgroundScheduler()
 
+    # Add jobs with next_run_time set to the end of the previous job
+    try:
+        scheduler.add_job(rotate_shift, "interval", hours=4, id="job1")
+    except:
+        pass
+
+    try:
+        scheduler.add_job(
+            rotate_work_type,
+            "interval",
+            hours=4,
+            id="job2",
+        )
+    except:
+        pass
+
+    try:
+        scheduler.add_job(
+            undo_shift,
+            "interval",
+            hours=4,
+            id="job3",
+        )
+    except:
+        pass
+
+    try:
+        scheduler.add_job(
+            switch_shift,
+            "interval",
+            hours=4,
+            id="job4",
+        )
+    except:
+        pass
+
+    try:
+        scheduler.add_job(
+            undo_work_type,
+            "interval",
+            hours=4,
+            id="job6",
+        )
+    except:
+        pass
+
+    try:
+        scheduler.add_job(
+            switch_work_type,
+            "interval",
+            hours=4,
+            id="job5",
+        )
+    except:
+        pass
+
+    scheduler.add_job(recurring_holiday, "interval", hours=4)
+    scheduler.add_job(sync_roster_shifts, "interval", hours=4)
+    scheduler.start()

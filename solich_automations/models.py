@@ -1,26 +1,23 @@
-from typing import Any
-
-from django.conf import settings
 from django.db import models
 from django.urls import reverse
-from django.utils.translation import gettext_lazy as _trans
+from django.utils.translation import gettext_lazy as _
 
+from base.methods import eval_validate
+from base.models import SolichMailTemplate
 from employee.models import Employee
 from solich.models import SolichModel
-from solich_automations.methods.methods import get_related_models
 from solich_views.cbv_methods import render_template
-from recruitment.models import RecruitmentMailTemplate
 
 MODEL_CHOICES = []
 
 CONDITIONS = [
-    ("equal", _trans("Equal (==)")),
-    ("notequal", _trans("Not Equal (!=)")),
-    ("lt", _trans("Less Than (<)")),
-    ("gt", _trans("Greater Than (>)")),
-    ("le", _trans("Less Than or Equal To (<=)")),
-    ("ge", _trans("Greater Than or Equal To (>=)")),
-    ("icontains", _trans("Contains")),
+    ("equal", _("Equal (==)")),
+    ("notequal", _("Not Equal (!=)")),
+    ("lt", _("Less Than (<)")),
+    ("gt", _("Greater Than (>)")),
+    ("le", _("Less Than or Equal To (<=)")),
+    ("ge", _("Greater Than or Equal To (>=)")),
+    ("icontains", _("Contains")),
 ]
 
 
@@ -30,32 +27,69 @@ class MailAutomation(SolichModel):
     """
 
     choices = [
-        ("on_create", "On Create"),
-        ("on_update", "On Update"),
-        ("on_delete", "On Delete"),
+        ("on_create", _("On Create")),
+        ("on_update", _("On Update")),
+        ("on_delete", _("On Delete")),
     ]
-    title = models.CharField(max_length=50, unique=True)
-    method_title = models.CharField(max_length=50, editable=False)
-    model = models.CharField(max_length=100, choices=MODEL_CHOICES, null=False)
-    mail_to = models.TextField(verbose_name="Mail to")
+    SEND_OPTIONS = [
+        ("email", _("Send as Email")),
+        ("notification", _("Send as Notification")),
+        ("both", _("Send as Email and Notification")),
+    ]
+
+    title = models.CharField(max_length=256, unique=True)
+    method_title = models.CharField(max_length=100, editable=False)
+    model = models.CharField(
+        max_length=100, choices=MODEL_CHOICES, null=False, verbose_name=_("Model")
+    )
+    mail_to = models.TextField(verbose_name=_("Mail to/Notify to"))
     mail_details = models.CharField(
         max_length=250,
-        help_text="Fill mail template details(reciever/instance, `self` will be the person who trigger the automation)",
+        help_text=_(
+            "Fill mail template details(reciever/instance, `self` will be the person who trigger the automation)"
+        ),
+        verbose_name=_("Mail Details"),
     )
     mail_detail_choice = models.TextField(default="", editable=False)
-    trigger = models.CharField(max_length=10, choices=choices)
+    trigger = models.CharField(
+        max_length=10, choices=choices, verbose_name=_("Trigger Condition")
+    )
     # udpate the on_update logic to if and only if when
     # changes in the previous and current value
-    mail_template = models.ForeignKey(RecruitmentMailTemplate, on_delete=models.CASCADE)
+    mail_template = models.ForeignKey(
+        SolichMailTemplate,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        verbose_name=_("Mail Template"),
+    )
+    also_sent_to = models.ManyToManyField(
+        Employee,
+        blank=True,
+        verbose_name=_("Also Send to"),
+    )
+    delivery_channel = models.CharField(
+        default="email",
+        max_length=50,
+        choices=SEND_OPTIONS,
+        verbose_name=_("Choose Delivery Channel"),
+    )
     template_attachments = models.ManyToManyField(
-        RecruitmentMailTemplate,
+        SolichMailTemplate,
         related_name="template_attachment",
         blank=True,
+        verbose_name=_("Template Attachments"),
     )
     condition_html = models.TextField(null=True, editable=False)
     condition_querystring = models.TextField(null=True, editable=False)
 
     condition = models.TextField()
+
+    xss_exempt_fields = [
+        "condition_html",
+        "condition",
+        "condition_querystring",
+    ]
 
     def save(self, *args, **kwargs):
         if not self.pk:
@@ -78,7 +112,7 @@ class MailAutomation(SolichModel):
         method that returns the display value for `mail_to`
         field
         """
-        mail_to = eval(self.mail_to)
+        mail_to = eval_validate(self.mail_to)
         mappings = []
         for mapping in mail_to:
             mapping = mapping.split("__")
@@ -90,7 +124,13 @@ class MailAutomation(SolichModel):
             display = display[:-1]
             mappings.append(display)
         return render_template(
-            "Solich_automations/mail_to.html", {"instance": self, "mappings": mappings}
+            "solich_automations/mail_to.html", {"instance": self, "mappings": mappings}
+        )
+
+    def get_mail_cc_display(self):
+        employees = self.also_sent_to.all()
+        return render_template(
+            "solich_automations/mail_cc.html", {"employees": employees}
         )
 
     def detailed_url(self):
@@ -98,7 +138,7 @@ class MailAutomation(SolichModel):
 
     def conditions(self):
         return render_template(
-            "Solich_automations/conditions.html", {"instance": self}
+            "solich_automations/conditions.html", {"instance": self}
         )
 
     def delete_url(self):
@@ -114,3 +154,12 @@ class MailAutomation(SolichModel):
         """"""
         return self.get_trigger_display()
 
+    def detail_view_actions(self):
+        """
+        This method for get detail view actions.
+        """
+
+        return render_template(
+            path="solich_automations/detail_actions.html",
+            context={"instance": self},
+        )

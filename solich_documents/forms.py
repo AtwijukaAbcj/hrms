@@ -19,17 +19,17 @@ class DocumentRequestForm(ModelForm):
         exclude = ["is_active"]
 
     def clean(self):
-        for field_name, field_instance in self.fields.items():
-            if isinstance(field_instance, SolichMultiSelectField):
-                self.errors.pop(field_name, None)
-                if len(self.data.getlist(field_name)) < 1:
-                    raise forms.ValidationError({field_name: "Thif field is required"})
-                cleaned_data = super().clean()
-                employee_data = self.fields[field_name].queryset.filter(
-                    id__in=self.data.getlist(field_name)
-                )
-                cleaned_data[field_name] = employee_data
         cleaned_data = super().clean()
+        if isinstance(self.fields["employee_id"], SolichMultiSelectField):
+            self.errors.pop("employee_id", None)
+            if len(self.data.getlist("employee_id")) < 1:
+                raise forms.ValidationError({"employee_id": "This field is required"})
+
+            employee_data = self.fields["employee_id"].queryset.filter(
+                id__in=self.data.getlist("employee_id")
+            )
+            cleaned_data["employee_id"] = employee_data
+
         return cleaned_data
 
     def __init__(self, *args, **kwargs):
@@ -39,7 +39,7 @@ class DocumentRequestForm(ModelForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=True,
                 instance=self.instance,
@@ -52,19 +52,18 @@ class DocumentRequestForm(ModelForm):
 class DocumentForm(ModelForm):
     """form to create a new Document"""
 
-    expiry_date = forms.DateField(
-        widget=forms.DateInput(attrs={"type": "date"}),
-        required=False,
-    )
-
-    verbose_name = "Document"
-
     class Meta:
         model = Document
         fields = "__all__"
         exclude = ["document_request_id", "status", "reject_reason", "is_active"]
         widgets = {
             "employee_id": forms.HiddenInput(),
+            "issue_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input  w-100"}
+            ),
+            "expiry_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input  w-100"}
+            ),
         }
 
     def as_p(self):
@@ -75,24 +74,43 @@ class DocumentForm(ModelForm):
         table_html = render_to_string("common_form.html", context)
         return table_html
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["expiry_date"].widget.attrs.update(
+            {
+                "hx-target": "#id_notify_before_parent_div",
+                "hx-trigger": "load,change",
+                "hx-swap": "innerHTML",
+                "hx-get": "/employee/get-notify-field/",
+            }
+        )
+
 
 class DocumentUpdateForm(ModelForm):
     """form to Update a Document"""
 
+    cols = {"document": 12}
+
     verbose_name = "Document"
-    expiry_date = forms.DateField(
-        widget=forms.DateInput(attrs={"type": "date"}),
-        required=False,
-    )
 
     class Meta:
         model = Document
         fields = "__all__"
         exclude = ["is_active"]
+        widgets = {
+            "issue_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input  w-100"}
+            ),
+            "expiry_date": forms.DateInput(
+                attrs={"type": "date", "class": "oh-input  w-100"}
+            ),
+        }
 
 
-class DocumentRejectForm(ModelForm):
+class DocumentRejectCbvForm(ModelForm):
     """form to add rejection reason while rejecting a Document"""
+
+    cols = {"reject_reason": 12}
 
     class Meta:
         model = Document
@@ -102,3 +120,10 @@ class DocumentRejectForm(ModelForm):
         super().__init__(*args, **kwargs)
         self.fields["reject_reason"].widget.attrs["required"] = True
 
+
+class DocumentRejectForm(ModelForm):
+    verbose_name = Document()._meta.get_field("reject_reason").verbose_name
+
+    class Meta:
+        model = Document
+        fields = ["reject_reason"]

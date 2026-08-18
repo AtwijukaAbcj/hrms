@@ -1,3 +1,4 @@
+# pylint: disable=too-few-public-methods
 """
 Module for defining filters related to biometric devices.
 
@@ -9,9 +10,10 @@ import django_filters
 
 from base.filters import FilterSet
 from biometric.models import BiometricDevices
+from solich.filters import SolichFilterSet
 
 
-class BiometricDeviceFilter(FilterSet):
+class BiometricDeviceFilter(SolichFilterSet):
     """
     Filter class for querying biometric devices.
 
@@ -34,4 +36,3 @@ class BiometricDeviceFilter(FilterSet):
             "is_scheduler",
             "is_live",
         ]
-

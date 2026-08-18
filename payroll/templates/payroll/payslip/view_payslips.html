@@ -9,88 +9,6 @@
   }
 </style>
 <div id="messages"></div>
-<div
-  class="oh-modal"
-  id="individualPayslipModal"
-  role="dialog"
-  aria-labelledby="individualPayslipModal"
-  aria-hidden="true"
-  >
-  <div class="oh-modal__dialog">
-    <div class="oh-modal__dialog-header pb-0">
-      <h1 class="oh-modal__dialog-title" id="addEmployeeModalLabel">
-        {% trans "Create Payslip" %}
-      </h1>
-      <button
-        class="oh-modal__close--custom"
-        hx-get="{% url 'payslip-create-form-initialize' %}"
-        hx-target="#individualPayslipModalBody"
-        onclick="$(this).closest('.oh-modal--show').removeClass('oh-modal--show');"
-      >
-        <ion-icon name="close-outline"></ion-icon>
-      </button>
-    </div>
-    <div class="oh-modal__dialog-body" id="individualPayslipModalBody">
-      {% include "payroll/payslip/create_payslip.html" %}
-    </div>
-  </div>
-</div>
-
-<div
-  class="oh-modal"
-  id="bulkPayslipModal"
-  role="dialog"
-  aria-labelledby="bulkPayslipModal"
-  aria-hidden="true"
-  >
-  <div class="oh-modal__dialog">
-    <div class="oh-modal__dialog-header pb-0">
-      <h1 class="oh-modal__dialog-title" id="addEmployeeModalLabel">
-        {% trans "Bulk Payslip" %}
-      </h1>
-      <button class="oh-modal__close" aria-label="Close">
-        <ion-icon name="close-outline"></ion-icon>
-      </button>
-    </div>
-    <div class="oh-modal__dialog-body" id="bulkPayslipModal">
-      {% include "payroll/payslip/bulk_create_payslip.html" %}
-    </div>
-  </div>
-</div>
-
-<div
-  class="oh-modal"
-  id="payslipExport"
-  role="dialog"
-  aria-labelledby="payslipExport"
-  aria-hidden="true"
-  >
-  <div class="oh-modal__dialog">
-    <div class="oh-modal__dialog-header">
-      <h2 class="oh-modal__dialog-title" id="employeeExportLavel">
-        {% trans "Export Payslips" %}
-      </h2>
-      <button class="oh-modal__close" aria-label="Close">
-        <ion-icon name="close-outline"></ion-icon>
-      </button>
-      <div class="oh-modal__dialog-body p-0 pt-2" id="payslipExportModalBody">
-        <form
-          action="{%url 'payslip-info-export' %}"
-          method="get"
-          onsubmit="event.stopPropagation();$(this).parents().find('.oh-modal--show').last().toggleClass('oh-modal--show');"
-          id="payslipExportForm"
-        >
-          {% csrf_token %} {% include 'payroll/payslip/payslip_export_filter.html' %}
-          <div class="oh-dropdown__filter-footer">
-            <button class="oh-btn oh-btn--secondary oh-btn--small w-100">
-              {% trans "Export" %}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
 
 <section class="oh-wrapper oh-main__topbar" x-data="{searchShow: false}">
   <div class="oh-main__titlebar oh-main__titlebar--left">
@@ -98,14 +16,14 @@
     <a
       class="oh-main__titlebar-search-toggle"
       role="button"
-      aria-label="Toggle Search"
+      aria-label="{% trans 'Toggle Search' %}"
       @click="searchShow = !searchShow"
       >
       <ion-icon
         name="search-outline"
         class="oh-main__titlebar-serach-icon md hydrated"
         role="img"
-        aria-label="search outline"
+        aria-label="{% trans 'search outline' %}"
       ></ion-icon>
     </a>
   </div>
@@ -130,7 +48,7 @@
           <input
             type="text"
             class="oh-input oh-input__icon"
-            aria-label="Search Input"
+            aria-label="{% trans 'Search Input' %}"
             id="payslip-search"
             name="search"
             placeholder="{% trans 'Search' %}"
@@ -182,7 +100,7 @@
               <div class="row">
                 <div class="col-sm-12 col-md-12 col-lg-6">
                   <div class="oh-input-group">
-                    <label class="oh-label">{% trans "Field" %}</label>
+                    <label class="oh-label">{% trans "Fields" %}</label>
                   </div>
                 </div>
                 <div class="col-sm-12 col-md-12 col-lg-6">
@@ -205,7 +123,7 @@
           </div>
         </div>
       {% endif %}
-      {% if perms.payroll.add_payslip %}
+      {% if perms.payroll.add_payslip or perms.payroll.delete_payslip or perms.payroll.change_payslip %}
         <div class="oh-dropdown" x-data="{open: false}">
           <button
             class="oh-btn oh-btn--dropdown ml-2 h-100"
@@ -226,8 +144,23 @@
                   <a
                     class="oh-dropdown__link"
                     data-toggle="oh-modal-toggle"
-                    data-target="#bulkPayslipModal"
+                    data-target="#objectCreateModal"
+                    hx-get="{% url 'generate-payslip' %}"
+                    hx-target="#objectCreateModalTarget"
                     >{% trans "Generate" %}</a
+                  >
+                </li>
+              {% endif %}
+              {% if perms.payroll.add_payslip and payslips %}
+                <li class="oh-dropdown__item">
+                  <a
+                    hx-get="{%url 'payslip-detailed-export' %}"
+                    hx-target = "#objectDetailsModalTarget"
+                    class="oh-dropdown__link"
+                    id="employee-payslip-Report"
+                    data-toggle="oh-modal-toggle"
+                    data-target="#objectDetailsModal"
+                    >{% trans "Payslip report" %}</a
                   >
                 </li>
               {% endif %}
@@ -260,11 +193,12 @@
               {% if perms.payroll.add_payslip and payslips %}
                 <li class="oh-dropdown__item">
                   <a
-                    href="#"
+                    hx-get="{%url 'payslip-info-export' %}"
+                    hx-target = "#objectDetailsModalTarget"
                     class="oh-dropdown__link"
                     id="employee-payslip-export"
                     data-toggle="oh-modal-toggle"
-                    data-target="#payslipExport"
+                    data-target="#objectDetailsModal"
                     >{% trans "Export" %}</a
                   >
                 </li>
@@ -273,6 +207,7 @@
                 <li class="oh-dropdown__item">
                   <a
                     class="oh-dropdown__link oh-dropdown__link--danger"
+                    data-action="delete"
                     id="deletePayslipBulk"
                     >{% trans "Delete" %}</a
                   >
@@ -288,13 +223,15 @@
           <a
             class="oh-btn oh-btn--secondary oh-btn--shadow"
             data-toggle="oh-modal-toggle"
-            data-target="#individualPayslipModal"
+            data-target="#objectCreateModal"
+            hx-get="{% url 'create-payslip' %}"
+            hx-target="#objectCreateModalTarget"
           >
             <ion-icon
               class="md hydrated"
               name="add-outline"
               role="img"
-              aria-label="add outline"
+              aria-label="{% trans 'add outline' %}"
             ></ion-icon
             >{% trans "Create" %}</a
           >
@@ -327,64 +264,16 @@
       </div>
     </div>
     {% else %}
-    <main :class="sidebarOpen ? 'oh-main__sidebar-visible' : ''">
-      <div class="oh-wrapper">
-        <div class="oh-404">
-          <img
-            style="width: 150px; height: 150px"
-            src="{% static 'images/ui/salary.png' %}"
-            class="oh-404__image mb-4"
-            alt="Page not found. 404."
-          />
-          <h5 class="oh-404__subtitle">
-            {% trans "There are currently no payslips to consider." %}
-          </h5>
-        </div>
+      <div class="oh-empty">
+        <img src="{% static 'images/ui/search.svg' %}" class="oh-404__image" alt="{% trans 'Page not found. 404.' %}" />
+        <h1 class="oh-empty__title">{% trans "No Records found." %}</h1>
+        <p class="oh-empty__subtitle">{% trans "No payslips have been generated." %}</p>
       </div>
-    </main>
     {% endif %}
 
     <div id="messageContainer"></div>
 
     <script>
-      var no_rows_payslip_send = {
-        ar: "لم يتم اختيار أي صفوف لإرسال قسائم الرواتب.",
-        de: "Es wurden keine Zeilen zum Senden von Gehaltsabrechnungen ausgewählt.",
-        es: "No se han seleccionado filas para enviar las nóminas.",
-        en: "No rows are selected for sending payslips.",
-        fr: "Aucune ligne n'est sélectionnée pour l'envoi des bulletins de salaire.",
-      };
-      var mail_processing = {
-        ar: "معالجة البريد.",
-        de: "Mailverarbeitung.",
-        es: "Procesamiento de correo.",
-        en: "Mail processing.",
-        fr: "Traitement du courrier.",
-      };
-      function getCurrentLanguageCode(callback) {
-        var languageCode = $("#main-section-data").attr("data-lang");
-        var allowedLanguageCodes = ["ar", "de", "es", "en", "fr"];
-        if (allowedLanguageCodes.includes(languageCode)) {
-          callback(languageCode);
-        } else {
-          $.ajax({
-            type: "GET",
-            url: "/employee/get-language-code/",
-            success: function (response) {
-              var ajaxLanguageCode = response.language_code;
-              $("#main-section-data").attr("data-lang", ajaxLanguageCode);
-              callback(
-                allowedLanguageCodes.includes(ajaxLanguageCode)
-                  ? ajaxLanguageCode
-                  : "en"
-              );
-            },
-            error: function () {
-              callback("en");
-            },
-          });
-        }
-      }
       function updateBulkStatus(element) {
         var status = element.val();
         var ids = [];
@@ -433,8 +322,7 @@
                   .parent()
                   .parent()
                   .parent()
-                  .parent()
-                  .find("[name=pay_status]")
+                  .find("[name=status]")
                   .val(status);
               } else {
                 containerCheckBoxes
@@ -445,8 +333,7 @@
                   .parent()
                   .parent()
                   .parent()
-                  .parent()
-                  .find("[name=pay_status]")
+                  .find("[name=status]")
                   .val(status);
               }
               $("#messageContainer").html(
@@ -500,13 +387,17 @@
           var form = $(this); // Get the form element
           var formData = form.serialize(); // Serialize the form data as a URL-encoded string
 
-          $(".errorlist").remove();
           $.ajax({
             type: "get",
             url: "{% url 'validate-start-date' %}",
             data: formData,
             success: function (response) {
-              form.prepend(response.message);
+              let ul = $(".errorlist")
+              response.errors.forEach(msg => {
+                const li = document.createElement("li");
+                li.textContent = msg;
+                ul.appendChild(li);
+              });
               if (response.valid) {
                 form[0].submit();
               }
@@ -562,44 +453,39 @@
       }
       $("#payslipBulkSend").click(function (e) {
         e.preventDefault();
-        var languageCode = null;
-        getCurrentLanguageCode(function (code) {
-          languageCode = code;
-          var idsJson = $("#selectedPayslip").attr("data-ids");
-          var ids = JSON.parse(idsJson);
-          if (ids.length > 0) {
-            $.ajax({
-              type: "get",
-              url: `/payroll/send-slip`,
-              data: { id: ids },
-              traditional: true,
-              success: function (response) {
-                  var mailProcessingMessage = mail_processing[languageCode];
+        var idsJson = $("#selectedPayslip").attr("data-ids");
+        var ids = JSON.parse(idsJson);
+        if (ids.length > 0) {
+          $.ajax({
+            type: "get",
+            url: `/payroll/send-slip`,
+            data: { id: ids },
+            traditional: true,
+            success: function (response) {
+                var mailProcessingMessage = "Mail processing.";
 
-                $("#messages").html(
-                  $(`
-                <div class="oh-alert-container">
-                  <div class="oh-alert oh-alert--animated oh-alert--info">`
-                   + mailProcessingMessage +`
-                  </div>
+              $("#messages").html(
+                $(`
+              <div class="oh-alert-container">
+                <div class="oh-alert oh-alert--animated oh-alert--info">`
+                  + mailProcessingMessage +`
                 </div>
-                `)
-                );
-                $("#unselectAllPayslip").click();
-                $(".payslip-checkbox:checked").prop("checked", false).change();
-              },
-            });
-          }else{
-            var textMessage = no_rows_payslip_send[languageCode];
-            Swal.fire({
-              text: textMessage,
-              icon: "warning",
-              confirmButtonText: "Close",
-            });
-                $("#unselectAllPayslip").click();
-                $(".payslip-checkbox:checked").prop("checked", false).change();
-          }
-        });
+              </div>
+              `)
+              );
+              $("#unselectAllPayslip").click();
+              $(".payslip-checkbox:checked").prop("checked", false).change();
+            },
+          });
+        }else{
+          Swal.fire({
+            text: i18nMessages.noRowsSelected,
+            icon: "warning",
+            confirmButtonText: i18nMessages.close,
+          });
+              $("#unselectAllPayslip").click();
+              $(".payslip-checkbox:checked").prop("checked", false).change();
+        }
       });
     </script>
   </div>

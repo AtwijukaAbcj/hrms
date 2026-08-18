@@ -18,4 +18,3 @@ TEMPLATES[0]["OPTIONS"]["context_processors"].append(
 TEMPLATES[0]["OPTIONS"]["context_processors"].append(
     "payroll.context_processors.host",
 )
-

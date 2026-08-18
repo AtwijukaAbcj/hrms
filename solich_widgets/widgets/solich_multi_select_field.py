@@ -10,4 +10,3 @@ class SolichMultiSelectField(forms.ModelMultipleChoiceField):
     """
     SolichMultiSelectField
     """
-

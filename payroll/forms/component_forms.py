@@ -9,19 +9,23 @@ import uuid
 from typing import Any
 
 from django import forms
+from django.apps import apps
 from django.template.loader import render_to_string
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 import payroll.models.models
 from base.forms import Form, ModelForm
 from base.methods import reload_queryset
+from base.models import Company
 from employee.filters import EmployeeFilter
 from employee.models import BonusPoint, Employee
 from solich import solich_middlewares
-from solich_widgets.forms import SolichForm
+from solich.solich_middlewares import _thread_locals
+from solich.methods import get_solich_model_class
+from solich_widgets.forms import SolichForm, default_select_option_template
 from solich_widgets.widgets.solich_multi_select_field import SolichMultiSelectField
 from solich_widgets.widgets.select_widgets import SolichMultiSelectWidget
-from leave.models import AvailableLeave, LeaveType
 from notifications.signals import notify
 from payroll.models import tax_models as models
 from payroll.models.models import (
@@ -40,7 +44,7 @@ from payroll.widgets import component_widgets as widget
 logger = logging.getLogger(__name__)
 
 
-class AllowanceForm(forms.ModelForm):
+class AllowanceForm(ModelForm):
     """
     Form for Allowance model
     """
@@ -78,7 +82,7 @@ class AllowanceForm(forms.ModelForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 instance=self.instance,
             ),
@@ -105,11 +109,16 @@ class AllowanceForm(forms.ModelForm):
 
         specific_employees = self.data.getlist("specific_employees")
         include_all = self.data.get("include_active_employees")
+        condition_based = self.data.get("is_condition_based")
 
         for field_name, field_instance in self.fields.items():
             if isinstance(field_instance, SolichMultiSelectField):
                 self.errors.pop(field_name, None)
-                if not specific_employees and include_all is None:
+                if (
+                    not specific_employees
+                    and include_all is None
+                    and not condition_based
+                ):
                     raise forms.ValidationError({field_name: "This field is required"})
                 cleaned_data = super().clean()
                 data = self.fields[field_name].queryset.filter(
@@ -146,6 +155,11 @@ class AllowanceForm(forms.ModelForm):
             cleaned_data["end_range"] = None
 
     def save(self, commit: bool = ...) -> Any:
+        specific_employees = self.data.getlist("specific_employees")
+        include_all = self.data.get("include_active_employees")
+        condition_based = self.data.get("is_condition_based")
+        if not specific_employees and not include_all and not condition_based:
+            self.instance.include_active_employees = True
         super().save(commit)
         other_conditions = self.data.getlist("other_conditions")
         other_fields = self.data.getlist("other_fields")
@@ -170,7 +184,7 @@ class AllowanceForm(forms.ModelForm):
         return multiple_conditions
 
 
-class DeductionForm(forms.ModelForm):
+class DeductionForm(ModelForm):
     """
     Form for Deduction model
     """
@@ -202,13 +216,12 @@ class DeductionForm(forms.ModelForm):
                 }
             kwargs["initial"] = initial
         super().__init__(*args, **kwargs)
-
         self.fields["specific_employees"] = SolichMultiSelectField(
             queryset=Employee.objects.all(),
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 instance=self.instance,
             ),
@@ -221,17 +234,25 @@ class DeductionForm(forms.ModelForm):
         )
         reload_queryset(self.fields)
         self.fields["style"].widget = widget.StyleWidget(form=self)
+        for field_name, field in self.fields.items():
+            if isinstance(field.widget, forms.Select):
+                field.widget.option_template_name = default_select_option_template
 
     def clean(self, *args, **kwargs):
         cleaned_data = super().clean(*args, **kwargs)
 
         specific_employees = self.data.getlist("specific_employees")
         include_all = self.data.get("include_active_employees")
+        condition_based = self.data.get("is_condition_based")
 
         for field_name, field_instance in self.fields.items():
             if isinstance(field_instance, SolichMultiSelectField):
                 self.errors.pop(field_name, None)
-                if not specific_employees and include_all is None:
+                if (
+                    not specific_employees
+                    and include_all is None
+                    and not condition_based
+                ):
                     raise forms.ValidationError({field_name: "This field is required"})
                 cleaned_data = super().clean()
                 data = self.fields[field_name].queryset.filter(
@@ -300,6 +321,11 @@ class DeductionForm(forms.ModelForm):
         return table_html
 
     def save(self, commit: bool = ...) -> Any:
+        specific_employees = self.data.getlist("specific_employees")
+        include_all = self.data.get("include_active_employees")
+        condition_based = self.data.get("is_condition_based")
+        if not specific_employees and not include_all and not condition_based:
+            self.instance.include_active_employees = True
         super().save(commit)
         other_conditions = self.data.getlist("other_conditions")
         other_fields = self.data.getlist("other_fields")
@@ -329,6 +355,12 @@ class PayslipForm(ModelForm):
     Form for Payslip
     """
 
+    cols = {
+        "employee_id": 12,
+        "start_date": 12,
+        "end_date": 12,
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         active_contracts = Contract.objects.filter(contract_status="active")
@@ -337,6 +369,15 @@ class PayslipForm(ModelForm):
             for contract in active_contracts
             if contract.employee_id.is_active
         ]
+        self.fields["employee_id"].widget.attrs.update(
+            {
+                "hx-get": "/payroll/check-contract-start-date",
+                "hx-target": "#contractStartDateDiv",
+                "hx-include": "#payslipCreateForm",
+                "hx-trigger": "change delay:300ms",
+                "hx-swap": "innerHTML",
+            }
+        )
         if self.instance.pk is None:
             self.initial["start_date"] = datetime.date.today().replace(day=1)
             self.initial["end_date"] = datetime.date.today()
@@ -357,6 +398,11 @@ class PayslipForm(ModelForm):
             "start_date": forms.DateInput(
                 attrs={
                     "type": "date",
+                    "hx-get": "/payroll/check-contract-start-date",
+                    "hx-target": "#contractStartDateDiv",
+                    "hx-include": "#payslipCreateForm",
+                    "hx-trigger": "change delay:300ms",
+                    "hx-swap": "innerHTML",
                 }
             ),
             "end_date": forms.DateInput(
@@ -374,7 +420,7 @@ class GeneratePayslipForm(SolichForm):
 
     group_name = forms.CharField(
         label="Batch name",
-        required=False,
+        required=True,
         # help_text="Enter +-something if you want to generate payslips by batches",
     )
     employee_id = SolichMultiSelectField(
@@ -382,11 +428,11 @@ class GeneratePayslipForm(SolichForm):
         widget=SolichMultiSelectWidget(
             filter_route_name="employee-widget-filter",
             filter_class=EmployeeFilter,
-            filter_instance_contex_name="f",
+            filter_instance_context_name="f",
             filter_template_path="employee_filters.html",
-            required=True,
         ),
         label="Employee",
+        required=True,
     )
     start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
     end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
@@ -395,6 +441,7 @@ class GeneratePayslipForm(SolichForm):
         cleaned_data = super().clean()
         start_date = cleaned_data.get("start_date")
         end_date = cleaned_data.get("end_date")
+
         today = datetime.date.today()
         if end_date < start_date:
             raise forms.ValidationError(
@@ -452,6 +499,9 @@ class PayrollSettingsForm(ModelForm):
 
         model = models.PayrollSettings
         fields = "__all__"
+        widgets = {
+            "position": forms.Select(attrs={"class": "oh-select oh-select-2 w-100"}),
+        }
 
 
 excel_columns = [
@@ -519,28 +569,58 @@ class ContractExportFieldForm(forms.Form):
     )
 
 
+from django.core.exceptions import ValidationError
+
+
+def rate_validator(value):
+    """
+    Percentage validator
+    """
+    if value < 0:
+        raise ValidationError(_("Rate must be greater than 0"))
+    if value > 100:
+        raise ValidationError(_("Rate must be less than 100"))
+
+
 class BonusForm(Form):
     """
     Bonus Creating Form
     """
 
     title = forms.CharField(max_length=100)
-    date = forms.DateField(widget=forms.DateInput())
+    date = forms.DateField(widget=forms.DateInput(), required=False)
     employee_id = forms.IntegerField(label="Employee", widget=forms.HiddenInput())
-    amount = forms.DecimalField(label="Amount")
+    is_fixed = forms.BooleanField(
+        label="Is Fixed", initial=True, required=False, widget=forms.CheckboxInput()
+    )
+    amount = forms.DecimalField(
+        label="Amount",
+        required=False,
+    )
+    based_on = forms.ChoiceField(choices=[("BASIC_PAY", "Basic Pay")], required=False)
+    rate = forms.FloatField(
+        validators=[
+            rate_validator,
+        ],
+        label="Rate",
+        required=False,
+    )
 
     def save(self, commit=True):
         title = self.cleaned_data["title"]
         date = self.cleaned_data["date"]
         employee_id = self.cleaned_data["employee_id"]
         amount = self.cleaned_data["amount"]
+        is_fixed = self.cleaned_data["is_fixed"]
+        rate = self.cleaned_data["rate"]
 
         bonus = Allowance()
         bonus.title = title
         bonus.one_time_date = date
         bonus.only_show_under_employee = True
         bonus.amount = amount
-        bonus.is_fixed = True
+        bonus.is_fixed = is_fixed
+        bonus.rate = rate
         bonus.save()
         bonus.include_active_employees = False
         bonus.specific_employees.set([employee_id])
@@ -555,6 +635,7 @@ class BonusForm(Form):
         self.fields["date"].widget = forms.DateInput(
             attrs={"type": "date", "class": "oh-input w-100"}
         )
+        self.fields["is_fixed"].widget.attrs.update({"class": "oh-switch__checkbox"})
 
 
 class PayslipAllowanceForm(BonusForm):
@@ -606,12 +687,15 @@ class LoanAccountForm(ModelForm):
     LoanAccountForm
     """
 
-    verbose_name = "Loan / Advanced Sarlary"
+    verbose_name = _("Loans & Salary Advances")
+    cols = {
+        "description": 12,
+    }
 
     class Meta:
         model = LoanAccount
         fields = "__all__"
-        exclude = ["is_active"]
+        exclude = ["is_active", "settled_date"]
         widgets = {
             "provided_date": forms.DateTimeInput(attrs={"type": "date"}),
             "installment_start_date": forms.DateTimeInput(attrs={"type": "date"}),
@@ -627,6 +711,7 @@ class LoanAccountForm(ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.initial["provided_date"] = str(datetime.date.today())
         self.initial["installment_start_date"] = str(datetime.date.today())
         if self.instance.pk:
             self.verbose_name = self.instance.title
@@ -636,23 +721,65 @@ class LoanAccountForm(ModelForm):
                     self.instance.deduction_ids.values_list("id", flat=True)
                 )
             ).exists():
-                fields_to_exclude = fields_to_exclude + ["loan_amount", "installments"]
+                fields_to_exclude = fields_to_exclude + [
+                    "loan_amount",
+                    "installments",
+                    "installment_amount",
+                ]
             self.initial["provided_date"] = str(self.instance.provided_date)
             for field in fields_to_exclude:
                 if field in self.fields:
                     del self.fields[field]
 
+    def clean(self, *args, **kwargs):
+        cleaned_data = super().clean(*args, **kwargs)
+
+        if not self.instance.pk and cleaned_data.get(
+            "installment_start_date"
+        ) < cleaned_data.get("provided_date"):
+            raise forms.ValidationError(
+                _(
+                    "Installment start date should be greater than or equal to provided date"
+                )
+            )
+        if cleaned_data.get("installments") != None:
+            if cleaned_data.get("installments") <= 0:
+                raise forms.ValidationError(
+                    _("Installments needs to be a positive integer")
+                )
+
+        return cleaned_data
+
 
 class AssetFineForm(LoanAccountForm):
-    verbose_name = "Asset Fine"
+    verbose_name = _("Asset Fine")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["loan_amount"].label = "Fine Amount"
-        fields_to_exclude = ["employee_id", "provided_date", "type"]
+        self.fields["loan_amount"].label = _("Fine Amount")
+        self.fields["provided_date"].label = _("Fine Date")
+
+        fields_to_exclude = [
+            "employee_id",
+            "type",
+        ]
         for field in fields_to_exclude:
             if field in self.fields:
                 del self.fields[field]
+        field_order = [
+            "title",
+            "loan_amount",
+            "provided_date",
+            "description",
+            "installments",
+            "installment_start_date",
+            "installment_amount",
+            "settled",
+        ]
+
+        self.fields = {
+            field: self.fields[field] for field in field_order if field in self.fields
+        }
 
 
 class MultipleFileInput(forms.ClearableFileInput):
@@ -675,103 +802,126 @@ class MultipleFileField(forms.FileField):
 
 class ReimbursementForm(ModelForm):
     """
-    ReimbursementForm
+    Optimized Reimbursement / Encashment Form
     """
+
+    cols = {"description": 12}
 
     verbose_name = "Reimbursement / Encashment"
 
     class Meta:
         model = Reimbursement
         fields = "__all__"
-        exclude = ["is_active"]
+        exclude = ["is_active", "status"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.request = getattr(solich_middlewares._thread_locals, "request", None)
+        self.employee = self.get_employee()  # 819
+
+        if not self.instance.pk:
+            self.initial["allowance_on"] = str(datetime.date.today())
+
+        self.initial["employee_id"] = self.employee.id if self.employee else None
+
+        self.configure_fields()
+
+    def get_employee(self):
+        """Resolves employee either from form data or request."""
+        if hasattr(self.instance, "employee_id") and self.instance.employee_id:
+            return self.instance.employee_id
+
+        employee_qs = self.fields["employee_id"].queryset
+        employee_id = self.data.get("employee_id") if self.data else None
+
+        if employee_id and (emp := employee_qs.filter(id=employee_id).first()):
+            return emp
+
+        if self.request and (emp := self.request.user.employee_get):
+            if not self.instance.pk and emp in employee_qs:
+                return emp
+            if self.instance.pk and emp.id == self.instance.employee_id:
+                return emp
+
+        return employee_qs.first()
 
     def get_encashable_leaves(self, employee):
-        leaves = LeaveType.objects.filter(
+        LeaveType = get_solich_model_class(app_label="leave", model="leavetype")
+        return LeaveType.objects.filter(
             employee_available_leave__employee_id=employee,
             employee_available_leave__total_leave_days__gte=1,
             is_encashable=True,
         )
-        return leaves
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def configure_fields(self):
         exclude_fields = []
-        if not self.instance.pk:
-            self.initial["allowance_on"] = str(datetime.date.today())
 
-        request = getattr(solich_middlewares._thread_locals, "request", None)
-        if request:
-            employee = (
-                request.user.employee_get
-                if self.instance.pk is None
-                else self.instance.employee_id
-            )
-        self.initial["employee_id"] = employee.id
-        assigned_leaves = self.get_encashable_leaves(employee)
+        if self.request and not self.request.user.has_perm("payroll.add_reimbursement"):
+            exclude_fields.append("employee_id")
+
+        self.setup_leave_fields()
+
+        self.fields["type"].widget.attrs["onchange"] = "toggleReimbursmentType($(this))"
+        self.fields["employee_id"].widget.attrs[
+            "onchange"
+        ] = "getAssignedLeave($(this))"
+
+        self.fields["allowance_on"].widget = forms.DateInput(
+            attrs={"type": "date", "class": "oh-input w-100"}
+        )
+
+        self.fields["attachment"] = MultipleFileField(label="Attachments")
+        self.fields["attachment"].widget.attrs["accept"] = ".jpg, .jpeg, .png, .pdf"
+
+        self.exclude_fields_by_type(exclude_fields)
+
+        for field in exclude_fields:
+            self.fields.pop(field, None)
+
+    def setup_leave_fields(self):
+        """Setup leave-related fields only if leave app is installed."""
+        if not apps.is_installed("leave") or not self.employee:
+            return
+
+        AvailableLeave = get_solich_model_class(
+            app_label="leave", model="availableleave"
+        )
+        assigned_leaves = self.get_encashable_leaves(self.employee)
+
         self.assigned_leaves = AvailableLeave.objects.filter(
-            leave_type_id__in=assigned_leaves, employee_id=employee
+            leave_type_id__in=assigned_leaves, employee_id=self.employee
         )
         self.fields["leave_type_id"].queryset = assigned_leaves
         self.fields["leave_type_id"].empty_label = None
         self.fields["employee_id"].empty_label = None
 
-        type_attr = self.fields["type"].widget.attrs
-        type_attr["onchange"] = "toggleReimbursmentType($(this))"
-        self.fields["type"].widget.attrs.update(type_attr)
-
-        employee_attr = self.fields["employee_id"].widget.attrs
-        employee_attr["onchange"] = "getAssignedLeave($(this))"
-        self.fields["employee_id"].widget.attrs.update(employee_attr)
-
-        self.fields["allowance_on"].widget = forms.DateInput(
-            attrs={"type": "date", "class": "oh-input w-100"}
+    def exclude_fields_by_type(self, exclude_fields):
+        """Determine which fields to exclude based on type."""
+        type = (
+            self.data.get("type")
+            if self.data
+            else self.instance.type if self.instance else None
         )
-        self.fields["attachment"] = MultipleFileField(label="Attachements")
+        is_edit = self.instance and self.instance.pk
 
-        # deleting fields based on type
-        type = None
-        if self.data and not self.instance.pk:
-            type = self.data["type"]
-        elif self.instance is not None:
-            type = self.instance.type
-        if not request.user.has_perm("payroll.add_reimbursement"):
-            exclude_fields.append("employee_id")
-
-        if type == "reimbursement" and self.instance.pk:
-            exclude_fields = exclude_fields + [
+        if type == "reimbursement" and (is_edit or self.data):
+            exclude_fields += [
                 "leave_type_id",
                 "cfd_to_encash",
                 "ad_to_encash",
                 "bonus_to_encash",
             ]
-        elif (
-            self.instance.pk
-            and type == "leave_encashment"
-            or self.data.get("type") == "leave_encashment"
-        ):
-            exclude_fields = exclude_fields + [
-                "attachment",
-                "amount",
-                "bonus_to_encash",
-            ]
-        elif (
-            self.instance.pk
-            and type == "bonus_encashment"
-            or self.data.get("type") == "bonus_encashment"
-        ):
-            exclude_fields = exclude_fields + [
+        elif type == "leave_encashment" and (is_edit or self.data):
+            exclude_fields += ["attachment", "amount", "bonus_to_encash"]
+        elif type == "bonus_encashment" and (is_edit or self.data):
+            exclude_fields += [
                 "attachment",
                 "amount",
                 "leave_type_id",
                 "cfd_to_encash",
                 "ad_to_encash",
             ]
-        if self.instance.pk:
-            exclude_fields = exclude_fields + ["type", "employee_id"]
-
-        for field in exclude_fields:
-            if field in self.fields:
-                del self.fields[field]
 
     def as_p(self):
         """
@@ -783,104 +933,121 @@ class ReimbursementForm(ModelForm):
 
     def clean(self):
         cleaned_data = super().clean()
-        request = getattr(solich_middlewares._thread_locals, "request", None)
-        if self.instance.pk:
-            employee_id = self.instance.employee_id
-            type = self.instance.type
 
-        else:
-            employee_id = request.user.employee_get
-            type = cleaned_data["type"]
+        type_ = cleaned_data.get("type")
+        employee = cleaned_data.get("employee_id")
 
-        available_points = BonusPoint.objects.filter(employee_id=employee_id).first()
-        if type == "bonus_encashment":
-            if self.instance.pk:
-                bonus_to_encash = self.instance.bonus_to_encash
+        if not type_ or not employee:
+            return cleaned_data
+
+        if type_ == "bonus_encashment":
+            bonus_to_encash = (
+                self.instance.bonus_to_encash
+                if self.instance.pk
+                else cleaned_data.get("bonus_to_encash")
+            )
+            available_points = BonusPoint.objects.filter(employee_id=employee).first()
+
+            if bonus_to_encash is not None:
+                if bonus_to_encash <= 0:
+                    self.add_error(
+                        "bonus_to_encash", "Points must be greater than zero to redeem."
+                    )
+                elif not available_points or available_points.points < bonus_to_encash:
+                    self.add_error(
+                        "bonus_to_encash", "Not enough bonus points to redeem"
+                    )
+
+        elif type_ == "leave_encashment":
+            leave_type = (
+                self.instance.leave_type_id
+                if self.instance.pk
+                else cleaned_data.get("leave_type_id")
+            )
+            cfd_to_encash = (
+                self.instance.cfd_to_encash
+                if self.instance.pk
+                else cleaned_data.get("cfd_to_encash", 0)
+            )
+            ad_to_encash = (
+                self.instance.ad_to_encash
+                if self.instance.pk
+                else cleaned_data.get("ad_to_encash", 0)
+            )
+
+            if not leave_type:
+                self.add_error("leave_type_id", "This field is required")
             else:
-                bonus_to_encash = cleaned_data["bonus_to_encash"]
+                encashable = self.get_encashable_leaves(employee)
+                if leave_type not in encashable:
+                    self.add_error("leave_type_id", "This leave type is not encashable")
+                else:
+                    AvailableLeave = get_solich_model_class("leave", "availableleave")
+                    available_leave = AvailableLeave.objects.filter(
+                        leave_type_id=leave_type, employee_id=employee
+                    ).first()
 
-            if available_points.points < bonus_to_encash:
-                raise forms.ValidationError(
-                    {"bonus_to_encash": "Not enough bonus points to redeem"}
-                )
-            if bonus_to_encash <= 0:
-                raise forms.ValidationError(
-                    {"bonus_to_encash": "Points must be greater than zero to redeem."}
-                )
-        if type == "leave_encashment":
-            if self.instance.pk:
-                leave_type_id = self.instance.leave_type_id
-                cfd_to_encash = self.instance.cfd_to_encash
-                ad_to_encash = self.instance.ad_to_encash
-            else:
-                leave_type_id = cleaned_data["leave_type_id"]
-                cfd_to_encash = cleaned_data["cfd_to_encash"]
-                ad_to_encash = cleaned_data["ad_to_encash"]
-            encashable_leaves = self.get_encashable_leaves(employee_id)
-            if leave_type_id is None:
-                raise forms.ValidationError({"leave_type_id": "This field is required"})
-            elif leave_type_id not in encashable_leaves:
-                raise forms.ValidationError(
-                    {"leave_type_id": "This leave type is not encashable"}
-                )
-            else:
-                available_leave = AvailableLeave.objects.filter(
-                    leave_type_id=leave_type_id, employee_id=employee_id
-                ).first()
-                if cfd_to_encash < 0:
-                    raise forms.ValidationError(
-                        {"cfd_to_encash": _("Value can't be negative.")}
-                    )
-                if ad_to_encash < 0:
-                    raise forms.ValidationError(
-                        {"ad_to_encash": _("Value can't be negative.")}
-                    )
-                if cfd_to_encash > available_leave.carryforward_days:
-                    raise forms.ValidationError(
-                        {"cfd_to_encash": _("Not enough carryforward days to redeem")}
-                    )
-                if ad_to_encash > available_leave.available_days:
-                    raise forms.ValidationError(
-                        {"ad_to_encash": _("Not enough available days to redeem")}
-                    )
+                    if available_leave:
+                        if cfd_to_encash < 0:
+                            self.add_error(
+                                "cfd_to_encash", _("Value can't be negative.")
+                            )
+                        elif cfd_to_encash > available_leave.carryforward_days:
+                            self.add_error(
+                                "cfd_to_encash",
+                                _("Not enough carryforward days to redeem"),
+                            )
 
-    def save(self, commit: bool = ...) -> Any:
-        is_new = not self.instance.pk
-        attachemnt = []
+                        if ad_to_encash < 0:
+                            self.add_error(
+                                "ad_to_encash", _("Value can't be negative.")
+                            )
+                        elif ad_to_encash > available_leave.available_days:
+                            self.add_error(
+                                "ad_to_encash", _("Not enough available days to redeem")
+                            )
+
+        return cleaned_data
+
+    def save(self, commit: bool = True) -> Any:
         multiple_attachment_ids = []
-        attachemnts = None
-        if self.files.getlist("attachment"):
-            attachemnts = self.files.getlist("attachment")
-            self.instance.attachemnt = attachemnts[0]
-            multiple_attachment_ids = []
-            for attachemnt in attachemnts:
-                file_instance = ReimbursementMultipleAttachment()
-                file_instance.attachment = attachemnt
-                file_instance.save()
-                multiple_attachment_ids.append(file_instance.pk)
-        instance = super().save(commit)
-        instance.other_attachments.add(*multiple_attachment_ids)
+        is_new = not self.instance.pk
+        attachments = self.files.getlist("attachment")
 
-        emp = Employee.objects.get(id=self.initial["employee_id"])
-        try:
-            if is_new:
-                notify.send(
-                    emp,
-                    recipient=(
-                        emp.employee_work_info.reporting_manager_id.employee_user_id
-                    ),
-                    verb=f"You have a new reimbursement request to approve for {emp}.",
-                    verb_ar=f"لديك طلب استرداد نفقات جديد يتعين عليك الموافقة عليه لـ {emp}.",
-                    verb_de=f"Sie haben einen neuen Rückerstattungsantrag zur Genehmigung für {emp}.",
-                    verb_es=f"Tienes una nueva solicitud de reembolso para aprobar para {emp}.",
-                    verb_fr=f"Vous avez une nouvelle demande de remboursement à approuver pour {emp}.",
-                    icon="information",
-                    redirect=f"/payroll/view-reimbursement?id={instance.id}",
-                )
-        except Exception as e:
-            pass
+        if attachments:
+            self.instance.attachment = attachments[0]
 
-        return instance, attachemnts
+        instance = super().save(commit=commit)
+
+        if attachments:
+            attachment_objs = [
+                ReimbursementMultipleAttachment(attachment=file) for file in attachments
+            ]
+            created_attachments = ReimbursementMultipleAttachment.objects.bulk_create(
+                attachment_objs
+            )
+            multiple_attachment_ids = [obj.pk for obj in created_attachments]
+            instance.other_attachments.add(*multiple_attachment_ids)
+
+        if is_new:
+            try:
+                manager = instance.employee_id.employee_work_info.reporting_manager_id
+                if manager and manager.employee_user_id:
+                    notify.send(
+                        instance.employee_id,  # 816
+                        recipient=manager.employee_user_id,
+                        verb=f"You have a new reimbursement request to approve for {instance.employee_id}.",
+                        verb_ar=f"لديك طلب استرداد نفقات جديد يتعين عليك الموافقة عليه لـ {instance.employee_id}.",
+                        verb_de=f"Sie haben einen neuen Rückerstattungsantrag zur Genehmigung für {instance.employee_id}.",
+                        verb_es=f"Tienes una nueva solicitud de reembolso para aprobar para {instance.employee_id}.",
+                        verb_fr=f"Vous avez une nouvelle demande de remboursement à approuver pour {instance.employee_id}.",
+                        icon="information",
+                        redirect=f"/payroll/view-reimbursement?id={instance.id}",
+                    )
+            except Exception:
+                pass
+
+        return instance, attachments
 
 
 class ConditionForm(ModelForm):
@@ -903,6 +1070,14 @@ class PayslipAutoGenerateForm(ModelForm):
         model = PayslipAutoGenerate
         fields = ["generate_day", "company_id", "auto_generate"]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        active_company_id = solich_middlewares.get_selected_company()
+        if active_company_id and active_company_id != "all":
+            self.fields["company_id"].queryset = Company.objects.filter(
+                id=active_company_id
+            )
+
     def as_p(self):
         """
         Render the form fields as HTML table rows with Bootstrap styling.
@@ -910,4 +1085,3 @@ class PayslipAutoGenerateForm(ModelForm):
         context = {"form": self}
         table_html = render_to_string("common_form.html", context)
         return table_html
-

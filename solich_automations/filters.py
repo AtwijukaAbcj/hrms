@@ -1,5 +1,5 @@
 """
-Solich_automations/filters.py
+solich_automations/filters.py
 """
 
 from solich.filters import SolichFilterSet, django_filters
@@ -16,4 +16,3 @@ class AutomationFilter(SolichFilterSet):
     class Meta:
         model = MailAutomation
         fields = "__all__"
-

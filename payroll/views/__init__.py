@@ -1,2 +1,1 @@
 from payroll import settings
-

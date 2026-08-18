@@ -38,7 +38,6 @@
 
 <!-- start of request view  -->
 <div class="oh-wrapper" id="ticketContainer">
-	{% if my_tickets or allocated_tickets or all_tickets %}
 		<!-- start of Quick filters  -->
 		<div class="d-flex flex-row-reverse mb-2">
 			<span
@@ -133,7 +132,7 @@
 				<li class="oh-tabs__tab" data-target="#tab_2">
 					{% trans "Suggested Tickets" %}
 				</li>
-				{% if request.user|is_reportingmanager %}
+				{% if request.user|is_reportingmanager or perms.helpdesk.view_ticket %}
 					<li class="oh-tabs__tab" data-target="#tab_3">
 						{% trans "All Tickets" %}
 					</li>
@@ -148,29 +147,6 @@
 			</div>
 		</div>
 		<!-- end of contents -->
-	{% else %}
-		<div
-			style="
-				height: 70vh;
-				display: flex;
-				align-items: center;
-				justify-content: center;
-			"
-			class=""
-		>
-			<div style="" class="oh-404">
-				<img
-					style="display: block; width: 150px; height: 150px; margin: 10px auto"
-					src="{% static 'images/ui/ticket.png' %}"
-					class="mb-4"
-					alt=""
-				/>
-				<h3 style="font-size: 20px" class="oh-404__subtitle">
-					{% trans "There are no tickets at the moment." %}
-				</h3>
-			</div>
-		</div>
-	{% endif %}
 </div>
 <!-- end of request view  -->
 
@@ -261,9 +237,10 @@
         var type = $("#id_type").val()
         var prefix = $("#id_prefix").val()
         var is_active = $("#id_ticket_type_is_active").val()
+
 		$.ajax({
 			type: "post",
-			url: "{% url 'ticket-type-create' %}?ajax=True",
+			url: `{% url 'ticket-type-create' %}?ajax=True`,
 			data: {
 			  csrfmiddlewaretoken: getCookie("csrftoken"),
 			  "title": title,

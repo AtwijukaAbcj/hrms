@@ -8,9 +8,11 @@ import math
 
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.urls import reverse
 from django.utils.text import format_lazy
 from django.utils.translation import gettext_lazy as _
 
+from base.solich_company_manager import SolichCompanyManager
 from base.models import Company
 from solich.models import SolichModel
 from payroll.models.models import FilingStatus
@@ -18,22 +20,28 @@ from payroll.models.models import FilingStatus
 
 class PayrollSettings(SolichModel):
     """
-    Payroll settings model"""
+    Payroll settings model
+    """
+
+    choices = [
+        ("prefix", _("Prefix")),
+        ("postfix", _("Suffix")),
+    ]
 
     currency_symbol = models.CharField(null=True, default="$", max_length=5)
-    company_id = models.ForeignKey(
-        Company, null=True, editable=False, on_delete=models.PROTECT
+    position = models.CharField(
+        max_length=15, null=True, choices=choices, default="postfix"
     )
-    objects = models.Manager()
+
+    company_id = models.ForeignKey(Company, null=True, on_delete=models.PROTECT)
+    objects = SolichCompanyManager("company_id")
+
+    class Meta:
+        verbose_name = _("Payroll Settings")
+        verbose_name_plural = _("Payroll Settings")
 
     def __str__(self):
         return f"Payroll Settings {self.currency_symbol}"
-
-    def save(self, *args, **kwargs):
-        if 1 < PayrollSettings.objects.count():
-            raise ValidationError("You cannot add more conditions.")
-
-        return super().save(*args, **kwargs)
 
 
 class TaxBracket(SolichModel):
@@ -77,6 +85,20 @@ class TaxBracket(SolichModel):
             return self.max_income
         return None
 
+    def get_update_url(self):
+        """
+        Returns the URL for updating the tax bracket.
+        """
+
+        return reverse("tax-bracket-update", kwargs={"pk": self.pk})
+
+    def get_delete_url(self):
+        """
+        Returns the URL for updating the tax bracket.
+        """
+
+        return reverse("tax-bracket-delete", kwargs={"tax_bracket_id": self.pk})
+
     def clean(self):
         super().clean()
 
@@ -114,4 +136,3 @@ class TaxBracket(SolichModel):
                         )
                     }
                 )
-

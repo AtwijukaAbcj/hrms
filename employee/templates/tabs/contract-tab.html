@@ -1,4 +1,4 @@
-{% load onboardingfilters %} {% load i18n %}
+{% load i18n %}
 
 <style>
     .height-adj{
@@ -18,7 +18,7 @@
                 <div class="oh-sticky-table__th">{% trans "Basic Salary" %}</div>
                 <div class="oh-sticky-table__th">{% trans "Filing Status" %}</div>
                 <div class="oh-sticky-table__th">{% trans "Status" %}</div>
-				{% if perms.leave.change_contract %}
+				{% if perms.payroll.change_contract %}
                     <div class="oh-sticky-table__th  oh-sticky-table__right"></div>
                 {% endif %}
                 </div>
@@ -40,7 +40,7 @@
                     <div class="oh-sticky-table__td">
                         {{ contract.get_contract_status_display}}
                     </div>
-					{% if perms.leave.change_contract %}
+					{% if perms.payroll.change_contract %}
                         <div class="oh-sticky-table__td  oh-sticky-table__right">
                             <div class="oh-btn-group">
                             <a
@@ -54,12 +54,12 @@
                                 role="img"
                                 class="md hydrated"
                                 style="color: blue"
-                                aria-label="create outline"
+                                aria-label="{% trans 'create outline' %}"
                                 ></ion-icon>
                             </a>
                             <a
                                 onclick = "event.preventDefault();event.stopPropagation();"
-                                class="oh-btn oh-btn--danger-outline oh-btn--light-bkg w-100"
+                                class="oh-btn oh-btn--danger w-100"
                                 hx-confirm="{% trans 'Do you want to delete this Contract?' %}"
                                 hx-post="{% url 'delete-contract-modal' contract.id %}?{{pd}}"
                                 hx-target="#personal_target"
@@ -69,7 +69,7 @@
                                 name="trash-outline"
                                 role="img"
                                 class="md hydrated"
-                                aria-label="trash outline"
+                                aria-label="{% trans 'trash outline' %}"
                                 ></ion-icon>
                             </a>
                             </div>

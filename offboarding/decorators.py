@@ -7,6 +7,7 @@ This module is used to write custom authentication decorators for offboarding mo
 from django.contrib import messages
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import render
+from django.utils.translation import gettext as _
 
 from solich.decorators import decorator_with_arguments
 from offboarding.models import (
@@ -21,8 +22,13 @@ from offboarding.models import (
 def any_manager_can_enter(function, perm, offboarding_employee_can_enter=False):
     def _function(request, *args, **kwargs):
         employee = request.user.employee_get
+        permissions = perm
+        has_permission = False
+        if not isinstance(permissions, (list, tuple, set)):
+            permissions = [permissions]
+        has_permission = any(request.user.has_perm(perm) for perm in permissions)
         if (
-            request.user.has_perm(perm)
+            has_permission
             or offboarding_employee_can_enter
             or (
                 Offboarding.objects.filter(managers=employee).exists()
@@ -32,6 +38,7 @@ def any_manager_can_enter(function, perm, offboarding_employee_can_enter=False):
         ):
             return function(request, *args, **kwargs)
         else:
+            messages.info(request, _("You don't have permission."))
             previous_url = request.META.get("HTTP_REFERER", "/")
             script = f'<script>window.location.href = "{previous_url}"</script>'
             key = "HTTP_HX_REQUEST"
@@ -45,14 +52,14 @@ def any_manager_can_enter(function, perm, offboarding_employee_can_enter=False):
 @decorator_with_arguments
 def offboarding_manager_can_enter(function, perm):
     def _function(request, *args, **kwargs):
-        employee = request.user.has_perm(perm)
+        employee = request.user.employee_get
         if (
             request.user.has_perm(perm)
             or Offboarding.objects.filter(managers=employee).exists()
         ):
             return function(request, *args, **kwargs)
         else:
-            messages.info(request, "You dont have permission.")
+            messages.info(request, _("You dont have permission."))
             previous_url = request.META.get("HTTP_REFERER", "/")
             script = f'<script>window.location.href = "{previous_url}"</script>'
             key = "HTTP_HX_REQUEST"
@@ -66,7 +73,7 @@ def offboarding_manager_can_enter(function, perm):
 @decorator_with_arguments
 def offboarding_or_stage_manager_can_enter(function, perm):
     def _function(request, *args, **kwargs):
-        employee = request.user.has_perm(perm)
+        employee = request.user.employee_get
         if (
             request.user.has_perm(perm)
             or Offboarding.objects.filter(managers=employee).exists()
@@ -74,7 +81,7 @@ def offboarding_or_stage_manager_can_enter(function, perm):
         ):
             return function(request, *args, **kwargs)
         else:
-            messages.info(request, "You dont have permission.")
+            messages.info(request, _("You dont have permission."))
             previous_url = request.META.get("HTTP_REFERER", "/")
             key = "HTTP_HX_REQUEST"
             if key in request.META.keys():
@@ -92,7 +99,7 @@ def check_feature_enabled(function, feature_name):
         enabled = getattr(general_setting, feature_name, False)
         if enabled:
             return function(request, *args, **kwargs)
-        messages.info(request, "Feature is not enabled on the settings")
+        messages.info(request, _("Feature is not enabled on the settings"))
         previous_url = request.META.get("HTTP_REFERER", "/")
         key = "HTTP_HX_REQUEST"
         if key in request.META.keys():
@@ -101,4 +108,3 @@ def check_feature_enabled(function, feature_name):
         return HttpResponse(script)
 
     return _function
-

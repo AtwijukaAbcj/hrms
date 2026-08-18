@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from urllib.parse import parse_qs
 
+from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils.translation import gettext_lazy as _
 
@@ -62,7 +63,7 @@ def attendance_search(request):
     validate_attendances = all_attendances.filter(attendance_validated=False)
     attendances = all_attendances.filter(attendance_validated=True)
     ot_attendances = all_attendances.filter(
-        overtime_second__gte=minot,
+        overtime_second__gt=0,
         attendance_validated=True,
     )
 
@@ -162,6 +163,7 @@ def attendance_search(request):
             "field": field,
             "filter_dict": data_dict,
             "month_name": month_name,
+            "minot": minot,
         },
     )
 
@@ -478,14 +480,11 @@ def search_attendance_requests(request):
     )
 
 
-from django.http import JsonResponse
-
-
 @login_required
+@hx_request_required
 def widget_filter(request):
     """
     This method is used to return all the ids of the employees
     """
     ids = AttendanceFilters(request.GET).qs.values_list("id", flat=True)
     return JsonResponse({"ids": list(ids)})
-

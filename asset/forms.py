@@ -26,6 +26,7 @@ from base.forms import ModelForm
 from base.methods import reload_queryset
 from employee.forms import MultipleFileField
 from employee.models import Employee
+from solich.solich_middlewares import _thread_locals
 
 
 def set_date_field_initial(instance):
@@ -45,79 +46,67 @@ class AssetForm(ModelForm):
     """
 
     class Meta:
-        """
-        Specifies the model and fields to be used for the AssetForm.
-        Attributes:
-            model (class): The model class Asset to be used for the form.
-            fields (str): A special value "__all__" to include all fields
-                          of the model in the form.
-        """
-
         model = Asset
         fields = "__all__"
-        exclude = ["is_active"]
+        exclude = ["is_active", "owner"]
         widgets = {
-            "asset_name": forms.TextInput(
-                attrs={"placeholder": "Macbook Pro.", "class": "oh-input w-100"}
-            ),
-            "asset_description": forms.Textarea(
-                attrs={
-                    "type": "text",
-                    "placeholder": _("A powerful laptop for business use."),
-                    "class": "oh-input oh-input--textarea oh-input--block",
-                    "rows": 3,
-                    "cols": 40,
-                }
-            ),
-            "asset_tracking_id": forms.TextInput(
-                attrs={"placeholder": "LPT001", "class": "oh-input w-100"}
-            ),
             "asset_purchase_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
+                attrs={"type": "date", "class": "oh-input w-100"}
             ),
             "expiry_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
-            ),
-            "asset_purchase_cost": forms.NumberInput(
-                attrs={"class": "oh-input w-100", "placeholder": "1200.00."}
-            ),
-            "asset_category_id": forms.Select(
                 attrs={
-                    "class": "oh-select oh-select-2 select2-hidden-accessible",
-                },
-            ),
-            "asset_status": forms.Select(
-                attrs={"class": "oh-select oh-select--lg oh-select-no-search "}
-            ),
-            "asset_lot_number_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select-2 select2-hidden-accessible  ",
-                    "placeholder": "LOT001",
-                    "onchange": "batchNoChange($(this))",
+                    "type": "date",
+                    "class": "oh-input w-100",
+                    "onchange": "toggleNotify($(this))",
                 }
             ),
+            "asset_lot_number_id": forms.Select(
+                attrs={"onchange": "batchNoChange($(this))"}
+            ),
+        }
+        labels = {
+            "asset_name": "Asset Name",
+            "asset_description": "Description",
+            # "asset_tracking_id": "Tracking ID", #commented for translation
+            "asset_purchase_date": "Purchase Date",
+            "expiry_date": "Expiry Date",
+            "asset_purchase_cost": "Cost",
+            "asset_category_id": "Category",
+            "asset_status": "Status",
+            "asset_lot_number_id": "Batch Number",
         }
 
     def __init__(self, *args, **kwargs):
+        request = getattr(_thread_locals, "request", None)
         instance = kwargs.get("instance")
-        if instance:
-            kwargs["initial"] = set_date_field_initial(instance)
-        super(AssetForm, self).__init__(*args, **kwargs)
-        reload_queryset(self.fields)
-        self.fields["asset_category_id"].widget.attrs.update({"id": str(uuid.uuid4())})
-        self.fields["asset_lot_number_id"].widget.attrs.update(
-            {"id": str(uuid.uuid4())}
-        )
-        self.fields["asset_status"].widget.attrs.update({"id": str(uuid.uuid4())})
 
-        batch_no_choices = [("", _("---Choose Batch No.---"))] + list(
-            self.fields["asset_lot_number_id"].queryset.values_list("id", "lot_number")
-        )
-        self.fields["asset_lot_number_id"].choices = batch_no_choices
+        if instance:
+            kwargs.setdefault("initial", set_date_field_initial(instance))
+
+        super().__init__(*args, **kwargs)
+
         if self.instance.pk is None:
-            self.fields["asset_lot_number_id"].choices += [
-                ("create", _("Create new batch number"))
-            ]
+            self.fields["expiry_date"].initial = None
+
+        uuid_map = {
+            field: str(uuid.uuid4())
+            for field in ["asset_category_id", "asset_lot_number_id", "asset_status"]
+        }
+        for field, uuid_value in uuid_map.items():
+            self.fields[field].widget.attrs["id"] = uuid_value
+
+        if request and request.user.has_perm("asset.add_assetlot"):
+            batch_no_choices = list(
+                self.fields["asset_lot_number_id"].queryset.values_list(
+                    "id", "lot_number"
+                )
+            )
+            batch_no_choices.insert(0, ("", _("---Choose Batch No.---")))
+
+            if not self.instance.pk:
+                batch_no_choices.append(("create", _("Create new batch number")))
+
+            self.fields["asset_lot_number_id"].choices = batch_no_choices
 
     def clean(self):
         instance = self.instance
@@ -159,6 +148,7 @@ class DocumentForm(forms.ModelForm):
                 "type": "File",
                 "class": "form-control",
                 "multiple": "True",
+                "accept": ".jpeg, .jpg, .png, .pdf",
             }
         )
     )
@@ -193,6 +183,19 @@ class AssetReportForm(ModelForm):
     - __init__: Initializes the form, disabling the 'asset_id' field.
     """
 
+    file = forms.FileField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                "name": "file",
+                "type": "File",
+                "class": "form-control",
+                "multiple": "True",
+                "accept": ".jpeg, .jpg, .png, .pdf",
+            }
+        ),
+    )
+
     class Meta:
         """
         Metadata options for the AssetReportForm.
@@ -204,10 +207,7 @@ class AssetReportForm(ModelForm):
         """
 
         model = AssetReport
-        fields = [
-            "title",
-            "asset_id",
-        ]
+        fields = ["title", "asset_id", "file"]
         exclude = ["is_active"]
 
     def __init__(self, *args, **kwargs):
@@ -219,13 +219,19 @@ class AssetReportForm(ModelForm):
         - **kwargs: Arbitrary keyword arguments.
         """
         super().__init__(*args, **kwargs)
-        self.fields["asset_id"].widget.attrs["disabled"] = "disabled"
+        # self.fields["asset_id"].widget.attrs["disabled"] = "disabled"
 
 
 class AssetCategoryForm(ModelForm):
     """
     A form for creating and updating AssetCategory instances.
     """
+
+    cols = {
+        "asset_category_name": 12,
+        "asset_category_description": 12,
+        "company_id": 12,
+    }
 
     class Meta:
         """
@@ -234,33 +240,19 @@ class AssetCategoryForm(ModelForm):
             model (class): The model class AssetCategory to be used for the form.
             fields (str): A special value "__all__" to include all fields
                           of the model in the form.
-            widgets (dict): A dictionary containing widget configurations for
-                            specific form fields.
         """
 
         model = AssetCategory
         fields = "__all__"
         exclude = ["is_active"]
-        widgets = {
-            "asset_category_name": forms.TextInput(
-                attrs={"placeholder": _("Computers."), "class": "oh-input w-100"}
-            ),
-            "asset_category_description": forms.Textarea(
-                attrs={
-                    "type": "text",
-                    "placeholder": _("A category for all types of laptops."),
-                    "class": "oh-input oh-input--textarea oh-input--block",
-                    "rows": 3,
-                    "cols": 40,
-                }
-            ),
-        }
 
 
 class AssetRequestForm(ModelForm):
     """
     A Django ModelForm for creating and updating AssetRequest instances.
     """
+
+    cols = {"requested_employee_id": 12, "asset_category_id": 12, "description": 12}
 
     class Meta:
         """
@@ -302,13 +294,16 @@ class AssetRequestForm(ModelForm):
         }
 
     def __init__(self, *args, **kwargs):
-        user = kwargs.pop("user", None)
+        # user = kwargs.pop("user", None)
+        request = getattr(_thread_locals, "request", None)
+        user = request.user
         super(AssetRequestForm, self).__init__(
             *args,
             **kwargs,
         )
         reload_queryset(self.fields)
         if user is not None and user.has_perm("asset.add_assetrequest"):
+
             self.fields["requested_employee_id"].queryset = Employee.objects.all()
             self.fields["requested_employee_id"].initial = Employee.objects.filter(
                 id=user.employee_get.id
@@ -327,14 +322,23 @@ class AssetAllocationForm(ModelForm):
     A Django ModelForm for creating and updating AssetAssignment instances.
     """
 
+    cols = {
+        "assigned_to_employee_id": 12,
+        "asset_id": 12,
+        "assigned_by_employee_id": 12,
+    }
+
     def __init__(self, *args, **kwargs):
+        request = getattr(_thread_locals, "request", None)
+        user = request.user
         super(AssetAllocationForm, self).__init__(*args, **kwargs)
         reload_queryset(self.fields)
-        self.fields["asset_id"].queryset = Asset.objects.filter(
-            asset_status="Available"
-        )
+        self.fields["asset_id"].queryset = Asset.available_assets()
+        self.fields["assigned_by_employee_id"].initial = user.employee_get
 
-        self.fields["assign_images"] = MultipleFileField()
+        self.fields["assign_images"] = MultipleFileField(
+            label=_("Assign Condition Images")
+        )
         self.fields["assign_images"].required = True
 
     class Meta:
@@ -355,6 +359,7 @@ class AssetAllocationForm(ModelForm):
             "return_condition",
             "assigned_date",
             "return_images",
+            "assign_images",
             "is_active",
         ]
         widgets = {
@@ -411,10 +416,15 @@ class AssetReturnForm(ModelForm):
         }
 
     def __init__(self, *args, **kwargs):
-        super(AssetReturnForm, self).__init__(*args, **kwargs)
+        """
+        Initializes the AssetReturnForm with initial values and custom field settings.
+        """
+        super().__init__(*args, **kwargs)
         self.fields["return_date"].initial = date.today()
 
-        self.fields["return_images"] = MultipleFileField(label="Images")
+        self.fields["return_images"] = MultipleFileField(
+            label=_("Return Condition Images")
+        )
         self.fields["return_images"].required = True
 
     def clean_return_date(self):
@@ -443,9 +453,7 @@ class AssetBatchForm(ModelForm):
     A Django ModelForm for creating or updating AssetLot instances.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        reload_queryset(self.fields)
+    cols = {"lot_description": 12, "lot_number": 12}
 
     class Meta:
         """
@@ -460,21 +468,68 @@ class AssetBatchForm(ModelForm):
 
         model = AssetLot
         fields = "__all__"
+        exclude = ["is_active"]
+
+
+class AssetReassignForm(ModelForm):
+    """
+    ModelForm to swap the asset on an existing assignment to a replacement asset.
+    Only exposes asset_id with queryset scoped to the same category.
+    """
+
+    class Meta:
+        model = AssetAssignment
+        fields = ["asset_id"]
+        labels = {"asset_id": _("Replacement Asset")}
         widgets = {
-            "lot_number": forms.TextInput(
-                attrs={"placeholder": "A12345.", "class": "oh-input w-100"}
-            ),
-            "lot_description": forms.Textarea(
-                attrs={
-                    "type": "text",
-                    "placeholder": _(
-                        "A batch of 50 laptops, consisting of Lenovo ThinkPad T480s\
-                              and Dell XPS 13."
-                    ),
-                    "class": "oh-input oh-input--textarea oh-input--block",
-                    "rows": 3,
-                    "cols": 40,
-                }
-            ),
+            "asset_id": forms.Select(attrs={"class": "oh-select oh-select-2 w-100"}),
         }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance and self.instance.pk:
+            self.fields["asset_id"].queryset = (
+                Asset.available_assets()
+                .filter(asset_category_id=self.instance.asset_id.asset_category_id)
+                .exclude(id=self.instance.asset_id.id)
+            )
+        else:
+            self.fields["asset_id"].queryset = Asset.available_assets()
+
+
+_ASSET_HISTORY_EXPORT_EXCLUDED = {
+    "id",
+    "created_at",
+    "is_active",
+    "additional_info",
+    "return_images",
+    "assign_images",
+    "return_request",
+}
+
+_asset_history_field_choices = [
+    (field.name, field.verbose_name)
+    for field in AssetAssignment._meta.get_fields()
+    if hasattr(field, "verbose_name")
+    and field.name not in _ASSET_HISTORY_EXPORT_EXCLUDED
+]
+
+
+class AssetHistoryExportForm(forms.Form):
+    """
+    Column picker for Asset History Excel export (same pattern as employee export).
+    """
+
+    selected_fields = forms.MultipleChoiceField(
+        choices=_asset_history_field_choices,
+        widget=forms.CheckboxSelectMultiple,
+        initial=[
+            "asset_id",
+            "assigned_to_employee_id",
+            "assigned_date",
+            "assigned_by_employee_id",
+            "return_date",
+            "return_status",
+            "return_condition",
+        ],
+    )

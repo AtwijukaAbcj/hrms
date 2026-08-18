@@ -5,12 +5,17 @@ This module is used to write email backends
 """
 
 import importlib
+import logging
 
+from django.core.cache import cache
+from django.core.mail import EmailMessage
 from django.core.mail.backends.smtp import EmailBackend
 
 from base.models import DynamicEmailConfiguration, EmailLog
 from solich import settings
 from solich.solich_middlewares import _thread_locals
+
+logger = logging.getLogger(__name__)
 
 
 class DefaultSolichMailBackend(EmailBackend):
@@ -67,6 +72,27 @@ class DefaultSolichMailBackend(EmailBackend):
             configuration = DynamicEmailConfiguration.objects.filter(
                 is_primary=True
             ).first()
+        if configuration:
+            display_email_name = (
+                f"{configuration.display_name} <{configuration.from_email}>"
+            )
+
+            user_id = ""
+            if request:
+                if (
+                    configuration.use_dynamic_display_name
+                    and request.user.is_authenticated
+                ):
+                    display_email_name = f"{request.user.employee_get.get_full_name()} <{request.user.employee_get.get_email()}>"
+                if request.user.is_authenticated:
+                    user_id = request.user.pk
+                    reply_to = [
+                        f"{request.user.employee_get.get_full_name()} <{request.user.employee_get.get_email()}>",
+                    ]
+                    cache.set(f"reply_to{request.user.pk}", reply_to)
+
+            cache.set(f"dynamic_display_name{user_id}", display_email_name)
+
         return configuration
 
     @property
@@ -107,10 +133,10 @@ class DefaultSolichMailBackend(EmailBackend):
 
     @property
     def dynamic_from_email_with_display_name(self):
-        return (
-            f"{self.dynamic_display_name} <{self.dynamic_mail_sent_from}>"
-            if self.dynamic_display_name
-            else self.dynamic_mail_sent_from
+        if self.dynamic_display_name and self.dynamic_mail_sent_from:
+            return f"{self.dynamic_display_name} <{self.dynamic_mail_sent_from}>"
+        return self.dynamic_mail_sent_from or getattr(
+            settings, "DEFAULT_FROM_EMAIL", ""
         )
 
     @property
@@ -173,9 +199,14 @@ class ConfiguredEmailBackend(BACKEND_CLASS):
     def send_messages(self, email_messages):
         response = super(BACKEND_CLASS, self).send_messages(email_messages)
         for message in email_messages:
+            from_email = (
+                self.dynamic_from_email_with_display_name
+                or message.from_email
+                or getattr(settings, "DEFAULT_FROM_EMAIL", "")
+            )
             email_log = EmailLog(
                 subject=message.subject,
-                from_email=self.dynamic_from_email_with_display_name,
+                from_email=from_email,
                 to=message.to,
                 body=message.body,
                 status="sent" if response else "failed",
@@ -193,3 +224,49 @@ if EMAIL_BACKEND != default:
 
 __all__ = ["ConfiguredEmailBackend"]
 
+
+message_init = EmailMessage.__init__
+
+
+def new_init(
+    self,
+    subject="",
+    body="",
+    from_email=None,
+    to=None,
+    bcc=None,
+    connection=None,
+    attachments=None,
+    headers=None,
+    cc=None,
+    reply_to=None,
+):
+    """
+    custom __init_method to override
+    """
+    request = getattr(_thread_locals, "request", None)
+    DefaultSolichMailBackend()
+    user_id = ""
+    if request and request.user and request.user.is_authenticated:
+        user_id = request.user.pk
+        reply_to = cache.get(f"reply_to{user_id}") if not reply_to else reply_to
+
+    if not from_email:
+        from_email = cache.get(f"dynamic_display_name{user_id}")
+
+    message_init(
+        self,
+        subject=subject,
+        body=body,
+        from_email=from_email,
+        to=to,
+        bcc=bcc,
+        connection=connection,
+        attachments=attachments,
+        headers=headers,
+        cc=cc,
+        reply_to=reply_to,
+    )
+
+
+EmailMessage.__init__ = new_init

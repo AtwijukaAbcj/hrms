@@ -1,6 +1,6 @@
 {% load static i18n %}
-{% load i18n %}
-{% load widget_tweaks %} {% load basefilters %} {% load pmsfilters %}
+{% load widget_tweaks %} {% load basefilters %} {% load pmsfilters %} {% load solichfilters %}
+{% get_company as theme_obj %}
 {% comment %} <section class="oh-wrapper oh-main__topbar" x-data="{searchShow: false}"> {% endcomment %}
     <div class="oh-main__titlebar oh-main__titlebar--left">
         <h1 class="oh-main__titlebar-title fw-bold">
@@ -33,7 +33,7 @@
                                                 {{emp_objective}}
                                         </div>
                                         {% if emp_objective.employee_key_result.first %}
-                                        <div class="oh-progress-container progress_barmm"  style="width:50%">
+                                        <div class="oh-progress-container progress_bar_objective"  style="width:50%">
                                             <div class="oh-progress" role="progressbar">
                                                     <div class="oh-progress__bar oh-progress__bar--secondary" style="width: calc( {{ emp_objective.progress_percentage }}%)"></div>
                                             </div>
@@ -48,9 +48,9 @@
                                                 {% comment %} {% if request.user|is_reportingmanager or perms.pms.view_employeekeyresult %} {% endcomment %}
                                                     <a
                                                         hx-get='{% url "view-employee-objective" emp_objective.id %}'
-                                                        hx-target="#objectDetailsModalTarget"
+                                                        hx-target="#genericModal"
                                                         data-toggle="oh-modal-toggle"
-                                                        data-target="#objectDetailsModal"
+                                                        data-target="#genericModalBody"
                                                         type="button" title="{% trans 'View' %}"
                                                         class="oh-btn oh-btn--light-bkg p-3 w-100"  onclick="event.stopPropagation()"
                                                     >
@@ -69,16 +69,16 @@
                                                     </a>
                                                 {% endif %}
                                                 {% if request.user|is_reportingmanager or perms.pms.add_employeekeyresult %}
-                                                    <button  style="border-right:1px solid hsl(8, 77%, 56%)"
+                                                    <button  style="border-right:1px solid {{ theme_obj.primary_600|default:'hsl(8, 77%, 56%)' }}"
                                                         class="oh-btn oh-btn--secondary-outline float-end"
                                                         hx-get='{% url "employee-key-result-creation" emp_objective.id %}'
-                                                        hx-target="#objectDetailsModalTarget"
+                                                        hx-target="#genericModalBody"
                                                         data-toggle="oh-modal-toggle"
-                                                        data-target="#objectDetailsModal"
-                                                        title="Add Key Result"
+                                                        data-target="#genericModal"
+                                                        title="{% trans 'Add Key Result' %}"
                                                         onclick="event.stopPropagation()"
                                                     >
-                                                        <ion-icon name="add-outline" class="m-0 md hydrated" role="img" aria-label="add outline"></ion-icon>
+                                                        <ion-icon name="add-outline" class="m-0 md hydrated" role="img" aria-label="{% trans 'add outline' %}"></ion-icon>
                                                     </button>
                                                 {% endif %}
                                                 {% if request.user|is_reportingmanager or perms.pms.add_employeeobjective %}
@@ -184,12 +184,11 @@
         var numericValue = parseFloat(targetValue.replace(/[^\d.]/g, ''));
         var prgressPercentage = parseInt( currentValue*100/numericValue )
         // Ensure totalProgress doesn't exceed 100
-        if (prgressPercentage > 100) {
-            prgressPercentage = 100;
+        if (prgressPercentage < 0) {
             Swal.fire({
                 icon: 'error',
                 title: 'Oops...',
-                text: 'Current Value cannot exceed target value!',
+                text: 'Current Value Cannot be -ve',
                 timer: 3000, // Display the alert for 3 seconds
                 timerProgressBar: true, // Show the progress bar
                 showConfirmButton: false // Hide the "OK" button
@@ -223,7 +222,7 @@
                 if (totalProgress > 100) {
                     totalProgress = 100;
                 }
-                objectiveProgressContainer = $(element).closest('.oh-accordion-meta__item').find('.progress_barmm');
+                objectiveProgressContainer = $(element).closest('.oh-accordion-meta__item').find('.progress_bar_objective');
                 objectiveProgressContainer.html(
                     '<div class="oh-progress" role="progressbar">'+
                     '<div class="oh-progress__bar oh-progress__bar--secondary" style="width: calc('+ totalProgress + '%)"></div>' +

@@ -10,15 +10,12 @@ from typing import Any
 from django import forms
 from django.contrib import messages
 from django.template.loader import render_to_string
+from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm
-from base.methods import reload_queryset
-from employee.filters import EmployeeFilter
 from employee.forms import MultipleFileField
 from employee.models import Employee
 from solich import solich_middlewares
-from solich_widgets.widgets.solich_multi_select_field import SolichMultiSelectField
-from solich_widgets.widgets.select_widgets import SolichMultiSelectWidget
 from notifications.signals import notify
 from offboarding.models import (
     EmployeeTask,
@@ -39,6 +36,8 @@ class OffboardingForm(ModelForm):
 
     verbose_name = "Offboarding"
 
+    cols = {"title": 12, "description": 12, "managers": 12, "status": 12}
+
     class Meta:
         model = Offboarding
         fields = "__all__"
@@ -52,30 +51,6 @@ class OffboardingForm(ModelForm):
         table_html = render_to_string("common_form.html", context)
         return table_html
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        reload_queryset(self.fields)
-        self.fields["managers"] = SolichMultiSelectField(
-            queryset=Employee.objects.filter(is_active=True),
-            widget=SolichMultiSelectWidget(
-                filter_route_name="employee-widget-filter",
-                filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
-                filter_template_path="employee_filters.html",
-                required=True,
-                instance=self.instance,
-            ),
-            label="Managers",
-        )
-
-    def clean(self):
-        if isinstance(self.fields["managers"], SolichMultiSelectField):
-            ids = self.data.getlist("managers")
-            if ids:
-                self.errors.pop("managers", None)
-        super().clean()
-
 
 class OffboardingStageForm(ModelForm):
     """
@@ -84,10 +59,12 @@ class OffboardingStageForm(ModelForm):
 
     verbose_name = "Stage"
 
+    cols = {"title": 12, "type": 12, "managers": 12}
+
     class Meta:
         model = OffboardingStage
         fields = "__all__"
-        exclude = ["offboarding_id", "is_active"]
+        exclude = ["is_active"]
 
     def as_p(self):
         """
@@ -96,30 +73,6 @@ class OffboardingStageForm(ModelForm):
         context = {"form": self}
         table_html = render_to_string("common_form.html", context)
         return table_html
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        reload_queryset(self.fields)
-        self.fields["managers"] = SolichMultiSelectField(
-            queryset=Employee.objects.filter(is_active=True),
-            widget=SolichMultiSelectWidget(
-                filter_route_name="employee-widget-filter",
-                filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
-                filter_template_path="employee_filters.html",
-                required=True,
-                instance=self.instance,
-            ),
-            label="Managers",
-        )
-
-    def clean(self):
-        if isinstance(self.fields["managers"], SolichMultiSelectField):
-            ids = self.data.getlist("managers")
-            if ids:
-                self.errors.pop("managers", None)
-        super().clean()
 
 
 class OffboardingEmployeeForm(ModelForm):
@@ -180,7 +133,7 @@ class StageSelectForm(ModelForm):
         super().__init__(*args, **kwargs)
         attrs = self.fields["stage_id"].widget.attrs
         attrs["onchange"] = "offboardingUpdateStage($(this))"
-        attrs["class"] = "w-100 oh-select-custom"
+        attrs["class"] = "w-100 oh-custom-select"
         self.fields["stage_id"].widget.attrs.update(attrs)
         self.fields["stage_id"].empty_label = None
         self.fields["stage_id"].queryset = OffboardingStage.objects.filter(
@@ -239,9 +192,9 @@ class TaskForm(ModelForm):
 
     verbose_name = "Offboarding Task"
     tasks_to = forms.ModelMultipleChoiceField(
-        queryset=OffboardingEmployee.objects.all(),
-        required=False,
+        queryset=OffboardingEmployee.objects.all(), required=False, label=_("Task To")
     )
+    cols = {"title": 12, "managers": 12, "stage_id": 12, "tasks_to": 12}
 
     class Meta:
         model = OffboardingTask
@@ -286,6 +239,14 @@ class ResignationLetterForm(ModelForm):
     Resignation Letter
     """
 
+    cols = {
+        "employee_id": 12,
+        "title": 12,
+        "description": 12,
+        "planned_to_leave_on": 12,
+        "status": 12,
+    }
+
     description = forms.CharField(
         widget=forms.Textarea(attrs={"data-summernote": "", "style": "display:none;"}),
         label="Description",
@@ -314,17 +275,22 @@ class ResignationLetterForm(ModelForm):
         if self.instance.pk:
             exclude.append("employee_id")
             self.verbose_name = (
-                self.instance.employee_id.get_full_name() + " Resignation Letter"
+                self.instance.employee_id.get_full_name() + "'s Resignation Letter"
             )
 
         request = getattr(solich_middlewares._thread_locals, "request", None)
-
-        if request and not request.user.has_perm("offboarding.add_offboardingemployee"):
-            exclude = exclude + [
-                "employee_id",
-                "status",
-            ]
+        if request and not request.user.has_perm("offboarding.add_resignationletter"):
+            exclude = exclude + ["status"]
+            self.fields["employee_id"].queryset = Employee.objects.filter(
+                employee_user_id=request.user
+            )
+            self.fields["employee_id"].initial = request.user.employee_get
             self.instance.employee_id = request.user.employee_get
+        if request and request.user.has_perm("offboarding.add_resignationletter"):
+            if request.GET.get("emp_id"):
+                emp_id = request.GET.get("emp_id")
+                self.fields["employee_id"].queryset = Employee.objects.filter(id=emp_id)
+                self.fields["employee_id"].initial = emp_id
         exclude = list(set(exclude))
         for field in exclude:
             del self.fields[field]
@@ -333,19 +299,20 @@ class ResignationLetterForm(ModelForm):
         request = getattr(solich_middlewares._thread_locals, "request", None)
         instance = self.instance
         if (
-            not request.user.has_perm("offboarding.add_offboardingemployee")
+            not request.user.has_perm("offboarding.add_resignationletter")
             and instance.status == "requested"
-        ) or request.user.has_perm("add_offboardingemployee"):
+        ) or request.user.has_perm("offboarding.add_resignationletter"):
             instance = super().save(commit)
         else:
             messages.info(
-                request, "You cannot edit a request that has been rejected/approved"
+                request, _("You cannot edit a request that has been rejected/approved")
             )
+            return None
 
         if (
             instance.status == "requested"
             and request
-            and not request.user.has_perm("offboarding.add_offboardingemployee")
+            and not request.user.has_perm("offboarding.add_resignationletter")
         ):
             with contextlib.suppress(Exception):
                 notify.send(
@@ -360,4 +327,3 @@ class ResignationLetterForm(ModelForm):
                     icon="information",
                 )
         return instance
-

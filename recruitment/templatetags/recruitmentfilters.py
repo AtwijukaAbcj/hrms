@@ -5,13 +5,14 @@ This module is used to write custom template filters.
 
 """
 
+import json
 import uuid
 
 from django import template
-from django.contrib.auth.models import User
+from django.apps import apps
 from django.template.defaultfilters import register
 
-from onboarding.models import OnboardingTask
+from solich_auth.models import SolichUser
 from recruitment.models import CandidateRating
 
 # from django.forms.boundfield
@@ -25,13 +26,38 @@ def is_stagemanager(user):
     This method is used to check the employee is stage or recruitment manager
     """
     try:
+        cached = getattr(user, "_solich_is_stagemanager", None)
+        if cached is not None:
+            return cached
         employee_obj = user.employee_get
-        return (
-            employee_obj.stage_set.all().exists()
+        result = (
+            employee_obj.stage_set.filter(is_active=True).exists()
             or employee_obj.recruitment_set.exists()
         )
+        setattr(user, "_solich_is_stagemanager", result)
+        return result
     except Exception:
         return False
+
+
+@register.filter(name="is_any_manager")
+def is_any_manager(request):
+    """
+    This method is used to check the employee is stage or recruitment manager
+    """
+    user = request.user
+    cached = getattr(user, "_solich_is_any_manager", None)
+    if cached is not None:
+        return cached
+    employee = user.employee_get
+    result = (
+        employee.stage_set.filter(is_active=True).exists()
+        or employee.recruitment_set.exists()
+        or employee.onboardingstage_set.exists()
+        or employee.onboarding_task.exists()
+    )
+    setattr(user, "_solich_is_any_manager", result)
+    return result
 
 
 @register.filter(name="is_recruitmentmanager")
@@ -40,8 +66,13 @@ def is_recruitmentmangers(user):
     This method is used to check the employee is recruitment manager
     """
     try:
+        cached = getattr(user, "_solich_is_recruitmentmanager", None)
+        if cached is not None:
+            return cached
         employee_obj = user.employee_get
-        return employee_obj.recruitment_set.exists()
+        result = employee_obj.recruitment_set.exists()
+        setattr(user, "_solich_is_recruitmentmanager", result)
+        return result
     except Exception:
         return False
 
@@ -83,7 +114,7 @@ def employee(uid):
     Returns:
         user object
     """
-    return User.objects.get(id=uid).employee_get if uid is not None else None
+    return SolichUser.objects.get(id=uid).employee_get if uid is not None else None
 
 
 @register.filter(name="media_path")
@@ -140,7 +171,13 @@ def is_in_task_managers(user):
     """
     This method is used to check the user in the task manager or not
     """
-    return OnboardingTask.objects.filter(employee_id__employee_user_id=user).exists()
+    if apps.is_installed("onboarding"):
+        from onboarding.models import OnboardingTask
+
+        return OnboardingTask.objects.filter(
+            employee_id__employee_user_id=user
+        ).exists()
+    return False
 
 
 @register.filter(name="pipeline_grouper")
@@ -150,3 +187,10 @@ def pipeline_grouper(grouper: dict = {}):
     """
     return grouper["title"], grouper["stages"]
 
+
+@register.filter(name="to_json")
+def to_json(value):
+    ordered_list = [
+        {"id": val.id, "stage": val.stage, "type": val.stage_type} for val in value
+    ]
+    return json.dumps(ordered_list)

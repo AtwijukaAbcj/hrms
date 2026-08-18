@@ -1,4 +1,4 @@
-"""Solich URL Configuration
+"""solich URL Configuration
 
 The `urlpatterns` list routes URLs to views. For more information please see:
     https://docs.djangoproject.com/en/4.1/topics/http/urls/
@@ -16,12 +16,50 @@ Including another URLconf
 
 from django.conf.urls.static import static
 from django.contrib import admin
+from django.core.cache import cache
+from django.db import connection
+from django.http import JsonResponse
 from django.urls import include, path, re_path
+from django.views.i18n import JavaScriptCatalog
 
 import notifications.urls
-from base.views import home, login_user, logout_user
 
 from . import settings
+
+
+def health_check(request):
+    """Liveness probe — cheap, no dependency checks (Docker HEALTHCHECK)."""
+    return JsonResponse({"status": "ok"}, status=200)
+
+
+def readiness_check(request):
+    """
+    Readiness probe — verifies database (and Redis cache when REDIS_URL is set).
+    """
+    checks = {}
+    try:
+        connection.ensure_connection()
+        checks["database"] = "ok"
+    except Exception as exc:
+        return JsonResponse(
+            {"status": "unavailable", "database": str(exc)},
+            status=503,
+        )
+
+    if getattr(settings, "REDIS_URL", None):
+        try:
+            cache.set("solich_ready_probe", "1", timeout=5)
+            if cache.get("solich_ready_probe") != "1":
+                raise RuntimeError("cache readback failed")
+            checks["cache"] = "ok"
+        except Exception as exc:
+            return JsonResponse(
+                {"status": "unavailable", "cache": str(exc), **checks},
+                status=503,
+            )
+
+    return JsonResponse({"status": "ok", **checks}, status=200)
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -30,23 +68,18 @@ urlpatterns = [
     path("", include("base.urls")),
     path("", include("solich_automations.urls")),
     path("", include("solich_views.urls")),
-    path("recruitment/", include("recruitment.urls")),
+    path("", include("solich_audit.urls")),
+    path("", include("solich_tour.urls")),
     path("employee/", include("employee.urls")),
-    path("leave/", include("leave.urls")),
-    path("onboarding/", include("onboarding.urls")),
-    path("pms/", include("pms.urls")),
-    path("asset/", include("asset.urls")),
-    path("attendance/", include("attendance.urls")),
-    path("payroll/", include("payroll.urls.urls")),
-    path("helpdesk/", include("helpdesk.urls")),
-    path("offboarding/", include("offboarding.urls")),
     path("solich-widget/", include("solich_widgets.urls")),
     re_path(
         "^inbox/notifications/", include(notifications.urls, namespace="notifications")
     ),
     path("i18n/", include("django.conf.urls.i18n")),
+    path("jsi18n/", JavaScriptCatalog.as_view(), name="javascript-catalog"),
+    path("health/", health_check),
+    path("ready/", readiness_check),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-
+# if settings.DEBUG:
+#     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

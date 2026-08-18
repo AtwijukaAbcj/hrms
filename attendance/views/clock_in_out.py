@@ -4,32 +4,43 @@ clock_in_out.py
 This module is used register endpoints to the check-in check-out functionalities
 """
 
+import ipaddress
+import logging
+
+from django.shortcuts import render
+
+from solich.http.response import SolichRedirect
+
+logger = logging.getLogger(__name__)
 from datetime import date, datetime, timedelta
 
+from django.contrib import messages
 from django.db.models import Q
 from django.http import HttpResponse
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from attendance.models import (
-    Attendance,
-    AttendanceActivity,
-    AttendanceLateComeEarlyOut,
-    GraceTime,
-)
-from attendance.views.views import (
+from attendance.methods.utils import (
     activity_datetime,
-    attendance_validate,
     employee_exists,
     format_time,
     overtime_calculation,
     shift_schedule_today,
     strtime_seconds,
 )
+from attendance.models import (
+    Attendance,
+    AttendanceActivity,
+    AttendanceGeneralSetting,
+    AttendanceLateComeEarlyOut,
+    GraceTime,
+)
+from attendance.views.views import attendance_validate
 from base.context_processors import (
     enable_late_come_early_out_tracking,
     timerunner_enabled,
 )
-from base.models import AttendanceAllowedIP, EmployeeShiftDay
+from base.models import AttendanceAllowedIP, Company, EmployeeShiftDay
 from solich.decorators import hx_request_required, login_required
 from solich.solich_middlewares import _thread_locals
 
@@ -66,6 +77,8 @@ def late_come(attendance, start_time, end_time, shift):
         end_time : attendance day shift end time
 
     """
+    if not shift:
+        return
     if not enable_late_come_early_out_tracking(None).get("tracking"):
         return
     request = getattr(_thread_locals, "request", None)
@@ -73,7 +86,7 @@ def late_come(attendance, start_time, end_time, shift):
     mid_day_sec = strtime_seconds("12:00")
 
     # Checking gracetime allowance before creating late come
-    if shift.grace_time_id:
+    if shift and shift.grace_time_id:
         # checking grace time in shift, it has the higher priority
         if (
             shift.grace_time_id.is_active == True
@@ -145,15 +158,14 @@ def clock_in_attendance_and_activity(
         activity.clock_out_date = date_today
         activity.save()
 
-    AttendanceActivity(
+    new_activity = AttendanceActivity.objects.create(
         employee_id=employee,
         attendance_date=attendance_date,
         clock_in_date=date_today,
         shift_day=day,
         clock_in=in_datetime,
         in_datetime=in_datetime,
-    ).save()
-
+    )
     # create attendance if not exist
     attendance = Attendance.objects.filter(
         employee_id=employee, attendance_date=attendance_date
@@ -193,123 +205,128 @@ def clock_in(request):
     """
     This method is used to mark the attendance once per a day and multiple attendance activities.
     """
-    allowed_attendance_ips = AttendanceAllowedIP.objects.first()
-
-    # 'not request.__dict__.get("datetime")' used to check if the request is from biometric device
-
+    # check wether check in/check out feature is enabled
+    selected_company = request.session.get("selected_company")
+    if selected_company == "all":
+        company = None
+        attendance_general_settings = AttendanceGeneralSetting.objects.filter(
+            company_id=None
+        ).first()
+    else:
+        company = Company.objects.filter(id=selected_company).first()
+        attendance_general_settings = AttendanceGeneralSetting.objects.filter(
+            company_id=company
+        ).first()
+    # request.__dict__.get("datetime")' used to check if the request is from a biometric device
     if (
-        not request.__dict__.get("datetime")
-        and allowed_attendance_ips
-        and allowed_attendance_ips.is_enabled
+        attendance_general_settings
+        and attendance_general_settings.enable_check_in
+        or request.__dict__.get("datetime")
     ):
+        allowed_attendance_ips = AttendanceAllowedIP.objects.filter(
+            company_id=company
+        ).first()
 
-        x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
-        ip = request.META.get("REMOTE_ADDR")
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(",")[0]
+        if (
+            not request.__dict__.get("datetime")
+            and allowed_attendance_ips
+            and allowed_attendance_ips.is_enabled
+        ):
+            x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+            ip = request.META.get("REMOTE_ADDR")
+            if x_forwarded_for:
+                ip = x_forwarded_for.split(",")[0]
 
-        if not (ip in allowed_attendance_ips.additional_data["allowed_ips"]):
-            return HttpResponse(_("You cannot mark attendance from this network"))
+            allowed_ips = (allowed_attendance_ips.additional_data or {}).get(
+                "allowed_ips", []
+            )
+            ip_allowed = False
+            for allowed_ip in allowed_ips:
+                try:
+                    if ipaddress.ip_address(ip) in ipaddress.ip_network(
+                        allowed_ip, strict=False
+                    ):
+                        ip_allowed = True
+                        break
+                except ValueError:
+                    continue
 
-    employee, work_info = employee_exists(request)
-    datetime_now = datetime.now()
-    if request.__dict__.get("datetime"):
-        datetime_now = request.datetime
-    if employee and work_info is not None:
-        shift = work_info.shift_id
-        date_today = date.today()
-        if request.__dict__.get("date"):
-            date_today = request.date
-        attendance_date = date_today
-        day = date_today.strftime("%A").lower()
-        day = EmployeeShiftDay.objects.get(day=day)
-        now = datetime.now().strftime("%H:%M")
-        if request.__dict__.get("time"):
-            now = request.time.strftime("%H:%M")
-        now_sec = strtime_seconds(now)
-        mid_day_sec = strtime_seconds("12:00")
-        minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
-            day=day, shift=shift
-        )
-        if start_time_sec > end_time_sec:
-            # night shift
-            # ------------------
-            # Night shift in HRMS consider a 24 hours from noon to next day noon,
-            # the shift day taken today if the attendance clocked in after 12 O clock.
-
-            if mid_day_sec > now_sec:
-                # Here you need to create attendance for yesterday
-
-                date_yesterday = date_today - timedelta(days=1)
-                day_yesterday = date_yesterday.strftime("%A").lower()
-                day_yesterday = EmployeeShiftDay.objects.get(day=day_yesterday)
-                minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
-                    day=day_yesterday, shift=shift
+            if not ip_allowed:
+                messages.error(
+                    request,
+                    _("Check-In Restricted: Your current network is not authorized "),
                 )
-                attendance_date = date_yesterday
-                day = day_yesterday
-        clock_in_attendance_and_activity(
-            employee=employee,
-            date_today=date_today,
-            attendance_date=attendance_date,
-            day=day,
-            now=now,
-            shift=shift,
-            minimum_hour=minimum_hour,
-            start_time=start_time_sec,
-            end_time=end_time_sec,
-            in_datetime=datetime_now,
-        )
-        script = ""
-        hidden_label = ""
-        time_runner_enabled = timerunner_enabled(request)["enabled_timerunner"]
-        mouse_in = ""
-        mouse_out = ""
-        if time_runner_enabled:
-            script = """
-            <script>
-                    $(".time-runner").removeClass("stop-runner");
-                    run = 1;
-                    at_work_seconds = {at_work_seconds_forecasted};
-                </script>
-                """.format(
-                at_work_seconds_forecasted=employee.get_forecasted_at_work()[
-                    "forecasted_at_work_seconds"
-                ]
-            )
-            hidden_label = """
-            style="display:none"
-            """
-            mouse_in = """ onmouseenter = "$(this).find('span').show();$(this).find('.time-runner').hide();" """
-            mouse_out = """ onmouseleave = "$(this).find('span').hide();$(this).find('.time-runner').show();" """
+                return SolichRedirect(request)
 
-        return HttpResponse(
-            """
-              <button class="oh-btn oh-btn--warning-outline check-in mr-2"
-              {mouse_in}
-              {mouse_out}
-                hx-get="/attendance/clock-out"
-                    hx-target='#attendance-activity-container'
-                    hx-swap='innerHTML'><ion-icon class="oh-navbar__clock-icon mr-2
-                    text-warning"
-                        name="exit-outline"></ion-icon>
-               <span {hidden_label} class="hr-check-in-out-text">{check_out}</span>
-                <div class="time-runner"></div>
-              </button>
-              {script}
-            """.format(
-                check_out=_("Check-Out"),
-                script=script,
-                hidden_label=hidden_label,
-                mouse_in=mouse_in,
-                mouse_out=mouse_out,
+        employee, work_info = employee_exists(request)
+        datetime_now = timezone.localtime()
+        if request.__dict__.get("datetime"):
+            datetime_now = request.datetime
+        if employee and work_info is not None:
+            shift = work_info.shift_id
+            date_today = date.today()
+            if request.__dict__.get("date"):
+                date_today = request.date
+            attendance_date = date_today
+            day = date_today.strftime("%A").lower()
+            day = EmployeeShiftDay.objects.get(day=day)
+            now = datetime.now().strftime("%H:%M")
+            if request.__dict__.get("time"):
+                now = request.time.strftime("%H:%M")
+            now_sec = strtime_seconds(now)
+            mid_day_sec = strtime_seconds("12:00")
+            minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
+                day=day, shift=shift
             )
+            if start_time_sec > end_time_sec:
+                # night shift
+                # ------------------
+                # Night shift in Solich consider a 24 hours from noon to next day noon,
+                # the shift day taken today if the attendance clocked in after 12 O clock.
+
+                if mid_day_sec > now_sec:
+                    # Here you need to create attendance for yesterday
+
+                    date_yesterday = date_today - timedelta(days=1)
+                    day_yesterday = date_yesterday.strftime("%A").lower()
+                    day_yesterday = EmployeeShiftDay.objects.get(day=day_yesterday)
+                    minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
+                        day=day_yesterday, shift=shift
+                    )
+                    attendance_date = date_yesterday
+                    day = day_yesterday
+            attendance = clock_in_attendance_and_activity(
+                employee=employee,
+                date_today=date_today,
+                attendance_date=attendance_date,
+                day=day,
+                now=now,
+                shift=shift,
+                minimum_hour=minimum_hour,
+                start_time=start_time_sec,
+                end_time=end_time_sec,
+                in_datetime=datetime_now,
+            )
+            # Refresh employee from DB so template re-evaluates is_clocked_in correctly
+            employee.refresh_from_db()
+            return render(
+                request, "attendance/components/in_out_component.html", {"run": 1}
+            )
+        messages.error(
+            request,
+            _(
+                "Check-In Unavailable: Your employee profile or work information is incomplete."
+            ),
         )
-    return HttpResponse(
-        _(
-            "You Don't have work information filled or your employee detail neither entered "
+        return SolichRedirect(request)
+    else:
+        messages.error(
+            request,
+            _(
+                "The attendance check-in/check-out feature has not been enabled for your company."
+            ),
         )
-    )
+        return SolichRedirect(request)
 
 
 def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=None):
@@ -324,6 +341,7 @@ def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=No
     attendance_activities = AttendanceActivity.objects.filter(
         employee_id=employee,
     ).order_by("attendance_date", "id")
+    attendance_activity = None  # Initialize attendance_activity
 
     if attendance_activities.filter(clock_out__isnull=True).exists():
         attendance_activity = attendance_activities.filter(
@@ -334,34 +352,37 @@ def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=No
         attendance_activity.out_datetime = out_datetime
         attendance_activity.save()
 
-    attendance_activities = attendance_activities.filter(
-        attendance_date=attendance_activity.attendance_date
-    )
-    # Here calculate the total durations between the attendance activities
+        attendance_activities = attendance_activities.filter(
+            attendance_date=attendance_activity.attendance_date
+        )
+        # Here calculate the total durations between the attendance activities
 
-    duration = 0
-    for attendance_activity in attendance_activities:
-        in_datetime, out_datetime = activity_datetime(attendance_activity)
-        difference = out_datetime - in_datetime
-        days_second = difference.days * 24 * 3600
-        seconds = difference.seconds
-        total_seconds = days_second + seconds
-        duration = duration + total_seconds
-    duration = format_time(duration)
-    # update clock out of attendance
-    attendance = Attendance.objects.filter(employee_id=employee).order_by(
-        "-attendance_date", "-id"
-    )[0]
-    attendance.attendance_clock_out = now + ":00"
-    attendance.attendance_clock_out_date = date_today
-    attendance.attendance_worked_hour = duration
-    # Overtime calculation
-    attendance.attendance_overtime = overtime_calculation(attendance)
+        duration = 0
+        for activity in attendance_activities:
+            in_datetime, out_datetime = activity_datetime(activity)
+            difference = out_datetime - in_datetime
+            days_second = difference.days * 24 * 3600
+            seconds = difference.seconds
+            total_seconds = days_second + seconds
+            duration = duration + total_seconds
+        duration = format_time(duration)
+        # update clock out of attendance
+        attendance = Attendance.objects.filter(employee_id=employee).order_by(
+            "-attendance_date", "-id"
+        )[0]
+        attendance.attendance_clock_out = now + ":00"
+        attendance.attendance_clock_out_date = date_today
+        attendance.attendance_worked_hour = duration
+        # Overtime calculation
+        attendance.attendance_overtime = overtime_calculation(attendance)
 
-    # Validate the attendance as per the condition
-    attendance.attendance_validated = attendance_validate(attendance)
-    attendance.save()
+        # Validate the attendance as per the condition
+        attendance.attendance_validated = attendance_validate(attendance)
+        attendance.save()
 
+        return attendance
+
+    logger.error("No attendance clock in activity found that needs clocking out.")
     return
 
 
@@ -394,9 +415,16 @@ def early_out(attendance, start_time, end_time, shift):
         start_time : attendance day shift start time
         start_end : attendance day shift end time
     """
+    if not shift:
+        return
     if not enable_late_come_early_out_tracking(None).get("tracking"):
         return
-    now_sec = strtime_seconds(attendance.attendance_clock_out.strftime("%H:%M"))
+
+    clock_out_time = attendance.attendance_clock_out
+    if isinstance(clock_out_time, str):
+        clock_out_time = datetime.strptime(clock_out_time, "%H:%M:%S")
+
+    now_sec = strtime_seconds(clock_out_time.strftime("%H:%M"))
     mid_day_sec = strtime_seconds("12:00")
     # Checking gracetime allowance before creating early out
     if shift and shift.grace_time_id:
@@ -435,91 +463,127 @@ def clock_out(request):
     """
     This method is used to set the out date and time for attendance and attendance activity
     """
-    datetime_now = datetime.now()
-    if request.__dict__.get("datetime"):
-        datetime_now = request.datetime
-    employee, work_info = employee_exists(request)
-    shift = work_info.shift_id
-    date_today = date.today()
-    if request.__dict__.get("date"):
-        date_today = request.date
-    day = date_today.strftime("%A").lower()
-    day = EmployeeShiftDay.objects.get(day=day)
-    attendance = (
-        Attendance.objects.filter(employee_id=employee)
-        .order_by("id", "attendance_date")
-        .last()
-    )
-    if attendance is not None:
-        day = attendance.attendance_day
-    now = datetime.now().strftime("%H:%M")
-    if request.__dict__.get("time"):
-        now = request.time.strftime("%H:%M")
-    minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
-        day=day, shift=shift
-    )
+    # check wether check in/check out feature is enabled
+    selected_company = request.session.get("selected_company")
+    if selected_company == "all":
+        company = None
+        attendance_general_settings = AttendanceGeneralSetting.objects.filter(
+            company_id=None
+        ).first()
+    else:
+        company = Company.objects.filter(id=selected_company).first()
+        attendance_general_settings = AttendanceGeneralSetting.objects.filter(
+            company_id=company
+        ).first()
+    if (
+        attendance_general_settings
+        and attendance_general_settings.enable_check_in
+        or request.__dict__.get("datetime")
+    ):
+        allowed_attendance_ips = AttendanceAllowedIP.objects.filter(
+            company_id=company
+        ).first()
 
-    clock_out_attendance_and_activity(
-        employee=employee, date_today=date_today, now=now, out_datetime=datetime_now
-    )
-    attendance = (
-        Attendance.objects.filter(employee_id=employee)
-        .order_by("id", "attendance_date")
-        .last()
-    )
-    early_out_instance = attendance.late_come_early_out.filter(type="early_out")
-    if not early_out_instance.exists():
-        early_out(
-            attendance=attendance,
-            start_time=start_time_sec,
-            end_time=end_time_sec,
-            shift=shift,
+        if (
+            not request.__dict__.get("datetime")
+            and allowed_attendance_ips
+            and allowed_attendance_ips.is_enabled
+        ):
+            x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+            ip = request.META.get("REMOTE_ADDR")
+            if x_forwarded_for:
+                ip = x_forwarded_for.split(",")[0]
+
+            allowed_ips = (allowed_attendance_ips.additional_data or {}).get(
+                "allowed_ips", []
+            )
+            ip_allowed = False
+            for allowed_ip in allowed_ips:
+                try:
+                    if ipaddress.ip_address(ip) in ipaddress.ip_network(
+                        allowed_ip, strict=False
+                    ):
+                        ip_allowed = True
+                        break
+                except ValueError:
+                    continue
+
+            if not ip_allowed:
+                messages.error(
+                    request,
+                    _("Check-Out Restricted: Your current network is not authorized"),
+                )
+                return SolichRedirect(request)
+
+        datetime_now = timezone.localtime()
+        if request.__dict__.get("datetime"):
+            datetime_now = request.datetime
+        employee, work_info = employee_exists(request)
+        shift = work_info.shift_id
+        date_today = date.today()
+        if request.__dict__.get("date"):
+            date_today = request.date
+        day = date_today.strftime("%A").lower()
+        day = EmployeeShiftDay.objects.get(day=day)
+        attendance = (
+            Attendance.objects.filter(employee_id=employee)
+            .order_by("id", "attendance_date")
+            .last()
+        )
+        if attendance is not None:
+            if not attendance.attendance_day:
+                day_name = attendance.attendance_date.strftime("%A").lower()
+                attendance.attendance_day = EmployeeShiftDay.objects.get(day=day_name)
+                attendance.save(update_fields=["attendance_day"])
+            day = attendance.attendance_day
+        now = datetime.now().strftime("%H:%M")
+        if request.__dict__.get("time"):
+            now = request.time.strftime("%H:%M")
+        minimum_hour, start_time_sec, end_time_sec = shift_schedule_today(
+            day=day, shift=shift
+        )
+        attendance = clock_out_attendance_and_activity(
+            employee=employee, date_today=date_today, now=now, out_datetime=datetime_now
+        )
+        if attendance:
+            early_out_instance = attendance.late_come_early_out.filter(type="early_out")
+            is_night_shift = attendance.is_night_shift()
+            next_date = attendance.attendance_date + timedelta(days=1)
+            if not early_out_instance.exists():
+                if is_night_shift:
+                    now_sec = strtime_seconds(now)
+                    mid_sec = strtime_seconds("12:00")
+
+                    if (attendance.attendance_date == date_today) or (
+                        # check is next day mid
+                        mid_sec >= now_sec
+                        and date_today == next_date
+                    ):
+                        early_out(
+                            attendance=attendance,
+                            start_time=start_time_sec,
+                            end_time=end_time_sec,
+                            shift=shift,
+                        )
+                elif attendance.attendance_date == date_today:
+                    early_out(
+                        attendance=attendance,
+                        start_time=start_time_sec,
+                        end_time=end_time_sec,
+                        shift=shift,
+                    )
+
+        # Refresh employee from DB so template re-evaluates is_clocked_in correctly
+        employee.refresh_from_db()
+        return render(
+            request, "attendance/components/in_out_component.html", {"run": 1}
         )
 
-    script = ""
-    hidden_label = ""
-    time_runner_enabled = timerunner_enabled(request)["enabled_timerunner"]
-    mouse_in = ""
-    mouse_out = ""
-    if time_runner_enabled:
-        script = """
-            <script>
-            $(document).ready(function () {{
-                $('.at-work-seconds').html(secondsToDuration({at_work_seconds_forecasted}))
-            }});
-            run = 0;
-            at_work_seconds = {at_work_seconds_forecasted};
-            </script>
-        """.format(
-            at_work_seconds_forecasted=employee.get_forecasted_at_work()[
-                "forecasted_at_work_seconds"
-            ],
+    else:
+        messages.error(
+            request,
+            _(
+                "The attendance check-in/check-out feature has not been enabled for your company."
+            ),
         )
-        hidden_label = """
-        style="display:none"
-        """
-        mouse_in = """ onmouseenter="$(this).find('div.at-work-seconds').hide();$(this).find('span').show();" """
-        mouse_out = """onmouseleave="$(this).find('div.at-work-seconds').show();$(this).find('span').hide();" """
-    return HttpResponse(
-        """
-              <button class="oh-btn oh-btn--success-outline mr-2"
-              {mouse_in}
-              {mouse_out}
-              hx-get="/attendance/clock-in"
-              hx-target='#attendance-activity-container'
-              hx-swap='innerHTML'>
-              <ion-icon class="oh-navbar__clock-icon mr-2 text-success"
-              name="enter-outline"></ion-icon>
-               <span class="hr-check-in-out-text" {hidden_label} >{check_in}</span>
-               <div class="at-work-seconds"></div>
-              </button>
-              {script}
-            """.format(
-            check_in=_("Check-In"),
-            script=script,
-            hidden_label=hidden_label,
-            mouse_in=mouse_in,
-            mouse_out=mouse_out,
-        )
-    )
-
+        return SolichRedirect(request)

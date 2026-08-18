@@ -1,30 +1,77 @@
+import uuid
 from urllib.parse import urlparse
 
+from django.apps import apps
 from django.shortcuts import redirect
 from django.urls import Resolver404, path, resolve, reverse
+from django.utils.translation import gettext as _trans
 
+from base.context_processors import white_labelling_company
 from employee.models import Employee
 from solich.urls import urlpatterns
-from recruitment.models import Candidate
+
+
+def is_valid_uuid(uuid_string):
+    try:
+        uuid.UUID(uuid_string, version=4)
+        return True
+    except ValueError:
+        return False
 
 
 def _split_path(self, path=None):
-    """Returns a list of the path components between slashes"""
-    if not path:
-        path = self.path
-    if path.endswith("/"):
-        path = path[:-1]
-    if path.startswith("/"):
-        path = path[1:]
-    if path == "":
-        return list()
 
-    result = path.split("/")
-    return result
+    path = path or self.path
+    path = path.strip("/")
+    parts = path.split("/") if path else []
 
+    if parts and parts[0] in ("static", "media"):
+        return []
+
+    return parts
+
+
+def _resolve_menu_section(path, menus):
+    """
+    Find the top-level sidebar section (a MENU entry from some app's
+    sidebar.py) that owns a submenu whose redirect matches the given path,
+    either exactly or as a parent path (e.g. an employee detail page under
+    the Employees list submenu). Returns (section_label, submenu_redirect)
+    for the longest/most specific matching submenu, or None if nothing
+    matches (e.g. settings pages, which aren't part of the main sidebar).
+    """
+    best = None
+    for menu in menus or []:
+        for submenu in menu.get("submenu", []):
+            redirect = submenu.get("redirect") or ""
+            if not redirect:
+                continue
+            if path == redirect or path.startswith(redirect):
+                if best is None or len(redirect) > len(best[1]):
+                    best = (str(menu.get("menu", "")), redirect)
+    return best
+
+
+BREADCRUMB_URL_NAMES = {
+    "ess": "Employee",
+    "offboarding": "Offboarding",
+    "helpdesk": "Helpdesk",
+    "policies-discipline": "Policies & Discipline",
+    "work-schedules": "Work Schedules",
+    "requests": "Requests",
+    "employee-settings-view": "Configuration",
+    "recruitment-settings-view": "Configuration",
+    "helpdesk-settings-view": "Configuration",
+    "leave-settings-view": "Configuration",
+    "payroll-settings-view": "Configuration",
+    "performance-settings-view": "Configuration",
+    "user-group-view": "Roles and Permissions",
+    "employee-permission-assign": "Roles and Permissions",
+}
 
 sidebar_urls = [
     "dashboard",
+    "ess",
     "pipeline",
     "recruitment-survey-question-template-view",
     "candidate-view",
@@ -65,12 +112,11 @@ sidebar_urls = [
     "dashboard-view",
     "objective-list-view",
     "feedback-view",
-    "period-view",
-    "question-template-view",
     "asset-category-view",
     "asset-request-allocation-view",
     "settings",
     "attendance-settings",
+    "geo-face-config",
     "employee-permission-assign",
     "user-group-assign",
     "currency",
@@ -90,8 +136,10 @@ sidebar_urls = [
     "faq-category-view",
     "ticket-view",
     "tag-view",
+    "audit-history-view",
     "ticket-type-view",
     "mail-server-conf",
+    "mail-templates-view",
     "multiple-approval-condition",
     "skill-zone-view",
     "view-mail-templates",
@@ -103,6 +151,7 @@ sidebar_urls = [
     "pagination-settings-view",
     "organisation-chart",
     "disciplinary-actions",
+    "roster",
     "view-policies",
     "resignation-requests-view",
     "action-type",
@@ -123,11 +172,83 @@ sidebar_urls = [
     "view-time-sheet",
     "templates",
     "sidebar.html",
+    "objective-detailed-view",
+    "mail-automations",
+    "mail-automations-view",
+    "faq-view",
+    "auto-payslip-settings-view",
+    "bonus-point-setting",
+    "employee-past-leave-restriction",
+    "track-late-come-early-out",
+    "enable-biometric-attendance",
+    "allowed-ips",
+    "self-tracking-feature",
+    "candidate-reject-reasons",
+    "skills-view",
+    "employee-bonus-point",
+    "mail-automations",
+    "task-all",
+    "check-in-check-out-setting",
+    "user-accessibility",
+    "asset-batch-view",
+    "task-all",
+    "gdrive",
+    "color-settings",
+    "employee-report",
+    "employee-pivot",
+    "recruitment-report",
+    "recruitment-pivot",
+    "attendance-report",
+    "attendance-pivot",
+    "leave-report",
+    "leave-pivot",
+    "payroll-report",
+    "payroll-pivot",
+    "asset-report",
+    "asset-pivot",
+    "pms-report",
+    "pms-pivot",
+    "linkedin-integration-setting",
+    "ldap-settings",
+    "gmeet-setting",
+    "whatsapp-credential-view",
+    "cbv-pipeline",
+    "gmeet-view",
+    "color-theme-view",
+    "survey-template-preview",
+    "system-preferences-view",
+    "default-export-access",
+    "encashment-settings-view",
+    "attendance-rule-view",
+    "leave-rules-view",
+    "restrict-leaves-view",
+    "holidays-view",
+    "company-leaves-view",
+    "offboarding-rules-view",
+    "grace-time-view",
+    "audit-history",
+    "policies-discipline",
+    "work-schedules",
+    "requests",
+    "employee-settings-view",
+    "recruitment-settings-view",
+    "helpdesk-settings-view",
+    "leave-settings-view",
+    "payroll-settings-view",
+    "performance-settings-view",
+    "tours",
+    "templates-periods",
 ]
 remove_urls = [
     "feedback-detailed-view",
     "question-template-detailed-view",
     "employee-view-new",
+    "objective-detailed-view",
+    "ticket-detail",
+    "faq-view",
+    "get-job-positions",
+    "task-view",
+    "dashboard",
 ]
 
 user_breadcrumbs = {}
@@ -135,15 +256,21 @@ user_breadcrumbs = {}
 
 def breadcrumbs(request):
     base_url = request.build_absolute_uri("/")
-    user_id = str(request.user)
+    company = white_labelling_company(request)["white_label_company_name"]
 
-    if user_id not in user_breadcrumbs:
-        user_breadcrumbs[user_id] = [
-            {"url": base_url, "name": "Hrms", "found": True}
+    # Initialize breadcrumbs in the session if not already present
+    if "breadcrumbs" not in request.session:
+        request.session["breadcrumbs"] = [
+            {
+                "url": base_url,
+                "name": company,
+                "found": True,
+                "clickable": True,
+            }
         ]
 
     try:
-        user_breadcrumb = user_breadcrumbs[user_id]
+        breadcrumbs = request.session["breadcrumbs"]
 
         qs = request.META.get("QUERY_STRING", "")
         pairs = qs.split("&")
@@ -151,7 +278,7 @@ def breadcrumbs(request):
         filtered_query_string = "&".join(filtered_pairs)
         emp_query_string = None
 
-        for item in user_breadcrumb:
+        for item in breadcrumbs:
             if item["name"] in ["employee-view", "candidate-view"]:
                 items = item["url"].split("?", 1)
                 if len(items) > 1:
@@ -161,7 +288,45 @@ def breadcrumbs(request):
         parts = _split_path(request)
         path = base_url
 
-        candidates = Candidate.objects.filter(is_active=True)
+        # Section-aware breadcrumb: instead of guessing the top-level label from
+        # the raw first URL segment, look it up in the same sidebar MENU/SUBMENUS
+        # registry that drives the actual left nav (see any app's sidebar.py).
+        # The one exception is the main Dashboard: it isn't a "section" of its
+        # own, so when the user actually came from there (via HTTP_REFERER,
+        # rather than a one-off query marker) we show "Dashboard" instead of
+        # whatever section the destination page belongs to.
+        menus = getattr(request, "MENUS", None)
+        if menus is None:
+            try:
+                from solich.config import sidebar as _build_sidebar_menus
+
+                _build_sidebar_menus(request)
+                menus = getattr(request, "MENUS", [])
+            except Exception:
+                menus = []
+
+        current_section = _resolve_menu_section(request.path, menus)
+
+        section_override = None
+        try:
+            dashboard_path = reverse("dashboard")
+        except Exception:
+            dashboard_path = None
+
+        referer = request.META.get("HTTP_REFERER")
+        if referer and dashboard_path:
+            referer_path = urlparse(referer).path
+            if referer_path.rstrip("/") == dashboard_path.rstrip("/"):
+                section_override = {"name": _trans("Dashboard"), "url": dashboard_path}
+
+        if apps.is_installed("recruitment"):
+            from recruitment.models import Candidate
+
+            candidates = Candidate.objects.filter(is_active=True)
+
+        else:
+            candidates = None
+
         employees = Employee.objects.all()
 
         if len(parts) > 1:
@@ -194,8 +359,13 @@ def breadcrumbs(request):
                 ]
 
         if len(parts) == 0:
-            user_breadcrumbs[user_id].clear()
-            user_breadcrumb.append({"url": base_url, "name": "Hrms", "found": True})
+            request.session["breadcrumbs"].clear()
+            breadcrumbs.append({"url": base_url, "name": company, "found": True})
+
+        if len(parts) == 1 and parts[0] in sidebar_urls:
+            first_path = breadcrumbs[0]
+            request.session["breadcrumbs"].clear()
+            request.session["breadcrumbs"].append(first_path)
 
         if len(parts) > 1:
             last_path = parts[-1]
@@ -205,10 +375,10 @@ def breadcrumbs(request):
                 or parts[-2] == "candidate-view"
                 or parts[-2] == "view-payslip"
             ):
-                breadcrumbs = user_breadcrumbs[user_id]
                 first_path = breadcrumbs[0]
-                user_breadcrumbs[user_id].clear()
-                user_breadcrumbs[user_id].append(first_path)
+                request.session["breadcrumbs"].clear()
+                request.session["breadcrumbs"].append(first_path)
+
         for i, item in enumerate(parts):
             path = path + item + "/"
             parsed_url = urlparse(path)
@@ -216,12 +386,52 @@ def breadcrumbs(request):
             try:
                 resolver_match = resolve(check_path)
                 found = True
-            except Resolver404 as e:
+            except Resolver404:
                 found = False
 
-            new_dict = {"url": path, "name": item, "found": found}
+            clickable = True
+            if found and not request.user.is_superuser:
+                view_func = resolver_match.func
+                required_perms = getattr(view_func, "_required_perms", [])
+                if not required_perms:
+                    redirect_to = getattr(view_func, "_redirect_to", None)
+                    if redirect_to:
+                        try:
+                            dest_path = reverse(redirect_to)
+                            dest_match = resolve(dest_path)
+                            required_perms = getattr(
+                                dest_match.func, "_required_perms", []
+                            )
+                        except Exception:
+                            pass
+                if required_perms:
+                    clickable = all(request.user.has_perm(p) for p in required_perms)
 
-            if item.isdigit():
+            new_dict = {
+                "url": path,
+                "name": BREADCRUMB_URL_NAMES.get(item, item),
+                "found": found,
+                "clickable": clickable,
+            }
+
+            if i == 0:
+                if section_override:
+                    new_dict["name"] = section_override["name"]
+                    new_dict["url"] = base_url.rstrip("/") + section_override["url"]
+                    new_dict["found"] = True
+                elif current_section:
+                    new_dict["name"] = current_section[0]
+
+            if item == "attendance":
+                from base.templatetags.basefilters import is_reportingmanager
+
+                new_dict["clickable"] = (
+                    request.user.is_superuser
+                    or request.user.has_perm("attendance.view_attendance")
+                    or is_reportingmanager(request.user)
+                )
+
+            if item.isdigit() or is_valid_uuid(item):
                 # Handle the case when item is a digit (e.g., an ID)
                 current_url = resolve(request.path_info)
                 url_kwargs = current_url.kwargs
@@ -229,26 +439,30 @@ def breadcrumbs(request):
 
                 if model_value:
                     try:
-                        object = model_value.objects.get(id=item)
-                        new_dict["name"] = str(object)
+                        obj = model_value.objects.get(id=item)  # completed
+                        new_dict["name"] = str(obj)
                     except:
                         pass
 
             key = "HTTP_HX_REQUEST"
-            names = [d["name"] for d in user_breadcrumb]
+            sidebar_nav_key = "HTTP_HX_SIDEBAR_NAV"
+            names = [d["name"] for d in breadcrumbs]
             if (
-                new_dict not in user_breadcrumb
+                new_dict not in breadcrumbs
                 and new_dict["name"] not in remove_urls + names
-                and key not in request.META.keys()
+                and (
+                    key not in request.META.keys()
+                    or request.META.get(sidebar_nav_key) == "true"
+                )
                 and not new_dict["name"].isdigit()
             ):
                 if new_dict["name"] in ["employee-view", "candidate-view"]:
                     new_dict["url"] = f'{new_dict["url"]}?{emp_query_string}'
 
-                user_breadcrumb.append(new_dict)
+                breadcrumbs.append(new_dict)
 
         try:
-            prev_url = user_breadcrumb[-1]
+            prev_url = breadcrumbs[-1]
             prev_url["url"] = prev_url["url"].split("?")[0]
             if filtered_query_string:
                 prev_url["url"] = f'{prev_url["url"]}?{filtered_query_string}'
@@ -257,34 +471,50 @@ def breadcrumbs(request):
         except:
             pass
 
-        user_breadcrumbs[user_id] = user_breadcrumb
+        request.session["breadcrumbs"] = breadcrumbs
 
     except Exception as e:
-        user_breadcrumb[user_id].clear()
-        user_breadcrumbs[user_id] = [
-            {"url": base_url, "name": "Hrms", "found": True}
+        request.session["breadcrumbs"] = [
+            {"url": base_url, "name": company, "found": True}
         ]
-    return {"breadcrumbs": user_breadcrumbs[user_id]}
+    return {"breadcrumbs": request.session["breadcrumbs"]}
 
 
-urlpatterns.append(
-    path("recruitment/", lambda request: redirect("recruitment-dashboard"))
-)
-urlpatterns.append(
-    path("onboarding/", lambda request: redirect("view-onboarding-dashboard"))
-)
-urlpatterns.append(path("employee/", lambda request: redirect("employee-view")))
-urlpatterns.append(
-    path("attendance/", lambda request: redirect("attendance-dashboard"))
-)
-urlpatterns.append(
-    path(
-        "leave/",
-        lambda request: redirect(
-            reverse("leave-employee-dashboard") + "?dashboard=true"
-        ),
-    )
-)
-urlpatterns.append(path("payroll/", lambda request: redirect("view-payroll-dashboard")))
-urlpatterns.append(path("pms/", lambda request: redirect("dashboard-view")))
+def _section_redirect(url_name):
+    """Return a named redirect view that stores its destination for breadcrumb permission checks."""
 
+    def _redirect(request):
+        return redirect(url_name)
+
+    _redirect._redirect_to = url_name
+    return _redirect
+
+
+def _leave_redirect(request):
+    return redirect(reverse("leave-employee-dashboard") + "?dashboard=true")
+
+
+def _attendance_redirect(request):
+    from base.templatetags.basefilters import is_reportingmanager
+
+    if (
+        request.user.is_superuser
+        or request.user.has_perm("attendance.view_attendance")
+        or is_reportingmanager(request.user)
+    ):
+        return redirect("attendance-dashboard")
+    return redirect("attendance-view")
+
+
+urlpatterns.append(path("recruitment/", _section_redirect("recruitment-dashboard")))
+urlpatterns.append(
+    path("onboarding/", _section_redirect("onboarding-modern-dashboard"))
+)
+urlpatterns.append(path("employee/", _section_redirect("ess-dashboard")))
+urlpatterns.append(path("attendance/", _attendance_redirect))
+urlpatterns.append(path("leave/", _leave_redirect))
+urlpatterns.append(path("payroll/", _section_redirect("view-payroll-dashboard")))
+urlpatterns.append(path("pms/", _section_redirect("dashboard-view")))
+urlpatterns.append(path("asset/", _section_redirect("asset-dashboard")))
+urlpatterns.append(path("project/", _section_redirect("project-dashboard-view")))
+urlpatterns.append(path("helpdesk/", _section_redirect("helpdesk-dashboard")))

@@ -8,7 +8,11 @@ pre-tax deductions, and post-tax deductions.
 import contextlib
 import operator
 
-from attendance.models import Attendance
+from django.apps import apps
+
+# from attendance.models import Attendance
+from solich.methods import get_solich_model_class
+from payroll.methods.deductions import update_compensation_deduction
 from payroll.methods.limits import compute_limit
 from payroll.models import models
 from payroll.models.models import (
@@ -19,6 +23,11 @@ from payroll.models.models import (
     MultipleCondition,
 )
 
+
+def return_none(a, b):
+    return None
+
+
 operator_mapping = {
     "equal": operator.eq,
     "notequal": operator.ne,
@@ -27,6 +36,7 @@ operator_mapping = {
     "le": operator.le,
     "ge": operator.ge,
     "icontains": operator.contains,
+    "range": return_none,
 }
 filter_mapping = {
     "work_type_id": {
@@ -208,9 +218,18 @@ def calculate_gross_pay(*_args, **kwargs):
     total_allowance = kwargs["total_allowance"]
     # basic_pay = compute_salary_on_period(employee, start_date, end_date)["basic_pay"]
     gross_pay = total_allowance + basic_pay
+
+    employee, start_date, end_date = (
+        kwargs[key] for key in ("employee", "start_date", "end_date")
+    )
+
+    updated_gross_pay_data = update_compensation_deduction(
+        employee, gross_pay, "gross_pay", start_date, end_date
+    )
     return {
-        "gross_pay": gross_pay,
+        "gross_pay": updated_gross_pay_data["compensation_amount"],
         "basic_pay": basic_pay,
+        "deductions": updated_gross_pay_data["deductions"],
     }
 
 
@@ -272,8 +291,10 @@ def calculate_allowance(**kwargs):
 
     allowances = specific_allowances | conditional_allowances | active_employees
 
-    allowances = allowances.exclude(one_time_date__lt=start_date).exclude(
-        one_time_date__gt=end_date
+    allowances = (
+        allowances.exclude(one_time_date__lt=start_date)
+        .exclude(one_time_date__gt=end_date)
+        .distinct()
     )
 
     employee_allowances = []
@@ -313,8 +334,12 @@ def calculate_allowance(**kwargs):
                 filter_params = filter_mapping[allowance.based_on]["filter"](
                     employee, allowance, start_date, end_date
                 )
-                if Attendance.objects.filter(**filter_params):
-                    employee_allowances.append(allowance)
+                if apps.is_installed("attendance"):
+                    Attendance = get_solich_model_class(
+                        app_label="attendance", model="attendance"
+                    )
+                    if Attendance.objects.filter(**filter_params):
+                        employee_allowances.append(allowance)
             else:
                 employee_allowances.append(allowance)
     # Filter and append taxable allowance and not taxable allowance
@@ -788,9 +813,11 @@ def calculate_based_on_gross_pay(*_args, **kwargs):
     """
 
     component = kwargs["component"]
+    day_dict = kwargs["day_dict"]
     gross_pay = calculate_gross_pay(**kwargs)
     rate = component.rate
     amount = gross_pay["gross_pay"] * rate / 100
+    amount = compute_limit(component, amount, day_dict)
     return amount
 
 
@@ -811,10 +838,12 @@ def calculate_based_on_taxable_gross_pay(*_args, **kwargs):
 
     """
     component = kwargs["component"]
+    day_dict = kwargs["day_dict"]
     taxable_gross_pay = calculate_taxable_gross_pay(**kwargs)
     taxable_gross_pay = taxable_gross_pay["taxable_gross_pay"]
     rate = component.rate
     amount = taxable_gross_pay * rate / 100
+    amount = compute_limit(component, amount, day_dict)
     return amount
 
 
@@ -833,8 +862,6 @@ def calculate_based_on_net_pay(component, net_pay, day_dict):
     rate = float(component.rate)
     amount = net_pay * rate / 100
     amount = compute_limit(component, amount, day_dict)
-
-    amount = compute_limit(component, amount, day_dict)
     return amount
 
 
@@ -852,6 +879,11 @@ def calculate_based_on_attendance(*_args, **kwargs):
     Returns:
         float: The calculated amount of the component based on the attendance.
     """
+
+    if not apps.is_installed("attendance"):
+        return 0
+
+    Attendance = get_solich_model_class(app_label="attendance", model="attendance")
     employee = kwargs["employee"]
     start_date = kwargs["start_date"]
     end_date = kwargs["end_date"]
@@ -864,9 +896,7 @@ def calculate_based_on_attendance(*_args, **kwargs):
         attendance_validated=True,
     ).count()
     amount = count * component.per_attendance_fixed_amount
-
     amount = compute_limit(component, amount, day_dict)
-
     return amount
 
 
@@ -884,6 +914,10 @@ def calculate_based_on_shift(*_args, **kwargs):
     Returns:
         float: The calculated amount of the component based on the shift attendance.
     """
+    if not apps.is_installed("attendance"):
+        return 0
+
+    Attendance = get_solich_model_class(app_label="attendance", model="attendance")
     employee = kwargs["employee"]
     start_date = kwargs["start_date"]
     end_date = kwargs["end_date"]
@@ -917,7 +951,10 @@ def calculate_based_on_overtime(*_args, **kwargs):
     Returns:
         float: The calculated amount of the allowance or deduction based on the overtime hours.
     """
+    if not apps.is_installed("attendance"):
+        return 0
 
+    Attendance = get_solich_model_class(app_label="attendance", model="attendance")
     employee = kwargs["employee"]
     start_date = kwargs["start_date"]
     end_date = kwargs["end_date"]
@@ -956,6 +993,10 @@ def calculate_based_on_work_type(*_args, **kwargs):
         float: The calculated amount of the allowance or deduction based on the
                attendance with the specified work type.
     """
+    if not apps.is_installed("attendance"):
+        return 0
+
+    Attendance = get_solich_model_class(app_label="attendance", model="attendance")
     employee = kwargs["employee"]
     start_date = kwargs["start_date"]
     end_date = kwargs["end_date"]
@@ -1010,4 +1051,3 @@ calculation_mapping = {
     "work_type_id": calculate_based_on_work_type,
     "children": calculate_based_on_children,
 }
-

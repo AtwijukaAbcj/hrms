@@ -4,21 +4,23 @@ Used to register models
 """
 
 import calendar
+import logging
+import re
 from datetime import date, datetime, timedelta
 
 from django import forms
+from django.apps import apps
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models.signals import post_save, pre_delete, pre_save
-from django.dispatch import receiver
 from django.http import QueryDict
+from django.urls import reverse, reverse_lazy
 from django.utils import timezone
+from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 
-from asset.models import Asset
-from attendance.models import Attendance, strtime_seconds, validate_time_format
 from base.solich_company_manager import SolichCompanyManager
+from base.methods import get_next_month_same_date
 from base.models import (
     Company,
     Department,
@@ -26,12 +28,18 @@ from base.models import (
     JobPosition,
     JobRole,
     WorkType,
+    validate_time_format,
 )
+from employee.methods.duration_methods import strtime_seconds
 from employee.models import BonusPoint, Employee, EmployeeWorkInformation
 from solich import solich_middlewares
-from solich.models import SolichModel
+from solich.solich_middlewares import _thread_locals
+from solich.models import SolichModel, upload_path
 from solich_audit.models import SolichAuditInfo, SolichAuditLog
-from leave.models import LeaveRequest, LeaveType
+from solich_views.cbv_methods import render_template
+
+logger = logging.getLogger(__name__)
+
 
 # Create your models here.
 
@@ -59,8 +67,6 @@ def get_date_range(start_date, end_date):
         start_date = date(2023, 1, 1)
         end_date = date(2023, 1, 10)
         date_range = get_date_range(start_date, end_date)
-        for date_obj in date_range:
-            print(date_obj)
     """
     date_list = []
     delta = end_date - start_date
@@ -95,6 +101,8 @@ class FilingStatus(SolichModel):
         default="taxable_gross_pay",
         verbose_name=_("Based on"),
     )
+    use_py = models.BooleanField(verbose_name=_("Python Code"), default=False)
+    python_code = models.TextField(null=True)
     description = models.TextField(
         blank=True,
         verbose_name=_("Description"),
@@ -107,6 +115,41 @@ class FilingStatus(SolichModel):
 
     def __str__(self) -> str:
         return str(self.filing_status)
+
+    def get_update_url(self):
+        """
+        Returns the URL for updating the filing status instance.
+        """
+        return reverse("filing-status-update", kwargs={"pk": self.pk})
+
+    def get_create_url(self):
+        """
+        Returns the URL for updating the filing status instance.
+        """
+        return reverse("tax-bracket-create", kwargs={"filing_status_id": self.pk})
+
+    def get_delete_url(self):
+        """
+        Returns the URL for updating the filing status instance.
+        """
+        return f"{reverse('generic-delete')}?model=payroll.FilingStatus&pk={self.pk}"
+
+    def tax_brackets_col(self):
+        """
+        Renders the tax brackets belonging to this filing status as a table.
+        """
+        return render_template(
+            path="cbv/federal_tax/tax_brackets_col.html",
+            context={
+                "instance": self,
+                "tax_brackets": self.taxbracket_set.all().order_by("min_income"),
+            },
+        )
+
+    class Meta:
+        ordering = ["-id"]
+        verbose_name = _("Filing Status")
+        verbose_name_plural = _("Filing Statuses")
 
 
 class Contract(SolichModel):
@@ -125,24 +168,20 @@ class Contract(SolichModel):
         ("monthly", _("Monthly")),
         ("semi_monthly", _("Semi-Monthly")),
     )
-    WAGE_CHOICES = (
-        ("hourly", _("Hourly")),
+    WAGE_CHOICES = [
         ("daily", _("Daily")),
         ("monthly", _("Monthly")),
-    )
+    ]
+
+    if apps.is_installed("attendance"):
+        WAGE_CHOICES.append(("hourly", _("Hourly")))
+
     CONTRACT_STATUS_CHOICES = (
         ("draft", _("Draft")),
         ("active", _("Active")),
         ("expired", _("Expired")),
         ("terminated", _("Terminated")),
     )
-    try:
-        # Here would be not filing status model at the initial/empty db
-        FILING_STATUS_CHOICES = [("", _("None"))] + list(
-            FilingStatus.objects.values_list("id", "filing_status")
-        )
-    except:
-        pass
 
     contract_name = models.CharField(
         max_length=250, help_text=_("Contract Title."), verbose_name=_("Contract")
@@ -231,7 +270,7 @@ class Contract(SolichModel):
         validators=[min_zero],
         verbose_name=_("Notice Period"),
     )
-    contract_document = models.FileField(upload_to="uploads/", null=True, blank=True)
+    contract_document = models.FileField(upload_to=upload_path, null=True, blank=True)
     deduct_leave_from_basic_pay = models.BooleanField(
         default=True,
         verbose_name=_("Deduct From Basic Pay"),
@@ -251,7 +290,7 @@ class Contract(SolichModel):
         verbose_name=_("Deduction For One Leave Amount"),
     )
 
-    note = models.TextField(null=True, blank=True, max_length=255)
+    note = models.TextField(null=True, blank=True)
     history = SolichAuditLog(
         related_name="history_set",
         bases=[
@@ -260,6 +299,103 @@ class Contract(SolichModel):
     )
 
     objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    def get_wage_type_display(self):
+        """
+        Display wage type
+        """
+        return dict(self.WAGE_CHOICES).get(self.wage_type)
+
+    def get_pay_frequency_display(self):
+        """
+        Display pay frequency
+        """
+        return dict(self.PAY_FREQUENCY_CHOICES).get(self.pay_frequency)
+
+    def get_status_display(self):
+        """
+        Display status
+        """
+        return dict(self.CONTRACT_STATUS_CHOICES).get(self.contract_status)
+
+    def status_col(self):
+        """
+        status column
+        """
+        return render_template(
+            path="cbv/contracts/status.html",
+            context={"instance": self},
+        )
+
+    def detail_action(self):
+        """
+        Detail actions
+        """
+        return render_template(
+            path="cbv/contracts/detail_action.html",
+            context={"instance": self},
+        )
+
+    def note_col(self):
+        """
+        Note column
+        """
+        return render_template(
+            path="cbv/contracts/note.html",
+            context={"instance": self},
+        )
+
+    def document_col(self):
+        """
+        Document column
+        """
+        return render_template(
+            path="cbv/contracts/document.html",
+            context={"instance": self},
+        )
+
+    def actions_col(self):
+        """
+        actions column
+        """
+        return render_template(
+            path="cbv/contracts/actions.html",
+            context={"instance": self},
+        )
+
+    def cal_leave_amount(self):
+        """
+        Action column for Calculate Leave Amount
+        """
+        return render_template(
+            path="cbv/contracts/cal_leave_amount.html",
+            context={"instance": self},
+        )
+
+    def conract_subtitle(self):
+        """
+        Detail view subtitle
+        """
+
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def contracts_detail(self):
+        """
+        detail view
+        """
+
+        url = reverse("contracts-detail-view", kwargs={"pk": self.pk})
+
+        return url
+
+    def deduct_leave_from_basic_pay_col(self):
+        """
+        Deduct leave from basic pay column
+        """
+        if self.deduct_leave_from_basic_pay:
+            return _("Yes")
+        else:
+            return _("No")
 
     def __str__(self) -> str:
         return f"{self.contract_name} -{self.contract_start_date} - {self.contract_end_date}"
@@ -347,8 +483,17 @@ class Contract(SolichModel):
             raise forms.ValidationError(
                 _("A draft contract already exists for this employee.")
             )
-
         super().save(*args, **kwargs)
+        if self.contract_status == "active" and self.wage is not None:
+            try:
+                wage_int = int(self.wage)
+                work_info = self.employee_id.employee_work_info
+                work_info.basic_salary = wage_int
+                work_info.save()
+            except ValueError:
+                logger.error((f"Failed to convert wage '{self.wage}' to an integer."))
+            except Exception as e:
+                logger.error(f"An unexpected error occurred: {e}")
         return self
 
     class Meta:
@@ -368,7 +513,7 @@ class WorkRecord(models.Model):
         ("FDP", _("Present")),
         ("HDP", _("Half Day Present")),
         ("ABS", _("Absent")),
-        ("HD", _("Holiday/Company Leave")),
+        ("HD", _("Holiday / Weekly Off")),
         ("CONF", _("Conflict")),
         ("DFT", _("Draft")),
     ]
@@ -425,191 +570,194 @@ class WorkRecord(models.Model):
         )
 
 
-class OverrideAttendance(Attendance):
-    """
-    Class to override Attendance model save method
-    """
+if apps.is_installed("attendance"):
+    from attendance.models import Attendance
 
+    # class OverrideAttendance(Attendance):
+    #     """
+    #     Class to override Attendance model save method
+    #     """
+    #     pass
     # Additional fields and methods specific to AnotherModel
-    @receiver(post_save, sender=Attendance)
-    def attendance_post_save(sender, instance, **kwargs):
+    # @receiver(post_save, sender=Attendance)
+    # def attendance_post_save(sender, instance, **kwargs):
+    #     """
+    #     Overriding Attendance model save method
+    #     """
+    #     if instance.first_save:
+    #         min_hour_second = strtime_seconds(instance.minimum_hour)
+    #         at_work_second = strtime_seconds(instance.attendance_worked_hour)
+    #         status = "FDP" if instance.at_work_second >= min_hour_second else "HDP"
+    #         status = "CONF" if instance.attendance_validated is False else status
+    #         message = (
+    #             _("Validate the attendance") if status == "CONF" else _("Validated")
+    #         )
+    #         message = (
+    #             _("Incomplete minimum hour")
+    #             if status == "HDP" and min_hour_second > at_work_second
+    #             else message
+    #         )
+    #         work_record = WorkRecord.objects.filter(
+    #             date=instance.attendance_date,
+    #             is_attendance_record=True,
+    #             employee_id=instance.employee_id,
+    #         )
+    #         work_record = (
+    #             WorkRecord()
+    #             if not WorkRecord.objects.filter(
+    #                 date=instance.attendance_date,
+    #                 employee_id=instance.employee_id,
+    #             ).exists()
+    #             else WorkRecord.objects.filter(
+    #                 date=instance.attendance_date,
+    #                 employee_id=instance.employee_id,
+    #             ).first()
+    #         )
+    #         work_record.employee_id = instance.employee_id
+    #         work_record.date = instance.attendance_date
+    #         work_record.at_work = instance.attendance_worked_hour
+    #         work_record.min_hour = instance.minimum_hour
+    #         work_record.min_hour_second = min_hour_second
+    #         work_record.at_work_second = at_work_second
+    #         work_record.work_record_type = status
+    #         work_record.message = message
+    #         work_record.is_attendance_record = True
+    #         if instance.attendance_validated:
+    #             work_record.day_percentage = (
+    #                 1.00 if at_work_second > min_hour_second / 2 else 0.50
+    #             )
+    #         work_record.save()
+    #         if status == "HDP" and work_record.is_leave_record:
+    #             message = _("Half day leave")
+    #         if status == "FDP":
+    #             message = _("Present")
+    #         work_record.message = message
+    #         work_record.save()
+    #         message = work_record.message
+    #         status = work_record.work_record_type
+    #         if not instance.attendance_clock_out:
+    #             status = "FDP"
+    #             message = _("Currently working")
+    #         work_record.message = message
+    #         work_record.work_record_type = status
+    #         work_record.save()
+    # @receiver(pre_delete, sender=Attendance)
+    # def attendance_pre_delete(sender, instance, **_kwargs):
+    #     """
+    #     Overriding Attendance model delete method
+    #     """
+    #     # Perform any actions before deleting the instance
+    #     # ...
+    #     WorkRecord.objects.filter(
+    #         employee_id=instance.employee_id,
+    #         is_attendance_record=True,
+    #         date=instance.attendance_date,
+    #     ).delete()
+
+
+if apps.is_installed("leave"):
+    from leave.models import LeaveRequest
+
+    class OverrideLeaveRequest(LeaveRequest):
         """
-        Overriding Attendance model save method
+        Class to override Attendance model save method
         """
-        if instance.first_save:
-            min_hour_second = strtime_seconds(instance.minimum_hour)
-            at_work_second = strtime_seconds(instance.attendance_worked_hour)
 
-            status = "FDP" if instance.at_work_second >= min_hour_second else "HDP"
+        pass
+        # Additional fields and methods specific to AnotherModel
+        # @receiver(pre_save, sender=LeaveRequest)
+        # def leaverequest_pre_save(sender, instance, **_kwargs):
+        #     """
+        #     Overriding LeaveRequest model save method
+        #     """
+        #     if (
+        #         instance.start_date == instance.end_date
+        #         and instance.end_date_breakdown != instance.start_date_breakdown
+        #     ):
+        #         instance.end_date_breakdown = instance.start_date_breakdown
+        #         super(LeaveRequest, instance).save()
 
-            status = "CONF" if instance.attendance_validated is False else status
-            message = (
-                _("Validate the attendance") if status == "CONF" else _("Validated")
-            )
+        #     period_dates = get_date_range(instance.start_date, instance.end_date)
+        #     if instance.status == "approved":
+        #         for date in period_dates:
+        #             try:
+        #                 work_entry = (
+        #                     WorkRecord.objects.filter(
+        #                         date=date,
+        #                         employee_id=instance.employee_id,
+        #                     )
+        #                     if WorkRecord.objects.filter(
+        #                         date=date,
+        #                         employee_id=instance.employee_id,
+        #                     ).exists()
+        #                     else WorkRecord()
+        #                 )
+        #                 work_entry.employee_id = instance.employee_id
+        #                 work_entry.is_leave_record = True
+        #                 work_entry.day_percentage = (
+        #                     0.50
+        #                     if instance.start_date == date
+        #                     and instance.start_date_breakdown == "first_half"
+        #                     or instance.end_date == date
+        #                     and instance.end_date_breakdown == "second_half"
+        #                     else 0.00
+        #                 )
+        #                 # scheduler task to validate the conflict entry for half day if they
+        #                 # take half day leave is when they mark the attendance.
+        #                 status = (
+        #                     "CONF"
+        #                     if instance.start_date == date
+        #                     and instance.start_date_breakdown == "first_half"
+        #                     or instance.end_date == date
+        #                     and instance.end_date_breakdown == "second_half"
+        #                     else "ABS"
+        #                 )
+        #                 work_entry.work_record_type = status
+        #                 work_entry.date = date
+        #                 work_entry.message = (
+        #                     "Absent"
+        #                     if status == "ABS"
+        #                     else _("Half day Attendance need to validate")
+        #                 )
+        #                 work_entry.save()
+        #             except:
+        #                 pass
 
-            message = (
-                _("Incomplete minimum hour")
-                if status == "HDP" and min_hour_second > at_work_second
-                else message
-            )
-            work_record = WorkRecord.objects.filter(
-                date=instance.attendance_date,
-                is_attendance_record=True,
-                employee_id=instance.employee_id,
-            )
-            work_record = (
-                WorkRecord()
-                if not WorkRecord.objects.filter(
-                    date=instance.attendance_date,
-                    employee_id=instance.employee_id,
-                ).exists()
-                else WorkRecord.objects.filter(
-                    date=instance.attendance_date,
-                    employee_id=instance.employee_id,
-                ).first()
-            )
-            work_record.employee_id = instance.employee_id
-            work_record.date = instance.attendance_date
-            work_record.at_work = instance.attendance_worked_hour
-            work_record.min_hour = instance.minimum_hour
-            work_record.min_hour_second = min_hour_second
-            work_record.at_work_second = at_work_second
-            work_record.work_record_type = status
-            work_record.message = message
-            work_record.is_attendance_record = True
-            if instance.attendance_validated:
-                work_record.day_percentage = (
-                    1.00 if at_work_second > min_hour_second / 2 else 0.50
-                )
-            work_record.save()
-
-            if status == "HDP" and work_record.is_leave_record:
-                message = _("Half day leave")
-
-            if status == "FDP":
-                message = _("Present")
-
-            work_record.message = message
-            work_record.save()
-
-            message = work_record.message
-            status = work_record.work_record_type
-            if not instance.attendance_clock_out:
-                status = "FDP"
-                message = _("Currently working")
-            work_record.message = message
-            work_record.work_record_type = status
-            work_record.save()
-
-    @receiver(pre_delete, sender=Attendance)
-    def attendance_pre_delete(sender, instance, **_kwargs):
-        """
-        Overriding Attendance model delete method
-        """
-        # Perform any actions before deleting the instance
-        # ...
-        WorkRecord.objects.filter(
-            employee_id=instance.employee_id,
-            is_attendance_record=True,
-            date=instance.attendance_date,
-        ).delete()
+        #     else:
+        #         for date in period_dates:
+        #             WorkRecord.objects.filter(
+        #                 is_leave_record=True,
+        #                 date=date,
+        #                 employee_id=instance.employee_id,
+        #             ).delete()
 
 
-class OverrideLeaveRequest(LeaveRequest):
-    """
-    Class to override Attendance model save method
-    """
+# class OverrideWorkInfo(EmployeeWorkInformation):
+#     """
+#     This class is to override the Model default methods
+#     """
 
-    # Additional fields and methods specific to AnotherModel
-    @receiver(pre_save, sender=LeaveRequest)
-    def leaverequest_pre_save(sender, instance, **_kwargs):
-        """
-        Overriding LeaveRequest model save method
-        """
-        if (
-            instance.start_date == instance.end_date
-            and instance.end_date_breakdown != instance.start_date_breakdown
-        ):
-            instance.end_date_breakdown = instance.start_date_breakdown
-            super(LeaveRequest, instance).save()
-
-        period_dates = get_date_range(instance.start_date, instance.end_date)
-        if instance.status == "approved":
-            for date in period_dates:
-                try:
-                    work_entry = (
-                        WorkRecord.objects.filter(
-                            date=date,
-                            employee_id=instance.employee_id,
-                        )
-                        if WorkRecord.objects.filter(
-                            date=date,
-                            employee_id=instance.employee_id,
-                        ).exists()
-                        else WorkRecord()
-                    )
-                    work_entry.employee_id = instance.employee_id
-                    work_entry.is_leave_record = True
-                    work_entry.day_percentage = (
-                        0.50
-                        if instance.start_date == date
-                        and instance.start_date_breakdown == "first_half"
-                        or instance.end_date == date
-                        and instance.end_date_breakdown == "second_half"
-                        else 0.00
-                    )
-                    # scheduler task to validate the conflict entry for half day if they
-                    # take half day leave is when they mark the attendance.
-                    status = (
-                        "CONF"
-                        if instance.start_date == date
-                        and instance.start_date_breakdown == "first_half"
-                        or instance.end_date == date
-                        and instance.end_date_breakdown == "second_half"
-                        else "ABS"
-                    )
-                    work_entry.work_record_type = status
-                    work_entry.date = date
-                    work_entry.message = (
-                        "Absent"
-                        if status == "ABS"
-                        else _("Half day Attendance need to validate")
-                    )
-                    work_entry.save()
-                except:
-                    pass
-
-        else:
-            for date in period_dates:
-                WorkRecord.objects.filter(
-                    is_leave_record=True, date=date, employee_id=instance.employee_id
-                ).delete()
-
-
-class OverrideWorkInfo(EmployeeWorkInformation):
-    """
-    This class is to override the Model default methods
-    """
-
-    @receiver(pre_save, sender=EmployeeWorkInformation)
-    def employeeworkinformation_pre_save(sender, instance, **_kwargs):
-        """
-        This method is used to override the save method for EmployeeWorkInformation Model
-        """
-        active_employee = (
-            instance.employee_id if instance.employee_id.is_active == True else None
-        )
-        if active_employee is not None:
-            contract_exists = active_employee.contract_set.exists()
-            if not contract_exists:
-                contract = Contract()
-                contract.contract_name = f"{active_employee}'s Contract"
-                contract.employee_id = active_employee
-                contract.contract_start_date = datetime.today()
-                contract.wage = (
-                    instance.basic_salary if instance.basic_salary is not None else 0
-                )
-                contract.save()
+# @receiver(pre_save, sender=EmployeeWorkInformation)
+# def employeeworkinformation_pre_save(sender, instance, **_kwargs):
+#     """
+#     This method is used to override the save method for EmployeeWorkInformation Model
+#     """
+#     active_employee = (
+#         instance.employee_id if instance.employee_id.is_active == True else None
+#     )
+#     if active_employee is not None:
+#         contract_exists = active_employee.contract_set.exists()
+#         if not contract_exists:
+#             contract = Contract()
+#             contract.contract_name = f"{active_employee}'s Contract"
+#             contract.employee_id = active_employee
+#             contract.contract_start_date = (
+#                 instance.date_joining if instance.date_joining else datetime.today()
+#             )
+#             contract.wage = (
+#                 instance.basic_salary if instance.basic_salary is not None else 0
+#             )
+#             contract.save()
 
 
 # Create your models here.
@@ -686,12 +834,19 @@ class Allowance(SolichModel):
 
     based_on_choice = [
         ("basic_pay", _("Basic Pay")),
-        ("attendance", _("Attendance")),
-        ("shift_id", _("Shift")),
-        ("overtime", _("Overtime")),
-        ("work_type_id", _("Work Type")),
         ("children", _("Children")),
     ]
+
+    if apps.is_installed("attendance"):
+        attendance_choices = [
+            ("overtime", _("Regular Overtime")),
+            ("week_off_overtime", _("Week Off Overtime")),
+            ("holiday_overtime", _("Holiday Overtime")),
+            ("shift_id", _("Shift")),
+            ("work_type_id", _("Work Type")),
+            ("attendance", _("Attendance")),
+        ]
+        based_on_choice += attendance_choices
 
     if_condition_choice = [
         ("basic_pay", _("Basic Pay")),
@@ -709,7 +864,7 @@ class Allowance(SolichModel):
     )
     include_active_employees = models.BooleanField(
         default=False,
-        verbose_name=_("Include all active employees"),
+        verbose_name=_("Include All Employees"),
         help_text=_("Target allowance to all active employees in the company"),
     )
     specific_employees = models.ManyToManyField(
@@ -854,6 +1009,7 @@ class Allowance(SolichModel):
         blank=True,
         validators=[min_zero],
         help_text=_("The maximum amount for the allowance"),
+        verbose_name=_("Maximum Amount"),
     )
     maximum_unit = models.CharField(
         max_length=20,
@@ -866,7 +1022,8 @@ class Allowance(SolichModel):
             ),
             # ("monthly_working_days", "For working days on month"),
         ],
-        help_text="The maximum amount for ?",
+        help_text=_("The maximum amount for ?"),
+        verbose_name=_("Maximum Unit"),
     )
     if_choice = models.CharField(
         max_length=10,
@@ -924,6 +1081,175 @@ class Allowance(SolichModel):
         ]
         verbose_name = _("Allowance")
 
+    def get_specific_employees(self):
+        """
+        Get all specific employees separated by commas.
+        """
+
+        employees = self.specific_employees.all()
+        employee_names_string = ", ".join([str(employee) for employee in employees])
+        return employee_names_string
+
+    def get_exclude_employees(self):
+        """
+        Get all specific employees separated by commas.
+        """
+
+        return ", ".join([str(employee) for employee in self.exclude_employees.all()])
+
+    def get_is_taxable_display(self):
+        """
+        method to return is taxable or not
+        """
+        return _("Yes") if self.is_taxable else _("No")
+
+    def get_is_condition_based(self):
+        """
+        method to return is condition based or not
+        """
+        return _("Yes") if self.is_condition_based else _("No")
+
+    def get_is_fixed(self):
+        """
+        method to return is fixed
+        """
+        return _("Yes") if self.is_fixed else _("No")
+
+    def get_based_on_display(self):
+        """
+        method to return get based on field
+        """
+        return dict(self.based_on_choice).get(self.based_on)
+
+    def allowance_detail_view(self):
+        """
+        detail view
+        """
+
+        url = reverse("allowance-detail-view", kwargs={"pk": self.pk})
+
+        return url
+
+    def get_delete_url(self):
+        """
+        to get the delete url for card action delete
+        """
+
+        url = reverse_lazy("generic-delete")
+
+        return url
+
+    def get_update_url(self):
+        """
+        to get the update url for card action update
+        """
+
+        url = reverse("update-allowance", kwargs={"allowance_id": self.pk})
+        return url
+
+    def get_allowance_actions(self):
+        """
+        This method to get allowance actions
+        """
+
+        return render_template(
+            path="cbv/allowance_deduction/allowance_action.html",
+            context={"instance": self},
+        )
+
+    def get_avatar(self):
+        """
+        Method will return the API URL for the avatar or the path to the profile image.
+        """
+        sanitized_title = re.sub(r"[^a-zA-Z0-9\s]", "", self.title)
+        sanitized_title = sanitized_title.replace(" ", "+")
+        url = f"https://ui-avatars.com/api/?name={sanitized_title}&background=random"
+        return url
+
+    def one_time_date_display(self):
+        """
+        method to return one time field
+        """
+        if self.one_time_date:
+            return f'On <span class="dateformat_changer">{self.one_time_date}</span>'
+        else:
+            return _("No")
+
+    def get_field_display(self):
+        """
+        get field choice dict if based on condition
+        """
+        return dict(FIELD_CHOICE).get(self.field)
+
+    def get_condition_display(self):
+        """
+        get condition choice dict if based on condition
+        """
+        return dict(CONDITION_CHOICE).get(self.condition)
+
+    def condition_based_display(self):
+        """
+        method to return condition if condition based
+        """
+        if self.is_condition_based:
+            condition_display = self.get_condition_display()
+            return f"{self.get_field_display()} {condition_display} {self.value}"
+        else:
+            return _("No")
+
+    def based_on_amount(self):
+        """
+        custome template for retrieve amount
+        """
+        return render_template(
+            path="cbv/allowance_deduction/allowance/custom_amount.html",
+            context={"instance": self},
+        )
+
+    def cust_allowance_max_limit(self):
+        """
+        custom template to retrive allowance max limit
+        """
+        return render_template(
+            path="cbv/allowance_deduction/allowance/max_limit_col.html",
+            context={"instance": self},
+        )
+
+    def get_if_choice_display(self):
+        """
+        for allowance eligibility
+        """
+        return (
+            dict(self.if_condition_choice).get(self.if_choice, self.if_choice)
+            if self.if_choice
+            else ""
+        )
+
+    def get_if_condition_display(self):
+        """
+        for allowance eligibility
+        """
+        return (
+            dict(IF_CONDITION_CHOICE).get(self.if_condition, self.if_condition)
+            if self.if_condition
+            else ""
+        )
+
+    def allowance_eligibility(self):
+        """
+        for allowance eligibility
+        """
+        return f'{_("If")} {self.get_if_choice_display()} {self.get_if_condition_display()} {self.if_amount}'
+
+    def allowance_detail_actions(self):
+        """
+        custom template to retrive detail view actions
+        """
+        return render_template(
+            path="cbv/allowance_deduction/allowance/detail_view_actions.html",
+            context={"instance": self},
+        )
+
     def reset_based_on(self):
         """Reset the this fields when is_fixed attribute is true"""
         attributes_to_reset = [
@@ -940,6 +1266,59 @@ class Allowance(SolichModel):
         for attribute in attributes_to_reset:
             setattr(self, attribute, None)
         self.has_max_limit = False
+
+    def get_specific_exclude_employees(self):
+        """
+        Get all specific and exclude employees separated by commas for detail view.
+        """
+        col = ""
+        if self.specific_employees.exists():
+            specific_employees = self.specific_employees.all()
+            specific_employee_names = ", ".join(
+                str(employee.get_full_name()) for employee in specific_employees
+            )
+            label = "Specific Employees"
+
+            col += format_html(
+                """
+                    <div class="col-span-1 md:col-span-6 mb-2 flex gap-5 items-center">
+                            <span class="font-medium text-xs text-[#565E6C] w-32">
+                                {}
+                            </span>
+                            <div class="text-xs font-semibold flex items-center gap-5">
+                                : <span>
+                                    {}
+                                </span>
+                            </div>
+                        </div>
+                """,
+                label,
+                specific_employee_names,
+            )
+
+        if self.exclude_employees.exists():
+            exclude_employees = self.exclude_employees.all()
+            exclude_employee_names = ", ".join(
+                str(employee.get_full_name()) for employee in exclude_employees
+            )
+            label = "Excluded Employees"
+            col += format_html(
+                """
+                    <div class="col-span-1 md:col-span-6 mb-2 flex gap-5 items-center">
+                            <span class="font-medium text-xs text-[#565E6C] w-32">
+                                {}
+                            </span>
+                            <div class="text-xs font-semibold flex items-center gap-5">
+                                : <span>
+                                    {}
+                                </span>
+                            </div>
+                        </div>
+                """,
+                label,
+                exclude_employee_names,
+            )
+        return col
 
     def clean(self):
         super().clean()
@@ -1005,6 +1384,13 @@ class Allowance(SolichModel):
     def __str__(self) -> str:
         return str(self.title)
 
+    def save(self, *args, **kwargs):
+        from base.auth_backends import stamp_company_on_create
+
+        if not self.id:
+            stamp_company_on_create(self)
+        super().save(*args, **kwargs)
+
 
 class Deduction(SolichModel):
     """
@@ -1039,7 +1425,7 @@ class Deduction(SolichModel):
     )
     include_active_employees = models.BooleanField(
         default=False,
-        verbose_name=_("Include all active employees"),
+        verbose_name=_("Include All Employees"),
         help_text=_("Target deduction to all active employees in the company"),
     )
     specific_employees = models.ManyToManyField(
@@ -1161,6 +1547,7 @@ class Deduction(SolichModel):
         blank=True,
         validators=[min_zero],
         help_text=_("The maximum amount for the deduction"),
+        verbose_name=_("Maximum Amount"),
     )
 
     maximum_unit = models.CharField(
@@ -1172,6 +1559,7 @@ class Deduction(SolichModel):
             # ("monthly_working_days", "For working days on month"),
         ],
         help_text=_("The maximum amount for ?"),
+        verbose_name=_("Maximum Unit"),
     )
     if_choice = models.CharField(
         max_length=10,
@@ -1212,13 +1600,225 @@ class Deduction(SolichModel):
         payslip = Payslip.objects.filter(installment_ids=self).first()
         return payslip
 
+    def get_is_pretax_display(self):
+        return _("Yes") if self.is_pretax else _("No")
+
+    def get_is_condition_based_display(self):
+        return _("Yes") if self.is_condition_based else _("No")
+
+    def get_is_fixed_display(self):
+        return _("Yes") if self.is_fixed else _("No")
+
+    def get_based_on_display(self):
+        """
+        Display work type
+        """
+        return dict(self.based_on_choice).get(self.based_on)
+
+    def get_field_display(self):
+        """
+        Field column
+        """
+        return dict(FIELD_CHOICE).get(self.field)
+
+    def get_condition_display(self):
+        """
+        condition display column
+        """
+        return dict(CONDITION_CHOICE).get(self.condition)
+
+    def condition_based_col(self):
+        """
+        Condition based column
+        """
+        if self.is_condition_based:
+            return f"{self.get_field_display()} {self.get_condition_display()} {self.value}"
+        else:
+            return _("No")
+
+    def deduct_actions(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/allowance_deduction/deductions/deductions_actions.html",
+            context={"instance": self},
+        )
+
+    def deduct_detail_actions(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/allowance_deduction/deductions/detail_view_actions.html",
+            context={"instance": self},
+        )
+
+    def deduction_eligibility(self):
+        """
+        Deduction eligibility column
+        """
+        return f"{self.get_if_choice_display()} {self.get_if_condition_display()} {self.if_amount}"
+
+    def has_maximum_limit_col(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/allowance_deduction/deductions/has_maximum_limit.html",
+            context={"instance": self},
+        )
+
+    def amount_col(self):
+        """
+        This method for get custom coloumn for amount .
+        """
+
+        return render_template(
+            path="cbv/allowance_deduction/deductions/amount.html",
+            context={"instance": self},
+        )
+
+    def get_avatar(self):
+        """
+        Method will return the API URL for the avatar or the path to the profile image.
+        """
+        sanitized_title = re.sub(r"[^a-zA-Z0-9\s]", "", self.title)
+        sanitized_title = sanitized_title.replace(" ", "+")
+        url = f"https://ui-avatars.com/api/?name={sanitized_title}&background=random"
+        return url
+
+    def deduction_detail_view(self):
+        """
+        detail view
+        """
+        url = reverse("deduction-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        detail view
+        """
+        # url = reverse("delete-deduction", kwargs={"deduction_id": self.pk})
+        url = reverse_lazy("generic-delete")
+
+        return url
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("update-deduction", kwargs={"deduction_id": self.pk})
+        return url
+
+    def specific_employees_col(self):
+        """
+        Specific Employees
+        """
+        employees = self.specific_employees.all()
+        employee_names_string = ", ".join(
+            [str(employee.get_full_name()) for employee in employees]
+        )
+        return employee_names_string
+
+    def excluded_employees_col(self):
+        """
+        Excluded employees
+        """
+        employees = self.exclude_employees.all()
+        employee_names_string = ", ".join(
+            [str(employee.get_full_name()) for employee in employees]
+        )
+        return employee_names_string
+
+    def tax_col(self):
+        if self.is_tax:
+            title = _("Tax")
+            count = _("Yes") if self.is_tax else _("No")
+        else:
+            title = _("Pretax")
+            count = _("Yes") if self.is_pretax else _("No")
+        count = count.capitalize()
+
+        return f"""
+        <div class="oh-timeoff-modal__stat">
+            <span class="oh-timeoff-modal__stat-title">{title}</span>
+            <span class="oh-timeoff-modal__stat-count">{count}</span>
+        </div>
+        """
+
+    def get_one_time_deduction(self):
+        """
+        One time deduction column
+        """
+        if self.one_time_date:
+            return f"On <span class='dateformat_changer'> {self.one_time_date}</span> "
+        else:
+            return _("No")
+
+    def get_specific_exclude_employees(self):
+        """
+        Get all specific and exclude employees separated by commas for detail view.
+        """
+        col = ""
+        if self.specific_employees.exists():
+            specific_employees = self.specific_employees.all()
+            specific_employee_names = ", ".join(
+                str(employee.get_full_name()) for employee in specific_employees
+            )
+            label = "Specific Employees"
+
+            col += format_html(
+                """
+                    <div class="col-span-1 md:col-span-6 mb-2 flex gap-5 items-center">
+                            <span class="font-medium text-xs text-[#565E6C] w-32">
+                                {}
+                            </span>
+                            <div class="text-xs font-semibold flex items-center gap-5">
+                                : <span>
+                                    {}
+                                </span>
+                            </div>
+                        </div>
+                """,
+                label,
+                specific_employee_names,
+            )
+
+        if self.exclude_employees.exists():
+            exclude_employees = self.exclude_employees.all()
+            exclude_employee_names = ", ".join(
+                str(employee.get_full_name()) for employee in exclude_employees
+            )
+            label = "Excluded Employees"
+            col += format_html(
+                """
+                    <div class="col-span-1 md:col-span-6 mb-2 flex gap-5 items-center">
+                            <span class="font-medium text-xs text-[#565E6C] w-32">
+                                {}
+                            </span>
+                            <div class="text-xs font-semibold flex items-center gap-5">
+                                : <span>
+                                    {}
+                                </span>
+                            </div>
+                        </div>
+                """,
+                label,
+                exclude_employee_names,
+            )
+        return col
+
     def clean(self):
         super().clean()
 
         if self.is_tax:
             self.is_pretax = False
         if not self.is_fixed:
-            if not self.based_on:
+            if not self.based_on and not self.update_compensation:
                 raise ValidationError(
                     _(
                         "If the 'Is fixed' field is disabled, the 'Based on' field is required."
@@ -1284,6 +1884,13 @@ class Deduction(SolichModel):
     def __str__(self) -> str:
         return str(self.title)
 
+    def save(self, *args, **kwargs):
+        from base.auth_backends import stamp_company_on_create
+
+        if not self.id:
+            stamp_company_on_create(self)
+        super().save(*args, **kwargs)
+
 
 class Payslip(SolichModel):
     """
@@ -1299,7 +1906,7 @@ class Payslip(SolichModel):
     group_name = models.CharField(
         max_length=50, null=True, blank=True, verbose_name=_("Batch name")
     )
-    reference = models.CharField(max_length=255, unique=False)
+    reference = models.CharField(max_length=255, unique=False, null=True, blank=True)
     employee_id = models.ForeignKey(
         Employee, on_delete=models.PROTECT, verbose_name=_("Employee")
     )
@@ -1327,6 +1934,82 @@ class Payslip(SolichModel):
     def __str__(self) -> str:
         return f"Payslip for {self.employee_id} - Period: {self.start_date} to {self.end_date}"
 
+    def get_status(self):
+        """
+        Display status
+        """
+        return dict(self.status_choices).get(self.status)
+
+    def get_download_url(self):
+        """
+        This method to get download url
+        """
+        return render_template(
+            path="cbv/payslip/payslip_download_tab.html",
+            context={"instance": self},
+        )
+
+    def gross_pay_display(self):
+        """
+        gross pay
+        """
+        gross_pay = self.gross_pay
+
+        return render_template(
+            path="cbv/payslip/pay_display.html",
+            context={"amount": gross_pay},
+        )
+
+    def deduction_display(self):
+        """
+        deduction
+        """
+        deduction = self.deduction
+
+        return render_template(
+            path="cbv/payslip/pay_display.html",
+            context={"amount": deduction},
+        )
+
+    def net_pay_display(self):
+        """
+        net pay
+        """
+        net_pay = self.net_pay
+
+        return render_template(
+            path="cbv/payslip/pay_display.html",
+            context={"amount": net_pay},
+        )
+
+    def custom_status_col(self):
+        """
+        custom status coloumn
+        """
+
+        return render_template(
+            path="cbv/payslip/payslip_status_col.html",
+            context={"instance": self},
+        )
+
+    def custom_actions_col(self):
+        """
+        custom actions coloumn
+        """
+
+        return render_template(
+            path="cbv/payslip/payslip_actions.html",
+            context={"instance": self},
+        )
+
+    def get_individual_payslip(self):
+        """
+        This method to get individual payslip
+        """
+
+        url = reverse_lazy("view-created-payslip", kwargs={"payslip_id": self.pk})
+        return url
+
     def clean(self):
         super().clean()
         today = date.today()
@@ -1349,8 +2032,9 @@ class Payslip(SolichModel):
                 employee_id=self.employee_id,
                 start_date=self.start_date,
                 end_date=self.end_date,
-            ).count()
-            > 1
+            )
+            .exclude(pk=self.pk)
+            .exists()
         ):
             raise ValidationError(_("Employee ,start and end date must be unique"))
 
@@ -1388,9 +2072,9 @@ class Payslip(SolichModel):
         if self.group_name:
             return self.group_name
         return (
-            f"Payslip {self.start_date} to {self.end_date}"
+            f"Payslip {self.start_date} to {self.end_date} for {self.employee_id}"
             if self.start_date != self.end_date
-            else f"Payslip for {self.start_date}"
+            else f"Payslip for {self.start_date} for {self.employee_id}"
         )
 
     def get_days_in_month(self):
@@ -1406,6 +2090,12 @@ class Payslip(SolichModel):
         ordering = [
             "-end_date",
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee_id", "start_date", "end_date"],
+                name="unique_payslip_per_employee_period",
+            )
+        ]
 
 
 class LoanAccount(SolichModel):
@@ -1415,33 +2105,116 @@ class LoanAccount(SolichModel):
 
     loan_type = [
         ("loan", _("Loan")),
-        ("advanced_salary", _("Advanced Salary")),
+        ("advanced_salary", _("Salary Advance")),
         ("fine", _("Penalty / Fine")),
     ]
-    type = models.CharField(default="loan", choices=loan_type, max_length=15)
-    title = models.CharField(max_length=20)
+    title = models.CharField(max_length=100)
     employee_id = models.ForeignKey(
         Employee, on_delete=models.PROTECT, verbose_name=_("Employee")
     )
+    type = models.CharField(default="loan", choices=loan_type, max_length=15)
     loan_amount = models.FloatField(default=0, verbose_name=_("Amount"))
     provided_date = models.DateField()
     allowance_id = models.ForeignKey(
         Allowance, on_delete=models.SET_NULL, editable=False, null=True
     )
-    description = models.TextField(null=True, max_length=255)
+    description = models.TextField(null=True)
     deduction_ids = models.ManyToManyField(Deduction, editable=False)
     is_fixed = models.BooleanField(default=True, editable=False)
     rate = models.FloatField(default=0, editable=False)
+    installment_amount = models.FloatField(
+        verbose_name=_("installment Amount"), blank=True, null=True
+    )
     installments = models.IntegerField(verbose_name=_("Total installments"))
     installment_start_date = models.DateField(
-        help_text="From the start date deduction will apply"
+        help_text=_("From the start date deduction will apply"),
+        verbose_name=_("Installment start date"),
     )
     apply_on = models.CharField(default="end_of_month", max_length=20, editable=False)
-    settled = models.BooleanField(default=False)
-    asset_id = models.ForeignKey(
-        Asset, on_delete=models.PROTECT, null=True, editable=False
-    )
+    settled = models.BooleanField(default=False, verbose_name=_("Settled"))
+    settled_date = models.DateTimeField(null=True)
+
+    if apps.is_installed("asset"):
+        asset_id = models.ForeignKey(
+            "asset.Asset",
+            on_delete=models.PROTECT,
+            blank=True,
+            null=True,
+            editable=False,
+        )
     objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    def __str__(self):
+        return f"{self.title} - {self.employee_id}"
+
+    def installment_paid(self):
+        installment_paid = Payslip.objects.filter(
+            installment_ids__in=self.deduction_ids.all()
+        ).count()
+        return installment_paid
+
+    def total_installments(self):
+        return self.installments
+
+    def loan_actions(self):
+        """
+        This method for get loan actions.
+        """
+
+        return render_template(
+            path="cbv/loan/loan_actions.html",
+            context={"instance": self},
+        )
+
+    def get_delete_url(self):
+        """
+        This method to get delete url
+        """
+        base_url = reverse_lazy("delete-loan")
+        message = "Do you want to delete this record?"
+        loan_id = self.pk
+        url = f"{base_url}?ids={loan_id}"
+        return f"'{url}'" + "," + f"'{message}'"
+
+    # def delete_url(self):
+    #     """
+    #     Edit url
+    #     """
+
+    #     return reverse("delete-loan", kwargs={"pk": self.pk})
+
+    def edit_url(self):
+        """
+        Edit url
+        """
+        return reverse("loan-edit-form", kwargs={"pk": self.pk})
+
+    def progress_bar_col(self):
+        """
+        This method for get progress bar col.
+        """
+
+        return render_template(
+            path="cbv/loan/loan_card.html",
+            context={
+                "instance": self,
+                "total_installments": self.total_installments,
+                "installment_paid": self.installment_paid,
+            },
+        )
+
+    def loan_detail_view(self):
+        """
+        for detail view of page
+        """
+        url = reverse("loan-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def detail_subtitle(self):
+        """
+        Return subtitle containing both department and job position information.
+        """
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
 
     def get_installments(self):
         """
@@ -1459,19 +2232,10 @@ class LoanAccount(SolichModel):
         installment_schedule = {}
 
         installment_date = installment_start_date
-        installment_date_copy = installment_start_date
         installment_schedule = {}
         for _ in range(total_installments):
             installment_schedule[str(installment_date)] = installment_amount
-            month = installment_date.month + 1
-            year = installment_date.year
-            if month > 12:
-                month = 1
-                year = year + 1
-            day = installment_date_copy.day
-            total_days_in_month = calendar.monthrange(year, month)[1]
-            day = min(day, total_days_in_month)
-            installment_date = date(day=day, month=month, year=year)
+            installment_date = get_next_month_same_date(installment_date)
 
         return installment_schedule
 
@@ -1498,57 +2262,18 @@ class LoanAccount(SolichModel):
         ).count()
         if not installment_paid:
             return 0
-        return (installment_paid / total_installments) * 100
+        ratio = (installment_paid / total_installments) * 100
 
+        return ratio
 
-@receiver(post_save, sender=LoanAccount)
-def create_installments(sender, instance, created, **kwargs):
-    """
-    Post save metod for loan account
-    """
-    installments = []
-    if created and instance.asset_id is None and instance.type != "fine":
-        loan = Allowance()
-        loan.amount = instance.loan_amount
-        loan.title = instance.title
-        loan.include_active_employees = False
-        loan.amount = instance.loan_amount
-        loan.only_show_under_employee = True
-        loan.is_fixed = True
-        loan.one_time_date = instance.provided_date
-        loan.is_loan = True
-        loan.save()
-        loan.include_active_employees = False
-        loan.specific_employees.add(instance.employee_id)
-        loan.save()
-        instance.allowance_id = loan
-        # Here create the instance...
-        super(LoanAccount, instance).save()
-    else:
-        deductions = instance.deduction_ids.values_list("id", flat=True)
-        # Re create deduction only when existing installment not exists in payslip
-        if not Payslip.objects.filter(installment_ids__in=deductions).exists():
-            Deduction.objects.filter(id__in=deductions).delete()
+    def save(self, *args, **kwargs):
 
-            # Installment deductions
-            for (
-                installment_date,
-                installment_amount,
-            ) in instance.get_installments().items():
-                installment = Deduction()
-                installment.title = instance.title
-                installment.include_active_employees = False
-                installment.amount = installment_amount
-                installment.is_fixed = True
-                installment.one_time_date = installment_date
-                installment.only_show_under_employee = True
-                installment.is_installment = True
-                installment.save()
-                installment.include_active_employees = False
-                installment.specific_employees.add(instance.employee_id)
-                installment.save()
-                installments.append(installment)
-            instance.deduction_ids.set(installments)
+        if self.settled:
+            self.settled_date = timezone.now()
+        else:
+            self.settled_date = None
+
+        super().save(*args, **kwargs)
 
 
 class ReimbursementMultipleAttachment(models.Model):
@@ -1556,7 +2281,7 @@ class ReimbursementMultipleAttachment(models.Model):
     ReimbursementMultipleAttachement Model
     """
 
-    attachment = models.FileField(upload_to="payroll/reimbursements")
+    attachment = models.FileField(upload_to=upload_path)
     objects = models.Manager()
 
 
@@ -1566,14 +2291,17 @@ class Reimbursement(SolichModel):
     """
 
     reimbursement_types = [
-        ("reimbursement", "Reimbursement"),
-        ("leave_encashment", "Leave Encashment"),
-        ("bonus_encashment", "Bonus Point Encashment"),
+        ("reimbursement", _("Reimbursement")),
+        ("bonus_encashment", _("Bonus Point Encashment")),
     ]
+
+    if apps.is_installed("leave"):
+        reimbursement_types.append(("leave_encashment", _("Leave Encashment")))
+
     status_types = [
-        ("requested", "Requested"),
-        ("approved", "Approved"),
-        ("rejected", "Rejected"),
+        ("requested", _("Requested")),
+        ("approved", _("Approved")),
+        ("rejected", _("Rejected")),
     ]
     title = models.CharField(max_length=50)
     type = models.CharField(
@@ -1583,33 +2311,38 @@ class Reimbursement(SolichModel):
         Employee, on_delete=models.PROTECT, verbose_name="Employee"
     )
     allowance_on = models.DateField()
-    attachment = models.FileField(upload_to="payroll/reimbursements", null=True)
+    attachment = models.FileField(upload_to=upload_path, null=True)
     other_attachments = models.ManyToManyField(
         ReimbursementMultipleAttachment, blank=True, editable=False
     )
-    leave_type_id = models.ForeignKey(
-        LeaveType,
-        on_delete=models.PROTECT,
-        blank=True,
-        null=True,
-        verbose_name="Leave type",
-    )
+    if apps.is_installed("leave"):
+        leave_type_id = models.ForeignKey(
+            "leave.LeaveType",
+            on_delete=models.PROTECT,
+            blank=True,
+            null=True,
+            verbose_name=_("Leave type"),
+        )
     ad_to_encash = models.FloatField(
-        default=0, help_text="Available Days to encash", verbose_name="Available days"
+        default=0,
+        help_text=_("Available Days to encash"),
+        verbose_name=_("Available days"),
     )
     cfd_to_encash = models.FloatField(
         default=0,
-        help_text="Carry Forward Days to encash",
-        verbose_name="Carry forward days",
+        help_text=_("Carry Forward Days to encash"),
+        verbose_name=_("Carry forward days"),
     )
     bonus_to_encash = models.IntegerField(
         default=0,
-        help_text="Bonus points to encash",
-        verbose_name="Bonus points",
+        help_text=_("Bonus points to encash"),
+        verbose_name=_("Bonus points"),
     )
     amount = models.FloatField(default=0)
     status = models.CharField(
-        max_length=10, choices=status_types, default="requested", editable=False
+        max_length=10,
+        choices=status_types,
+        default="requested",
     )
     approved_by = models.ForeignKey(
         Employee,
@@ -1618,7 +2351,7 @@ class Reimbursement(SolichModel):
         related_name="approved_by",
         editable=False,
     )
-    description = models.TextField(null=True, max_length=255)
+    description = models.TextField(null=True)
     allowance_id = models.ForeignKey(
         Allowance, on_delete=models.SET_NULL, null=True, editable=False
     )
@@ -1634,9 +2367,14 @@ class Reimbursement(SolichModel):
             if EncashmentGeneralSettings.objects.first()
             else 1
         )
+        amount_for_bonus = (
+            EncashmentGeneralSettings.objects.first().bonus_amount
+            if EncashmentGeneralSettings.objects.first()
+            else 1
+        )
 
         # Setting the created use if the used dont have the permission
-        has_perm = request.user.has_perm("payroll.add_reimbursement")
+        has_perm = request.user.has_perm("payroll.change_reimbursement")
         if not has_perm:
             self.employee_id = request.user.employee_get
         if self.type == "reimbursement" and self.attachment is None:
@@ -1653,6 +2391,9 @@ class Reimbursement(SolichModel):
             assigned_leave = self.leave_type_id.employee_available_leave.filter(
                 employee_id=self.employee_id
             ).first()
+        if self.type == "bonus_encashment":
+            if self.status == "requested":
+                self.amount = (self.bonus_to_encash) * amount_for_bonus
         if self.status != "approved" or self.allowance_id is None:
             super().save(*args, **kwargs)
             if self.status == "approved" and self.allowance_id is None:
@@ -1750,24 +2491,103 @@ class Reimbursement(SolichModel):
             if self.allowance_id:
                 self.allowance_id.delete()
                 super().delete(*args, **kwargs)
-                message = messages.success(request, "Reimbursement deleted")
+                message = messages.success(request, _("Reimbursement deleted"))
 
         return message
 
     def __str__(self):
         return f"{self.title}"
 
+    def get_status_display(self):
+        """
+        Display status types
+        """
+        return dict(self.status_types).get(self.status)
 
-# changing status canceled to reject for existing reimbursement
-try:
-    if Reimbursement.objects.filter(status="canceled").exists():
-        Reimbursement.objects.filter(status="canceled").update(status="rejected")
-except:
-    pass
+    def comment_col(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/comment.html",
+            context={"instance": self},
+        )
+
+    def options_col(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/options.html",
+            context={"instance": self},
+        )
+
+    def actions_col(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/actions.html",
+            context={"instance": self},
+        )
+
+    def amount_col(self):
+        """
+        This method for get custom column for amount .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/amount.html",
+            context={"instance": self},
+        )
+
+    def attachments_col(self):
+        """
+        This method for get custom column for attachment .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/attachments.html",
+            context={"instance": self},
+        )
+
+    def detail_action_col(self):
+        """
+        This method for get custom column for actions in detail .
+        """
+
+        return render_template(
+            path="cbv/reimbursements/detail_actions.html",
+            context={"instance": self},
+        )
+
+    def reimbursements_detail_view(self):
+        """
+        for detail view of reimbursements
+        """
+        url = reverse("detail-view-reimbursement", kwargs={"pk": self.pk})
+        return url
+
+    def leave_encash_detail_view(self):
+        """
+        for detail view of leave encashments.
+        """
+        url = reverse("detail-view-leave-encashment", kwargs={"pk": self.pk})
+        return url
+
+    def bonus_encash_detail_view(self):
+        """
+        for detail view of bonus encashments.
+        """
+        url = reverse("detail-view-bonus-encashment", kwargs={"pk": self.pk})
+        return url
 
 
 class ReimbursementFile(models.Model):
-    file = models.FileField(upload_to="payroll/request_files")
+    file = models.FileField(upload_to=upload_path)
     objects = models.Manager()
 
 
@@ -1796,7 +2616,7 @@ class PayrollGeneralSetting(models.Model):
     """
 
     notice_period = models.IntegerField(
-        help_text="Notice period in days",
+        help_text=_("Notice period in days"),
         validators=[min_zero],
         default=30,
     )
@@ -1858,13 +2678,54 @@ class PayslipAutoGenerate(models.Model):
         max_length=30,
         choices=DAYS,
         default=("1"),
-        verbose_name="Payslip Generate Day",
-        help_text="On this day of every month,Payslip will auto generate",
+        verbose_name=_("Payslip Generate Day"),
+        help_text=_("On this day of every month,Payslip will auto generate"),
     )
-    auto_generate = models.BooleanField(default=False)
+    auto_generate = models.BooleanField(default=False, verbose_name=_("Auto Generate"))
     company_id = models.OneToOneField(
-        Company, on_delete=models.CASCADE, null=True, blank=True
+        Company,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        verbose_name=_("Company"),
     )
+    objects = SolichCompanyManager(related_company_field="company_id")
+
+    def get_generate_day_display(self):
+        """
+        Display work type
+        """
+        return dict(DAYS).get(self.generate_day)
+
+    def get_company(self):
+        if self.company_id:
+            return self.company_id
+        return "All company"
+
+    def is_active_col(self):
+        """
+        is active column
+        """
+        return render_template(
+            path="cbv/settings/is_active_col.html", context={"instance": self}
+        )
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("pay-slip-automation-update", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        This method to get delete url
+        """
+        url = reverse_lazy("delete-auto-payslip", kwargs={"auto_id": self.pk})
+        return url
+
+    def get_instance_id(self):
+        return self.id
 
     def clean(self):
         # Unique condition checking for all company
@@ -1893,8 +2754,8 @@ class PayslipAutoGenerate(models.Model):
 
         if self.auto_generate:
             auto_payslip_generate()
+
         super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"{self.generate_day} | {self.company_id} "
-

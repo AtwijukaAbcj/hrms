@@ -5,18 +5,25 @@ This module is used to register models for employee app
 
 """
 
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 
+from django.apps import apps
 from django.conf import settings
-from django.contrib.auth.models import Permission, User
+from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
+from django.core.validators import RegexValidator
 from django.db import models
+from django.db.models.query import QuerySet
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from django.utils.translation import gettext as _
-from django.utils.translation import gettext_lazy as trans
+from django.templatetags.static import static
+from django.urls import reverse, reverse_lazy
+from django.utils.translation import gettext_lazy as _
+from PIL import Image
 
+from accessibility.accessibility import ACCESSBILITY_FEATURE
 from base.solich_company_manager import SolichCompanyManager
 from base.models import (
     Company,
@@ -30,9 +37,13 @@ from base.models import (
 )
 from employee.methods.duration_methods import format_time, strtime_seconds
 from solich import solich_middlewares
-from solich.models import SolichModel
+from solich.solich_middlewares import _thread_locals
+from solich.methods import get_solich_model_class
+from solich.models import SolichModel, has_xss, upload_path
 from solich_audit.methods import get_diff
 from solich_audit.models import SolichAuditInfo, SolichAuditLog
+from solich_auth.models import SolichUser
+from solich_views.cbv_methods import render_template
 
 # create your model
 
@@ -44,24 +55,30 @@ def reporting_manager_validator(value):
     return value
 
 
+phone_validator = RegexValidator(
+    regex=r"^\+?[\d\s\-\(\)]{7,20}$",
+    message=_("Enter a valid phone number (7-20 characters, optional +)."),
+)
+
+
 class Employee(models.Model):
     """
     Employee model
     """
 
     choice_gender = [
-        ("male", trans("Male")),
-        ("female", trans("Female")),
-        ("other", trans("Other")),
+        ("male", _("Male")),
+        ("female", _("Female")),
+        ("other", _("Other")),
     ]
     choice_marital = (
-        ("single", trans("Single")),
-        ("married", trans("Married")),
-        ("divorced", trans("Divorced")),
+        ("single", _("Single")),
+        ("married", _("Married")),
+        ("divorced", _("Divorced")),
     )
     badge_id = models.CharField(max_length=50, null=True, blank=True)
     employee_user_id = models.OneToOneField(
-        User,
+        SolichUser,
         on_delete=models.CASCADE,
         blank=True,
         null=True,
@@ -75,35 +92,79 @@ class Employee(models.Model):
         max_length=200, null=True, blank=True, verbose_name=_("Last Name")
     )
     employee_profile = models.ImageField(
-        upload_to="employee/profile", null=True, blank=True
+        upload_to=upload_path, null=True, blank=True, verbose_name=_("Profile Image")
     )
     email = models.EmailField(max_length=254, unique=True)
-    phone = models.CharField(
-        max_length=15,
-    )
+    phone = models.CharField(max_length=25, validators=[phone_validator])
     address = models.TextField(max_length=200, blank=True, null=True)
-    country = models.CharField(max_length=30, blank=True, null=True)
-    state = models.CharField(max_length=30, null=True, blank=True)
+    country = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, null=True, blank=True)
     city = models.CharField(max_length=30, null=True, blank=True)
-    zip = models.CharField(max_length=20, null=True, blank=True)
-    dob = models.DateField(null=True, blank=True)
+    zip = models.CharField(max_length=20, null=True, blank=True, verbose_name=_("Zip"))
+    dob = models.DateField(null=True, blank=True, verbose_name=_("Date of Birth"))
     gender = models.CharField(
         max_length=10, null=True, choices=choice_gender, default="male"
     )
     qualification = models.CharField(max_length=50, blank=True, null=True)
     experience = models.IntegerField(null=True, blank=True)
     marital_status = models.CharField(
-        max_length=50, blank=True, null=True, choices=choice_marital, default="single"
+        max_length=50,
+        blank=True,
+        null=True,
+        choices=choice_marital,
+        default="single",
+        verbose_name=_("Marital Status"),
     )
     children = models.IntegerField(blank=True, null=True)
-    emergency_contact = models.CharField(max_length=15, null=True, blank=True)
-    emergency_contact_name = models.CharField(max_length=20, null=True, blank=True)
-    emergency_contact_relation = models.CharField(max_length=20, null=True, blank=True)
+    emergency_contact = models.CharField(
+        max_length=15, null=True, blank=True, verbose_name=_("Emergency Contact")
+    )
+    emergency_contact_name = models.CharField(
+        max_length=20, null=True, blank=True, verbose_name=_("Emergency Contact Name")
+    )
+    emergency_contact_relation = models.CharField(
+        max_length=20,
+        null=True,
+        blank=True,
+        verbose_name=_("Emergency Contact Relation"),
+    )
     is_active = models.BooleanField(default=True)
     additional_info = models.JSONField(null=True, blank=True)
+    is_from_onboarding = models.BooleanField(
+        default=False, null=True, blank=True, editable=False
+    )
+    is_directly_converted = models.BooleanField(
+        default=False, null=True, blank=True, editable=False
+    )
     objects = SolichCompanyManager(
         related_company_field="employee_work_info__company_id"
     )
+
+    def get_contact(self):
+        """
+        to get contact no of candidates
+        """
+        return self.phone
+
+    def clean_fields(self, exclude=None):
+        errors = {}
+
+        # Get the list of fields to exclude from validation
+        total_exclude = set(exclude or []).union(getattr(self, "xss_exempt_fields", []))
+
+        for field in self._meta.get_fields():
+            if (
+                isinstance(field, (models.CharField, models.TextField))
+                and field.name not in total_exclude
+            ):
+                value = getattr(self, field.name, None)
+                if value and has_xss(value):
+                    errors[field.name] = ValidationError(
+                        _("Potential XSS content detected.")
+                    )
+
+        if errors:
+            raise ValidationError(errors)
 
     def get_image(self):
         """
@@ -113,6 +174,11 @@ class Employee(models.Model):
         if self.employee_profile:
             url = self.employee_profile.url
         return url
+
+    def get_employee_dob(self) -> any:
+        if self.dob:
+            return self.dob.strftime("%d %b")
+        return None
 
     def get_full_name(self):
         """
@@ -130,6 +196,20 @@ class Employee(models.Model):
         """
         return getattr(getattr(self, "employee_work_info", None), "company_id", None)
 
+    def get_date_format(self):
+        company = (
+            self.get_company()
+            if self.get_company()
+            else Company.objects.filter(hq=True).first()
+        )
+
+        if company:
+            date_format = company.date_format
+
+            return date_format if date_format else "MMM. D, YYYY"
+
+        return "MMM. D, YYYY"
+
     def get_job_position(self):
         """
         This method is used to return the job position of the employee
@@ -137,6 +217,24 @@ class Employee(models.Model):
         return getattr(
             getattr(self, "employee_work_info", None), "job_position_id", None
         )
+
+    def diff_cell(self):
+        request = getattr(_thread_locals, "request", None)
+        if (
+            request
+            and hasattr(request, "user")
+            and hasattr(request.user, "employee_get")
+        ):
+            if (
+                hasattr(self, "employee_work_info")
+                and self.employee_work_info.reporting_manager_id
+                == request.user.employee_get
+            ):
+                return 'style="color: inherit; text-decoration: none; background-color: hsl(38.08deg 100% 50% / 8%);"'
+            else:
+                return ""
+        else:
+            return ""
 
     def get_department(self):
         """
@@ -150,11 +248,30 @@ class Employee(models.Model):
         """
         return getattr(getattr(self, "employee_work_info", None), "shift_id", None)
 
+    def get_shift_schedule(self):
+        """
+        This method is used to check if the employee has a shift assigned
+        """
+        from base.methods import is_holiday
+
+        today = datetime.today().date()
+        if is_holiday(today, self):
+            return None
+        shift = self.get_shift()
+        day = datetime.today().strftime("%A").lower()
+        if not shift:
+            return None
+        schedule = shift.employeeshiftschedule_set.filter(day__day=day).first()
+        return schedule if schedule else None
+
     def get_mail(self):
         """
-        This method is used to return the shift of the employee
+        This method is used to return the employee's email, checking work email first
+        then falling back to personal email.
         """
-        return getattr(getattr(self, "employee_work_info", None), "email", self.email)
+        work_info = getattr(self, "employee_work_info", None)
+        work_email = getattr(work_info, "email", None)
+        return work_email if work_email is not None else self.email
 
     def get_email(self):
         return self.get_mail()
@@ -182,60 +299,107 @@ class Employee(models.Model):
         )
 
     def get_avatar(self):
-        """
-        Method will retun the api to the avatar or path to the profile image
-        """
-        url = (
-            f"https://ui-avatars.com/api/?name={self.get_full_name()}&background=random"
-        )
-        if self.employee_profile:
-            full_filename = settings.MEDIA_ROOT + self.employee_profile.name
+        if self.employee_profile and default_storage.exists(self.employee_profile.name):
+            return self.employee_profile.url
+        return static("images/ui/default_avatar.jpg")
 
-            if default_storage.exists(full_filename):
-                url = self.employee_profile.url
-        return url
+    def get_active_status(self):
+        """
+        This method is used to return the active/inactive status of the employee
+        """
+        return _("Active") if self.is_active else _("Inactive")
 
     def get_leave_status(self):
         """
         This method is used to get the leave status of the employee
         """
         today = date.today()
-        leaves_requests = self.leaverequest_set.filter(
-            start_date__lte=today, end_date__gte=today
+        leaves_requests = (
+            self.leaverequest_set.filter(start_date__lte=today, end_date__gte=today)
+            if apps.is_installed("leave")
+            else QuerySet().none()
         )
-        status = "Expected working"
+        status = _("Expected working")
         if leaves_requests.exists():
             if leaves_requests.filter(status="approved").exists():
-                status = "On Leave"
+                status = _("On Leave")
             elif leaves_requests.filter(status="requested"):
-                status = "Waiting Approval"
+                status = _("Waiting Approval")
             else:
-                status = "Canceled / Rejected"
-        elif self.employee_attendances.filter(
-            attendance_date=today,
-        ).exists():
-            status = "On a break"
-        return status
+                status = _("Canceled / Rejected")
+        elif (
+            apps.is_installed("attendance")
+            and self.employee_attendances.filter(
+                attendance_date=today,
+            ).exists()
+        ):
+            status = _("On a break")
+        # return status
+        return f'<span class="oh-recruitment_tag" style="font-size: 0.5rem; color: red;">{status}</span>'
+
+    def send_mail_button(self):
+        """
+        View to return the HTML for the send mail button.
+        """
+
+        return render_template(
+            path="cbv/dashboard/offline_action.html",
+            context={"instance": self},
+        )
 
     def get_forecasted_at_work(self):
         """
         This method is used to the employees current day shift status
         """
-        today = datetime.today()
-        attendance = self.employee_attendances.filter(attendance_date=today).first()
-        minimum_hour_seconds = strtime_seconds(getattr(attendance, "minimum_hour", "0"))
-        at_work = 0
-        forecasted_pending_hours = 0
-        if attendance:
-            at_work = attendance.get_at_work_from_activities()
-        forecasted_pending_hours = max(0, (minimum_hour_seconds - at_work))
+        if apps.is_installed("attendance"):
+            today = datetime.today()
+            yesterday = today - timedelta(days=1)
+            today_attendance = None
+            yesterday_attendance = None
+            attendances = list(
+                self.employee_attendances.filter(
+                    attendance_date__in=[yesterday, today]
+                ).order_by("attendance_date")
+            )
 
-        return {
-            "forecasted_at_work": format_time(at_work),
-            "forecasted_pending_hours": format_time(forecasted_pending_hours),
-            "forecasted_at_work_seconds": at_work,
-            "forecasted_pending_hours_seconds": forecasted_pending_hours,
-        }
+            if len(attendances) == 1:
+                yesterday_attendance, today_attendance = attendances[0], None
+            elif len(attendances) == 2:
+                yesterday_attendance, today_attendance = attendances
+            else:
+                yesterday_attendance, today_attendance = None, None
+
+            attendance = today_attendance
+            if not today_attendance:
+                attendance = yesterday_attendance
+            minimum_hour_seconds = strtime_seconds(
+                getattr(attendance, "minimum_hour", "0")
+            )
+            at_work = 0
+            forecasted_pending_hours = 0
+            if attendance:
+                at_work = attendance.get_at_work_from_activities()
+            forecasted_pending_hours = max(0, (minimum_hour_seconds - at_work))
+
+            return {
+                "forecasted_at_work": format_time(at_work),
+                "forecasted_pending_hours": format_time(forecasted_pending_hours),
+                "forecasted_at_work_seconds": at_work,
+                "forecasted_pending_hours_seconds": forecasted_pending_hours,
+                "has_attendance": attendance is not None,
+            }
+        else:
+            return {}
+
+    def get_custom_forecasted_info_col(self):
+        forecasted_info = self.get_forecasted_at_work()
+        forecasted_at_work = forecasted_info.get("forecasted_at_work")
+        forecasted_pending_hours = forecasted_info.get("forecasted_pending_hours")
+
+        return f"""
+                <span class="oh-recuritment_tag" style="font-size: .5rem;">At work {forecasted_at_work}</span>
+                <span class="oh-recuritment_tag" style="font-size: .5rem;">Pending {forecasted_pending_hours}</span>
+            """
 
     def get_today_attendance(self):
         """
@@ -261,25 +425,33 @@ class Employee(models.Model):
         they are considered eligible for archiving. If they are associated,
         a dictionary is returned with a list of related models of that employee.
         """
-        from onboarding.models import OnboardingStage, OnboardingTask
-        from recruitment.models import Recruitment, Stage
-
+        if apps.is_installed("onboarding"):
+            OnboardingStage = get_solich_model_class("onboarding", "onboardingstage")
+            OnboardingTask = get_solich_model_class("onboarding", "onboardingtask")
+            onboarding_stage_query = OnboardingStage.objects.filter(employee_id=self.pk)
+            onboarding_task_query = OnboardingTask.objects.filter(employee_id=self.pk)
+        else:
+            onboarding_stage_query = None
+            onboarding_task_query = None
+        if apps.is_installed("recruitment"):
+            Recruitment = get_solich_model_class("recruitment", "recruitment")
+            Stage = get_solich_model_class("recruitment", "stage")
+            recruitment_stage_query = Stage.objects.filter(stage_managers=self.pk)
+            recruitment_manager_query = Recruitment.objects.filter(
+                recruitment_managers=self.pk
+            )
+        else:
+            recruitment_stage_query = None
+            recruitment_manager_query = None
         reporting_manager_query = EmployeeWorkInformation.objects.filter(
             reporting_manager_id=self.pk
         )
-        recruitment_stage_query = Stage.objects.filter(stage_managers=self.pk)
-        onboarding_stage_query = OnboardingStage.objects.filter(employee_id=self.pk)
-        onboarding_task_query = OnboardingTask.objects.filter(employee_id=self.pk)
-        recruitment_manager_query = Recruitment.objects.filter(
-            recruitment_managers=self.pk
-        )
-
         if not (
             reporting_manager_query.exists()
-            or recruitment_stage_query.exists()
-            or onboarding_stage_query.exists()
-            or onboarding_task_query.exists()
-            or recruitment_manager_query.exists()
+            or (recruitment_stage_query and recruitment_stage_query.exists())
+            or (onboarding_stage_query and onboarding_stage_query.exists())
+            or (onboarding_task_query and onboarding_task_query.exists())
+            or (recruitment_manager_query and recruitment_manager_query.exists())
         ):
             return False
         else:
@@ -292,28 +464,28 @@ class Employee(models.Model):
                         "field_name": "reporting_manager_id",
                     }
                 )
-            if recruitment_manager_query.exists():
+            if recruitment_manager_query and recruitment_manager_query.exists():
                 related_models.append(
                     {
                         "verbose_name": _("Recruitment manager"),
                         "field_name": "recruitment_managers",
                     }
                 )
-            if recruitment_stage_query.exists():
+            if recruitment_stage_query and recruitment_stage_query.exists():
                 related_models.append(
                     {
                         "verbose_name": _("Recruitment stage manager"),
                         "field_name": "recruitment_stage_managers",
                     }
                 )
-            if onboarding_stage_query.exists():
+            if onboarding_stage_query and onboarding_stage_query.exists():
                 related_models.append(
                     {
                         "verbose_name": _("Onboarding stage manager"),
                         "field_name": "onboarding_stage_manager",
                     }
                 )
-            if onboarding_task_query.exists():
+            if onboarding_task_query and onboarding_task_query.exists():
                 related_models.append(
                     {
                         "verbose_name": _("Onboarding task manager"),
@@ -345,24 +517,111 @@ class Employee(models.Model):
         badge_id = (f"({self.badge_id})") if self.badge_id is not None else ""
         return f"{self.employee_first_name} {last_name} {badge_id}"
 
+    def employee_name_with_badge_id(self):
+
+        last_name = (
+            self.employee_last_name if self.employee_last_name is not None else ""
+        )
+        badge_id = (f"({self.badge_id})") if self.badge_id is not None else ""
+        return f"{self.employee_first_name} {last_name} {badge_id}"
+
+    def get_history_col(self):
+        """
+        Renders a clickable icon that opens this employee's activity-history
+        feed -- the same feed shown on the profile page's History tab -- in
+        the shared #historySidebar, matching the History column every
+        SolichModel-based list already gets automatically (see
+        SolichListView's history_tracking handling). Employee doesn't
+        subclass SolichModel, so it's added explicitly here instead.
+        """
+        return render_template(
+            path="cbv/employees/history_col.html",
+            context={
+                "instance": self,
+                "history_url": reverse_lazy(
+                    "employee-history-sidebar", kwargs={"pk": self.pk}
+                ),
+            },
+        )
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("employee-view-update", kwargs={"obj_id": self.pk})
+        return url
+
+    def get_archive_url(self):
+        """
+        This method to get archive  url
+        """
+        url = reverse_lazy("employee-archive", kwargs={"obj_id": self.pk})
+        return url
+
+    def get_individual_url(self):
+        """
+        This method to get individual  url
+        """
+        url = reverse_lazy("employee-view-individual", kwargs={"obj_id": self.pk})
+        return url
+
+    def get_profile_url(self):
+        """
+        This method to get individual  url
+        """
+        url = reverse_lazy("profile-new", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        This method to get delete  url
+        """
+        url = reverse_lazy("generic-delete")
+        return url
+
+    def employee_actions(self):
+        """
+        This method for get custom column for actions.
+        """
+
+        return render_template(
+            path="cbv/employees_view/employee_actions.html",
+            context={"instance": self},
+        )
+
+    def archive_status(self):
+        """
+        archive status
+        """
+        if self.is_active:
+            return _("Archive")
+        else:
+            return _("Un-Archive")
+
     def check_online(self):
         """
-        This method is used to check the user in online users or not
+        This method is used to check if the user is in the list of online users.
         """
-        from attendance.models import Attendance
+        if apps.is_installed("attendance"):
+            Attendance = get_solich_model_class("attendance", "attendance")
+            request = getattr(solich_middlewares._thread_locals, "request", None)
 
-        request = getattr(solich_middlewares._thread_locals, "request", None)
-        if not getattr(request, "working_employees", None):
-            today = datetime.now().date()
-            yesterday = today - timedelta(days=1)
-            working_employees = Attendance.objects.filter(
-                attendance_date__gte=yesterday,
-                attendance_date__lte=today,
-                attendance_clock_out_date__isnull=True,
-            ).values_list("employee_id", flat=True)
-            setattr(request, "working_employees", working_employees)
-        working_employees = request.working_employees
-        return self.pk in working_employees
+            if request is not None:
+                if (
+                    not hasattr(request, "working_employees")
+                    or request.working_employees is None
+                ):
+                    today = datetime.now().date()
+                    yesterday = today - timedelta(days=1)
+                    working_employees = Attendance.objects.filter(
+                        attendance_date__gte=yesterday,
+                        attendance_date__lte=today,
+                        attendance_clock_out_date__isnull=True,
+                    ).values_list("employee_id", flat=True)
+                    setattr(request, "working_employees", working_employees)
+                working_employees = request.working_employees
+                return self.pk in working_employees
+        return False
 
     class Meta:
         """
@@ -408,28 +667,103 @@ class Employee(models.Model):
             .first()
         )
 
+    def get_subordinate_employees(self):
+        """
+        Function to get all Employee objects of subordinates reporting to a given manager.
+        :param manager: Employee object who is the reporting manager.
+        :return: QuerySet of Employee objects.
+        """
+        subordinates = Employee.objects.filter(
+            employee_work_info__reporting_manager_id=self
+        )
+        return subordinates
+
+    def _employee_profile_path_matches_db(self, file) -> bool:
+        """
+        True if the in-memory file field still points at the same path as in the DB.
+        Used to skip strict validation when the file is missing from storage but the
+        row was not given a new upload (e.g. archive, other saves that touch is_active).
+        """
+        if not self.pk or not file:
+            return False
+        current = (getattr(file, "name", None) or "").strip()
+        if not current:
+            return False
+        try:
+            stored = (
+                Employee.objects.filter(pk=self.pk)
+                .values_list("employee_profile", flat=True)
+                .first()
+            )
+        except Exception:
+            return False
+        stored = (stored or "").strip()
+        return bool(stored) and stored == current
+
+    def clean(self):
+        super().clean()
+
+        file = self.employee_profile
+        if not file:
+            return
+
+        # Committed = already saved to storage; unreadable path → don't block saves.
+        committed = getattr(file, "committed", False)
+        same_as_db = self._employee_profile_path_matches_db(file)
+
+        try:
+            file.seek(0)
+            content = file.read()
+        except Exception:
+            if committed or same_as_db:
+                return
+            raise ValidationError({"employee_profile": "Unable to read uploaded file."})
+
+        is_svg = False
+        try:
+            text = content.decode("utf-8", errors="strict")
+            root = ET.fromstring(text)
+            if root.tag.endswith("svg"):
+                is_svg = True
+        except Exception:
+            pass
+
+        if not is_svg:
+            try:
+                file.seek(0)
+                Image.open(file).verify()
+            except Exception:
+                if committed or same_as_db:
+                    return
+                raise ValidationError(
+                    {"employee_profile": "Invalid image or SVG file."}
+                )
+
     def save(self, *args, **kwargs):
-        # your custom code here
-        # ...
-        # call the parent class's save method to save the object
-        prev_employee = Employee.objects.filter(id=self.id).first()
+        self.full_clean()
         super().save(*args, **kwargs)
+
         request = getattr(solich_middlewares._thread_locals, "request", None)
         if request and not self.is_active and self.get_archive_condition() is not False:
             self.is_active = True
             super().save(*args, **kwargs)
         employee = self
-        if prev_employee and prev_employee.email != employee.email:
-            employee.employee_user_id.username = employee.email
-            employee.employee_user_id.save()
 
         if employee.employee_user_id is None:
             # Create user if no corresponding user exists
             username = self.email
-            password = self.phone
-            user = User.objects.create_user(
-                username=username, email=username, password=password
+            password = str(self.phone)
+
+            user = SolichUser.objects.create_user(
+                username=username,
+                email=username,
+                password=password,
+                is_new_employee=True,
             )
+            if not user:
+                user = SolichUser.objects.create_user(
+                    username=username, email=username, password=password
+                )
             self.employee_user_id = user
             # default permissions
             change_ownprofile = Permission.objects.get(codename="change_ownprofile")
@@ -455,6 +789,32 @@ class EmployeeTag(SolichModel):
     def __str__(self) -> str:
         return f"{self.title}"
 
+    def color_span(self):
+        """
+        to return color into correct format
+        """
+        return (
+            '<span style="height: 25px; width: 25px; '
+            'background-color: {}; border-radius: 50%; display: inline-block;"></span>'
+        ).format(self.color)
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("employee-tag-update-form", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        This method to get delete url
+        """
+        url = reverse_lazy("employee-tag-delete", kwargs={"obj_id": self.pk})
+        return url
+
+    def get_instance_id(self):
+        return self.id
+
 
 class EmployeeWorkInformation(models.Model):
     """
@@ -469,13 +829,6 @@ class EmployeeWorkInformation(models.Model):
         related_name="employee_work_info",
         verbose_name=_("Employee"),
     )
-    job_position_id = models.ForeignKey(
-        JobPosition,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        verbose_name=_("Job Position"),
-    )
     department_id = models.ForeignKey(
         Department,
         on_delete=models.PROTECT,
@@ -483,19 +836,12 @@ class EmployeeWorkInformation(models.Model):
         blank=True,
         verbose_name=_("Department"),
     )
-    work_type_id = models.ForeignKey(
-        WorkType,
+    job_position_id = models.ForeignKey(
+        JobPosition,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
-        verbose_name=_("Work Type"),
-    )
-    employee_type_id = models.ForeignKey(
-        EmployeeType,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        verbose_name=_("Employee Type"),
+        verbose_name=_("Job Position"),
     )
     job_role_id = models.ForeignKey(
         JobRole,
@@ -506,32 +852,11 @@ class EmployeeWorkInformation(models.Model):
     )
     reporting_manager_id = models.ForeignKey(
         Employee,
-        on_delete=models.DO_NOTHING,
+        on_delete=models.PROTECT,
         blank=True,
         null=True,
         related_name="reporting_manager",
         verbose_name=_("Reporting Manager"),
-    )
-    company_id = models.ForeignKey(
-        Company,
-        on_delete=models.PROTECT,
-        blank=True,
-        null=True,
-        verbose_name=_("Company"),
-    )
-    tags = models.ManyToManyField(
-        EmployeeTag, blank=True, verbose_name=_("Employee tag")
-    )
-    location = models.CharField(
-        max_length=50, null=True, blank=True, verbose_name=_("Work Location")
-    )
-    email = models.EmailField(
-        max_length=254, blank=True, null=True, verbose_name=_("Email")
-    )
-    mobile = models.CharField(
-        max_length=254,
-        blank=True,
-        null=True,
     )
     shift_id = models.ForeignKey(
         EmployeeShift,
@@ -540,10 +865,51 @@ class EmployeeWorkInformation(models.Model):
         blank=True,
         verbose_name=_("Shift"),
     )
+    work_type_id = models.ForeignKey(
+        WorkType,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        verbose_name=_("Work Type"),
+    )
+
+    employee_type_id = models.ForeignKey(
+        EmployeeType,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        verbose_name=_("Employee Type"),
+    )
+    tags = models.ManyToManyField(
+        EmployeeTag, blank=True, verbose_name=_("Employee tag")
+    )
+    location = models.CharField(
+        max_length=254, null=True, blank=True, verbose_name=_("Work Location")
+    )
+    company_id = models.ForeignKey(
+        Company,
+        on_delete=models.PROTECT,
+        blank=True,
+        null=True,
+        verbose_name=_("Company"),
+    )
+    email = models.EmailField(
+        max_length=254, blank=True, null=True, verbose_name=_("Work Email")
+    )
+    mobile = models.CharField(
+        max_length=254,
+        blank=True,
+        null=True,
+        verbose_name=_("Work Phone"),
+        validators=[phone_validator],
+    )
+
     date_joining = models.DateField(
         null=True, blank=True, verbose_name=_("Joining Date")
     )
-    contract_end_date = models.DateField(blank=True, null=True)
+    contract_end_date = models.DateField(
+        blank=True, null=True, verbose_name=_("Contract End Date")
+    )
     basic_salary = models.IntegerField(
         null=True, blank=True, default=0, verbose_name=_("Basic Salary")
     )
@@ -570,6 +936,52 @@ class EmployeeWorkInformation(models.Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.skip_history = False
+
+    def calculate_progress(self):
+        fields_to_focus = [
+            "job_position_id",
+            "department_id",
+            "work_type_id",
+            "employee_type_id",
+            "job_role_id",
+            "reporting_manager_id",
+            "company_id",
+            "location",
+            "email",
+            "mobile",
+            "shift_id",
+            "date_joining",
+            "contract_end_date",
+            "basic_salary",
+            "salary_hour",
+        ]
+
+        completed_field_count = sum(
+            1 for field_name in fields_to_focus if getattr(self, field_name) is not None
+        )
+        total_fields = len(fields_to_focus)
+        percent = (
+            (completed_field_count / total_fields) * 100 if total_fields > 0 else 0
+        )
+        return round(percent, 1)
+
+    def progress_col(self):
+        """
+        This method for get custome coloumn for progress.
+        """
+
+        return render_template(
+            path="cbv/dashboard/progress.html",
+            context={"instance": self},
+        )
+
+    def get_edit_url(self):
+        """
+        To get edit url
+        """
+
+        url = reverse("update-emp-workinfo", kwargs={"pk": self.pk})
+        return url
 
     def tracking(self):
         """
@@ -611,19 +1023,20 @@ class EmployeeBankDetails(SolichModel):
         related_name="employee_bank_details",
         verbose_name=_("Employee"),
     )
-    bank_name = models.CharField(max_length=50)
+    bank_name = models.CharField(max_length=50, null=True, verbose_name=_("Bank Name"))
     account_number = models.CharField(
         max_length=50,
-        null=False,
+        null=True,
         blank=False,
-        default="",
     )
-    branch = models.CharField(max_length=50)
-    address = models.TextField(max_length=255)
-    country = models.CharField(max_length=50, blank=True, null=True)
-    state = models.CharField(max_length=50, blank=True)
-    city = models.CharField(max_length=50, blank=True)
-    any_other_code1 = models.CharField(max_length=50, verbose_name="Bank Code #1")
+    branch = models.CharField(max_length=50, null=True)
+    address = models.TextField(max_length=255, null=True)
+    country = models.CharField(max_length=50, null=True, blank=True)
+    state = models.CharField(max_length=50, null=True, blank=True)
+    city = models.CharField(max_length=50, null=True, blank=True)
+    any_other_code1 = models.CharField(
+        max_length=50, verbose_name="Bank Code #1", null=True
+    )
     any_other_code2 = models.CharField(
         max_length=50, null=True, blank=True, verbose_name="Bank Code #2"
     )
@@ -631,6 +1044,10 @@ class EmployeeBankDetails(SolichModel):
     objects = SolichCompanyManager(
         related_company_field="employee_id__employee_work_info__company_id"
     )
+
+    class Meta:
+        verbose_name = _("Employee Bank Details")
+        verbose_name_plural = _("Employee Bank Details")
 
     def __str__(self) -> str:
         return f"{self.employee_id}-{self.bank_name}"
@@ -651,7 +1068,7 @@ class EmployeeBankDetails(SolichModel):
 
 
 class NoteFiles(SolichModel):
-    files = models.FileField(upload_to="employee/NoteFiles", blank=True, null=True)
+    files = models.FileField(upload_to=upload_path, blank=True, null=True)
     objects = models.Manager()
 
     def __str__(self):
@@ -668,9 +1085,7 @@ class EmployeeNote(SolichModel):
         on_delete=models.CASCADE,
         related_name="employee_name",
     )
-    description = models.TextField(
-        verbose_name=_("Description"), max_length=255, null=True
-    )
+    description = models.TextField(verbose_name=_("Description"), null=True)  # 905
     note_files = models.ManyToManyField(NoteFiles, blank=True)
     updated_by = models.ForeignKey(Employee, on_delete=models.CASCADE)
     objects = SolichCompanyManager(
@@ -686,7 +1101,7 @@ class PolicyMultipleFile(SolichModel):
     PoliciesMultipleFile model
     """
 
-    attachment = models.FileField(upload_to="employee/policies")
+    attachment = models.FileField(upload_to=upload_path)
 
 
 class Policy(SolichModel):
@@ -701,7 +1116,11 @@ class Policy(SolichModel):
     attachments = models.ManyToManyField(PolicyMultipleFile, blank=True)
     company_id = models.ManyToManyField(Company, blank=True, verbose_name=_("Company"))
 
-    objects = SolichCompanyManager()
+    objects = SolichCompanyManager("company_id")
+
+    class Meta:
+        verbose_name = _("Policy")
+        verbose_name_plural = _("Policies")
 
     def delete(self, *args, **kwargs):
         super().delete(*args, **kwargs)
@@ -728,7 +1147,7 @@ class BonusPoint(SolichModel):
         related_name="bonus_point",
     )
     points = models.IntegerField(
-        default=0, help_text="Use negative numbers to reduce points."
+        default=0, help_text=_("Use negative numbers to reduce points.")
     )
     encashment_condition = models.CharField(
         max_length=100, choices=CONDITIONS, blank=True, null=True
@@ -775,21 +1194,63 @@ class Actiontype(SolichModel):
     """
 
     choice_actions = [
-        ("warning", trans("Warning")),
-        ("suspension", trans("Suspension")),
-        ("dismissal", trans("Dismissal")),
+        ("warning", _("Warning")),
+        ("suspension", _("Suspension")),
+        ("dismissal", _("Dismissal")),
     ]
 
     title = models.CharField(max_length=50)
-    action_type = models.CharField(max_length=30, choices=choice_actions)
+    action_type = models.CharField(
+        max_length=30, choices=choice_actions, verbose_name=_("Action Type")
+    )
     block_option = models.BooleanField(
         default=False,
         verbose_name=_("Enable login block :"),
-        help_text="If is enabled, employees log in will be blocked based on period of suspension or dismissal.",
+        help_text=_(
+            "If is enabled, employees log in will be blocked based on period of suspension or dismissal."
+        ),
     )
+
+    class Meta:
+        verbose_name = _("Action Type")
+        verbose_name_plural = _("Action Types")
 
     def __str__(self) -> str:
         return f"{self.title}"
+
+    def get_block_option(self):
+        """
+        To get block option
+        """
+        if self.block_option:
+            return _("Yes")
+        return _("No")
+
+    def get_action_type_display(self):
+        """
+        Display action type
+        """
+        return dict(self.choice_actions).get(self.action_type)
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("update-action-type", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        This method to get delete url
+        """
+        url = reverse_lazy("generic-delete")
+        return url
+
+    def get_instance_id(self):
+        """
+        To get instance in list view
+        """
+        return self.id
 
 
 class DisciplinaryAction(SolichModel):
@@ -810,18 +1271,105 @@ class DisciplinaryAction(SolichModel):
         validators=[validate_time_format],
     )
     start_date = models.DateField(null=True)
-    attachment = models.FileField(
-        upload_to="employee/discipline", null=True, blank=True
-    )
-    company_id = models.ManyToManyField(Company, blank=True)
-
-    objects = SolichCompanyManager()
+    attachment = models.FileField(upload_to=upload_path, null=True, blank=True)
+    objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
 
     def __str__(self) -> str:
         return f"{self.action}"
 
     class Meta:
         ordering = ["-id"]
+
+    def employee_column(self):
+        """
+        This method for get custom column for employee.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/employee_col.html",
+            context={"instance": self},
+        )
+
+    def action_taken_col(self):
+        """
+        This method for get custom column for employee.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/action_taken.html",
+            context={"instance": self},
+        )
+
+    def block_option_col(self):
+        """
+        block option column
+        """
+        if self.action.block_option:
+            return _("Yes")
+        else:
+            return _("No")
+
+    def action_date_col(self):
+        """
+        This method for get custom column for action date.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/action_date.html",
+            context={"instance": self},
+        )
+
+    def get_avatar(self):
+        """
+        Method will retun the api to the avatar or path to the profile image
+        """
+        url = f"https://ui-avatars.com/api/?name={self.action}&background=random"
+        return url
+
+    def attachments_col(self):
+        """
+        This method for get custom column for attachments.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/attachments.html",
+            context={"instance": self},
+        )
+
+    def actions(self):
+        """
+        This method for get custom column for actions.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/actions.html",
+            context={"instance": self},
+        )
+
+    def detail_actions(self):
+        """
+        This method for get custom column for actions.
+        """
+
+        return render_template(
+            path="cbv/disciplinary_actions/detail_action.html",
+            context={"instance": self},
+        )
+
+    def employee_detail(self):
+        """
+        interviewer in detail view
+        """
+        employees = self.employee_id.all()
+        employee_names_string = "<br>".join([str(employee) for employee in employees])
+        return employee_names_string
+
+    def dis_action_detail_view(self):
+        """
+        detail view
+        """
+        url = reverse("disciplinary-actions-detail-view", kwargs={"pk": self.pk})
+        return url
 
 
 class EmployeeGeneralSetting(SolichModel):
@@ -830,6 +1378,20 @@ class EmployeeGeneralSetting(SolichModel):
     """
 
     badge_id_prefix = models.CharField(max_length=5, default="PEP")
-    objects = models.Manager()
     company_id = models.ForeignKey(Company, null=True, on_delete=models.CASCADE)
+    objects = SolichCompanyManager("company_id")
 
+
+class ProfileEditFeature(SolichModel):
+    """
+    ProfileEditFeature
+    """
+
+    is_enabled = models.BooleanField(default=False)
+    objects = models.Manager()
+
+
+ACCESSBILITY_FEATURE.append(("gender_chart", _("Can view Gender Chart")))
+ACCESSBILITY_FEATURE.append(("department_chart", _("Can view Department Chart")))
+ACCESSBILITY_FEATURE.append(("employees_chart", _("Can view Employees Chart")))
+ACCESSBILITY_FEATURE.append(("birthday_view", _("Can view Birthdays")))

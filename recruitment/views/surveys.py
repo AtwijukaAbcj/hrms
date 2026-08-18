@@ -5,33 +5,35 @@ This module is used to write views related to the survey features
 """
 
 import json
+import os
 from datetime import datetime
+from uuid import uuid4
 
 from django.contrib import messages
+from django.contrib.auth import get_user_model
 from django.core import serializers
-from django.core.cache import cache as CACHE
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models import ProtectedError
-from django.http import HttpResponse, HttpResponseRedirect
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
-from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
-from base.methods import closest_numbers, get_pagination
+from base.methods import closest_numbers
 from solich.decorators import (
     hx_request_required,
     is_recruitment_manager,
     login_required,
-    manager_can_enter,
     permission_required,
 )
+from solich.http import SolichRedirect
 from recruitment.filters import SurveyFilter
 from recruitment.forms import (
     AddQuestionForm,
     ApplicationForm,
     QuestionForm,
     SurveyForm,
+    SurveyPreviewForm,
     TemplateForm,
 )
 from recruitment.models import (
@@ -48,14 +50,78 @@ from recruitment.pipeline_grouper import group_by_queryset
 from recruitment.views.paginator_qry import paginator_qry
 
 
+@login_required
+@is_recruitment_manager(perm="recruitment.add_recruitmentsurvey")
 def survey_form(request):
     """
     This method is used to render survey wform
     """
-    recruitment_id = request.GET["recId"]
-    recruitment = Recruitment.objects.get(id=recruitment_id)
+    recruitment_id = request.GET.get("recId")
+    recruitment = Recruitment.find(recruitment_id)
+    if not recruitment_id or not recruitment:
+        message = (
+            _("Missing Recruitment ID")
+            if not recruitment_id
+            else _("No Recruitment found matching the query.")
+        )
+        return SolichRedirect(request, message=message)
+
     form = SurveyForm(recruitment=recruitment).form
     return render(request, "survey/form.html", {"form": form})
+
+
+@login_required
+@is_recruitment_manager(perm="recruitment.add_recruitmentsurvey")
+def survey_preview(request, pk=None):
+    """
+    Used to render survey form to the candidate
+    """
+    title = request.GET.get("title")
+    template = SurveyTemplate.objects.filter(title=title).first()
+    if not title or not template:
+        message = (
+            _("Missing Survey Template Title")
+            if not title
+            else _("No Survey Template found matching the query.")
+        )
+        return SolichRedirect(request, message=message)
+
+    form = SurveyPreviewForm(template=template).form
+    preview_template = "survey/survey_preview.html"
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        preview_template = "survey/survey_preview_container.html"
+    return render(
+        request,
+        preview_template,
+        {"form": form, "template": template},
+    )
+
+
+@login_required
+def question_order_update(request):
+    if request.method == "POST":
+        # Extract data from the request
+        question_id = request.POST.get("question_id")
+        new_position = int(request.POST.get("new_position"))
+        qs = RecruitmentSurvey.objects.get(id=question_id)
+
+        if qs.sequence > new_position:
+            new_position = new_position
+        if qs.sequence <= new_position:
+            new_position = new_position - 1
+
+        old_qs = RecruitmentSurvey.objects.filter(sequence=new_position)
+        for i in old_qs:
+
+            i.sequence = new_position + 1
+            i.save()
+        qs.sequence = int(new_position)
+        qs.save()
+        return JsonResponse(
+            {"success": True, "message": "Question order updated successfully"}
+        )
+
+    return JsonResponse({"error": "Invalid request method"}, status=405)
 
 
 def candidate_survey(request):
@@ -63,16 +129,38 @@ def candidate_survey(request):
     Used to render survey form to the candidate
     """
     MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB in bytes
-
-    candidate: Candidate = CACHE.get(
-        request.session.session_key + "application-candidate"
-    )
-    if not candidate:
-        return redirect(reverse("open-recruitments"))
-    form = SurveyForm(recruitment=candidate.recruitment_id).form
+    if not request.session.get("candidate"):
+        return SolichRedirect(
+            request, message=_("No candidate found matching the query.")
+        )
+    candidate_json = request.session["candidate"]
+    candidate_dict = json.loads(candidate_json)
+    rec_id = candidate_dict[0]["fields"]["recruitment_id"]
+    job_id = candidate_dict[0]["fields"]["job_position_id"]
+    job = JobPosition.objects.get(id=job_id)
+    recruitment = Recruitment.objects.get(id=rec_id)
+    stage_id = candidate_dict[0]["fields"]["stage_id"]
+    created_by = candidate_dict[0]["fields"].get("created_by")
+    modified_by = candidate_dict[0]["fields"].get("modified_by")
+    candidate_dict[0]["fields"]["recruitment_id"] = recruitment
+    candidate_dict[0]["fields"]["job_position_id"] = job
+    candidate_dict[0]["fields"]["stage_id"] = Stage.objects.get(id=stage_id)
+    UserModel = get_user_model()
+    if created_by:
+        candidate_dict[0]["fields"]["created_by"] = UserModel(id=created_by)
+    if modified_by:
+        candidate_dict[0]["fields"]["modified_by"] = UserModel(id=modified_by)
+    candidate = Candidate(**candidate_dict[0]["fields"])
+    form = SurveyForm(recruitment=recruitment).form
     if request.method == "POST":
-        if not candidate.pk:
+        if not Candidate.objects.filter(
+            email=candidate.email, recruitment_id=candidate.recruitment_id
+        ).exists():
             candidate.save()
+        else:
+            candidate = Candidate.objects.filter(
+                email=candidate.email, recruitment_id=candidate.recruitment_id
+            ).first()
         answer = (
             RecruitmentSurveyAnswer()
             if candidate.recruitmentsurveyanswer_set.first() is None
@@ -112,6 +200,9 @@ def candidate_survey(request):
                     {"form": form, "candidate": candidate},
                 )
             attachment_path = f"recruitment_attachment/{attachment.name}"
+            attachment_dir = os.path.dirname(default_storage.path(attachment_path))
+            if not os.path.exists(attachment_dir):
+                os.makedirs(attachment_dir)
             with default_storage.open(attachment_path, "wb+") as destination:
                 for chunk in attachment.chunks():
                     destination.write(chunk)
@@ -140,16 +231,23 @@ def view_question_template(request):
         for manager in i.recruitment_managers.all():
             if request.user.employee_get == manager:
                 ids.append(i.id)
-    if request.user.has_perm("view_recruitmentsurvey"):
+    if request.user.has_perm("recruitment.view_recruitmentsurvey"):
         questions = RecruitmentSurvey.objects.all()
     else:
         questions = RecruitmentSurvey.objects.filter(recruitment_ids__in=ids)
+    # See the matching fix/comment in recruitment/views/search.py's
+    # filter_survey() - group_by_queryset() already paginates correctly, but
+    # the unused (0-question) templates it can't see get appended afterward
+    # and the combined list gets paginated a second time on the same
+    # "template_page" param, so page 2+ silently lost has_previous. Fetch
+    # every templates-with-questions group here (unpaginated) and paginate
+    # the merged list exactly once below instead.
     templates = group_by_queryset(
         questions.filter(template_id__isnull=False).distinct(),
         "template_id__title",
-        page=request.GET.get("template_page"),
+        page=1,
         page_name="template_page",
-        records_per_page=get_pagination(),
+        records_per_page=1000000,
     )
     all_template_object_list = []
     for template in templates:
@@ -219,12 +317,7 @@ def update_question_template(request, survey_id):
             instance.recruitment_ids.set(form.recruitment)
             # instance.job_position_ids.set(form.job_positions)
             messages.success(request, _("New survey question updated."))
-            return HttpResponse(
-                render(
-                    request, "survey/template_update_form.html", {"form": form}
-                ).content.decode("utf-8")
-                + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "survey/template_update_form.html", {"form": form})
 
 
@@ -245,17 +338,12 @@ def create_question_template(request):
             instance.template_id.set(form.cleaned_data["template_id"])
             # instance.job_position_ids.set(form.job_positions)
             messages.success(request, _("New survey question created."))
-            return HttpResponse(
-                render(
-                    request, "survey/template_form.html", {"form": form}
-                ).content.decode("utf-8")
-                + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "survey/template_form.html", {"form": form})
 
 
 @login_required
-@permission_required(perm="recriutment.delete_recruitmentsurvey")
+@permission_required(perm="recruitment.delete_recruitmentsurvey")
 def delete_survey_question(request, survey_id):
     """
     This method is used to delete the survey instance
@@ -267,6 +355,10 @@ def delete_survey_question(request, survey_id):
         messages.error(request, _("Question not found."))
     except ProtectedError:
         messages.error(request, _("You cannot delete this question"))
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        from recruitment.views.search import filter_survey
+
+        return filter_survey(request)
     return redirect(view_question_template)
 
 
@@ -274,22 +366,27 @@ def application_form(request):
     """
     This method renders candidate form to create candidate
     """
-    form = ApplicationForm()
     recruitment = None
     recruitment_id = request.GET.get("recruitmentId")
     resume_id = request.GET.get("resumeId")
     resume_obj = Resume.objects.filter(id=resume_id).first()
 
-    if resume_obj:
-        initial_data = {"resume": resume_obj.file.url if resume_obj else None}
-        form = ApplicationForm(initial=initial_data)
+    if request.method == "GET" and not recruitment_id:
+        messages.error(request, _("Recruitment ID is missing"))
+        return redirect("open-recruitments")
 
-    if recruitment_id is not None:
-        recruitment = Recruitment.objects.filter(id=recruitment_id)
-        if recruitment.exists():
-            recruitment = recruitment.first()
+    try:
+        recruitment = Recruitment.objects.filter(
+            id=recruitment_id, is_published=True
+        ).first()  # Only create applications for published recruitments.
+        if not recruitment:
+            messages.error(request, _("Recruitment not found"))
+            return redirect("open-recruitments")
+    except (ValueError, OverflowError):
+        messages.error(request, _("Invalid Recruitment ID"))
+        return redirect("open-recruitments")
+
     if request.POST:
-
         if "resume" not in request.FILES and resume_id:
             if resume_obj and resume_obj.file:
                 file_content = resume_obj.file.read()
@@ -303,38 +400,23 @@ def application_form(request):
             candidate_obj = form.save(commit=False)
             recruitment_obj = candidate_obj.recruitment_id
             stages = recruitment_obj.stage_set.all()
-            if stages.filter(stage_type="initial").exists():
-                candidate_obj.stage_id = stages.filter(stage_type="initial").first()
+            if stages.filter(stage_type="applied").exists():
+                candidate_obj.stage_id = stages.filter(stage_type="applied").first()
             else:
                 candidate_obj.stage_id = stages.order_by("sequence").first()
             messages.success(request, _("Application saved."))
-
-            resume = request.FILES["resume"]
-
-            resume_path = f"recruitment/resume/{resume.name}"
-
-            with default_storage.open(resume_path, "wb+") as destination:
-                for chunk in resume.chunks():
-                    destination.write(chunk)
-
-            candidate_obj.resume = resume_path
-            try:
-                profile = request.FILES["profile"] if request.FILES["profile"] else None
-                profile_path = f"recruitment/profile/{profile.name}"
-                with default_storage.open(profile_path, "wb+") as destination:
-                    for chunk in profile.chunks():
-                        destination.write(chunk)
-                candidate_obj.profile = profile_path
-            except:
-                pass
-            CACHE.set(
-                request.session.session_key + "application-candidate", candidate_obj
+            candidate_obj.save()  # 945
+            request.session["candidate"] = serializers.serialize(
+                "json", [candidate_obj]
             )
-            if RecruitmentSurvey.objects.filter(
+            has_direct_survey = RecruitmentSurvey.objects.filter(
                 recruitment_ids=recruitment_id
-            ).exists():
-                if not request.user.has_perm("perms.recruitment.add_candidate"):
-                    return redirect(candidate_survey)
+            ).exists()
+            has_template_survey = RecruitmentSurvey.objects.filter(
+                template_id__in=recruitment.survey_templates.all()
+            ).exists()
+            if has_direct_survey or has_template_survey:
+                return redirect(candidate_survey)
             candidate_obj.save()
 
             if resume_obj:
@@ -342,9 +424,36 @@ def application_form(request):
                 resume_obj.save()
 
             return render(request, "candidate/success.html")
-        form.fields["job_position_id"].queryset = (
-            form.instance.recruitment_id.open_positions.all()
-        )
+        for field_name, field_errors in form.errors.items():
+            if field_name == "__all__":
+                for error in field_errors:
+                    messages.error(request, error)
+            else:
+                field_label = (
+                    form.fields.get(field_name).label
+                    if form.fields.get(field_name)
+                    else field_name
+                )
+                for error in field_errors:
+                    messages.error(
+                        request,
+                        _("%(field_label)s: %(error)s")
+                        % {"field_label": field_label, "error": error},
+                    )
+        recruitment_for_job_position = form.data.get("recruitment_id") or recruitment_id
+        if recruitment_for_job_position:
+            recruitment_for_job_position = Recruitment.objects.filter(
+                id=recruitment_for_job_position
+            ).first()
+            if recruitment_for_job_position:
+                form.fields["job_position_id"].queryset = (
+                    recruitment_for_job_position.open_positions.all()
+                )
+    else:
+        # 811
+        initial_data = {"resume": resume_obj.file.url} if resume_obj else {}
+        form = ApplicationForm(initial=initial_data)
+
     return render(
         request,
         "candidate/application_form.html",
@@ -373,11 +482,18 @@ def single_survey(request, survey_id):
 
 @login_required
 @hx_request_required
-@permission_required("recruitment.add_surveytemplate")
 def create_template(request):
     """
     Create question template views
     """
+    # Check if the user has any of the two permissions
+    if not (
+        request.user.has_perm("recruitment.add_surveytemplate")
+        or request.user.has_perm("recruitment.change_surveytemplate")
+    ):
+        messages.info(request, _("You dont have permission."))
+        return SolichRedirect(request)
+
     title = request.GET.get("title")
     instance = None
     if title:
@@ -387,8 +503,8 @@ def create_template(request):
         form = TemplateForm(request.POST, instance=instance)
         if form.is_valid():
             form.save()
-            messages.success(request, "Template saved")
-            return HttpResponse("<script>window.location.reload()</script>")
+            messages.success(request, _("Template saved"))
+            return SolichRedirect(request)
     return render(request, "survey/main_form.html", {"form": form})
 
 
@@ -401,11 +517,13 @@ def delete_template(request):
     title = request.GET.get("title")
     SurveyTemplate.objects.filter(title=str(title)).delete()
     if title == "None":
-        messages.info(request, "This template group cannot be deleted")
+        messages.info(request, _("This template group cannot be deleted"))
     else:
-        messages.success(request, "Template group deleted")
+        messages.success(request, _("Template group deleted"))
 
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        return HttpResponse("<script>$('#filterSubmit').click();</script>")
+    return SolichRedirect(request)
 
 
 @login_required
@@ -418,14 +536,21 @@ def question_add(request):
     template = None
     title = request.GET.get("title")
     if title:
-        template = SurveyTemplate.objects.filter(title=title)
+        template = SurveyTemplate.objects.filter(title=title).first
 
     form = AddQuestionForm(initial={"template_ids": template})
     if request.method == "POST":
         form = AddQuestionForm(request.POST)
         if form.is_valid():
             form.save()
-            messages.success(request, "Question added")
-            return HttpResponse("<script>window.location.reload()</script>")
+            messages.success(request, _("Question added"))
+            if request.META.get("HTTP_HX_REQUEST") == "true":
+                return HttpResponse(
+                    "<script>"
+                    "$('#templateModal').removeClass('oh-modal--show');"
+                    "$('#genericModal').removeClass('oh-modal--show');"
+                    "$('#filterSubmit').click();"
+                    "</script>"
+                )
+            return SolichRedirect(request)
     return render(request, "survey/add_form.html", {"form": form})
-

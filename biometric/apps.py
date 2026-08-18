@@ -3,6 +3,7 @@ Django application configuration for the biometric app.
 """
 
 from django.apps import AppConfig
+from django.conf import settings
 
 
 class BiometricConfig(AppConfig):
@@ -23,6 +24,7 @@ class BiometricConfig(AppConfig):
 
         from solich.urls import urlpatterns
 
+        settings.APPS.append("biometric")
         urlpatterns.append(
             path("biometric/", include("biometric.urls")),
         )
@@ -30,4 +32,3 @@ class BiometricConfig(AppConfig):
         from biometric import sidebar
 
         super().ready()
-

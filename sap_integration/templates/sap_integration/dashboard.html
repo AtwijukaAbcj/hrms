@@ -1,0 +1,166 @@
+{% extends 'index.html' %}
+{% load static %}
+
+{% block title %}SAP Integration Dashboard{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-12">
+            <h1>SAP Integration Dashboard</h1>
+            <hr>
+        </div>
+    </div>
+
+    <!-- Status Cards -->
+    <div class="row mt-4">
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Configuration Status</h5>
+                    {% if config %}
+                        {% if config.IS_ACTIVE %}
+                            <span class="badge badge-success">Active</span>
+                        {% else %}
+                            <span class="badge badge-danger">Inactive</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="badge badge-warning">Not Configured</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Mapped Employees</h5>
+                    <h3>{{ mapped_employees }}/{{ total_employees }}</h3>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Auto Sync</h5>
+                    {% if config and config.AUTO_SYNC %}
+                        <span class="badge badge-success">Enabled</span>
+                    {% else %}
+                        <span class="badge badge-secondary">Disabled</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Sync Interval</h5>
+                    {% if config %}
+                        <p>{{ config.SYNC_INTERVAL }}s</p>
+                    {% else %}
+                        <p>-</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="row mt-4">
+        <div class="col-md-12">
+            <a href="{% url 'sap_integration:configure' %}" class="btn btn-primary">Configure SAP Connection</a>
+            <button class="btn btn-success" onclick="testConnection()">Test Connection</button>
+            <button class="btn btn-info" onclick="triggerSync()">Sync Employee Data</button>
+            <a href="{% url 'sap_integration:sync_logs' %}" class="btn btn-secondary">View Sync Logs</a>
+        </div>
+    </div>
+
+    <!-- Recent Syncs -->
+    <div class="row mt-4">
+        <div class="col-md-12">
+            <h4>Recent Sync Operations</h4>
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Status</th>
+                        <th>Records Synced</th>
+                        <th>Records Failed</th>
+                        <th>Started At</th>
+                        <th>Completed At</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for log in recent_syncs %}
+                    <tr>
+                        <td>{{ log.get_sync_type_display }}</td>
+                        <td>
+                            {% if log.status == 'success' %}
+                                <span class="badge badge-success">{{ log.status }}</span>
+                            {% elif log.status == 'failed' %}
+                                <span class="badge badge-danger">{{ log.status }}</span>
+                            {% elif log.status == 'in_progress' %}
+                                <span class="badge badge-warning">{{ log.status }}</span>
+                            {% else %}
+                                <span class="badge badge-secondary">{{ log.status }}</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ log.records_synced }}</td>
+                        <td>{{ log.records_failed }}</td>
+                        <td>{{ log.started_at|date:"Y-m-d H:i" }}</td>
+                        <td>{% if log.completed_at %}{{ log.completed_at|date:"Y-m-d H:i" }}{% else %}-{% endif %}</td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="6" class="text-center">No sync logs yet</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+function testConnection() {
+    fetch('{% url "sap_integration:test_connection" %}', {
+        method: 'POST',
+        headers: {
+            'X-CSRFToken': '{{ csrf_token }}'
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert('✓ SAP connection successful!');
+        } else {
+            alert('✗ Connection failed: ' + data.message);
+        }
+    })
+    .catch(error => alert('Error: ' + error));
+}
+
+function triggerSync() {
+    if (confirm('This will sync employee data to SAP. Continue?')) {
+        fetch('{% url "sap_integration:sync_employees" %}', {
+            method: 'POST',
+            headers: {
+                'X-CSRFToken': '{{ csrf_token }}'
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                alert('Sync completed!\n' + data.message);
+                location.reload();
+            } else {
+                alert('Sync failed: ' + data.message);
+            }
+        })
+        .catch(error => alert('Error: ' + error));
+    }
+}
+</script>
+{% endblock %}

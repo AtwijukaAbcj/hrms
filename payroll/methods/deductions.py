@@ -28,6 +28,9 @@ def update_compensation_deduction(
     temp = compensation_amount
     for deduction in deduction_heads:
         amount = deduction.amount if deduction.amount else 0
+        employee_rate = deduction.rate
+        if employee_rate:
+            amount = compensation_amount * employee_rate / 100
         compensation_amount = compensation_amount - float(amount)
         employer_contribution_amount = 0
         if max(0, deduction.employer_rate):
@@ -49,3 +52,19 @@ def update_compensation_deduction(
         "difference_amount": difference_amount,
     }
 
+
+def create_deductions(instance, amount, date):
+    installment = Deduction()
+    installment.title = f"{instance.title} - {date}"
+    installment.include_active_employees = False
+    installment.amount = amount
+    installment.is_fixed = True
+    installment.one_time_date = date
+    installment.only_show_under_employee = True
+    installment.is_installment = True
+    installment.save()
+    installment.include_active_employees = False
+    installment.specific_employees.add(instance.employee_id)
+    installment.save()
+
+    return installment

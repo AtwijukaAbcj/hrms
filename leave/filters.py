@@ -2,7 +2,7 @@
 This module contains custom filter classes used for filtering
 various models in the Leave Management System app.
 The filters are designed to provide flexible search and filtering
-capabilities for LeaveType, LeaveRequest,AvailableLeave, Holiday, and CompanyLeave models.
+capabilities for LeaveType, LeaveRequest and AvailableLeave models.
 """
 
 import uuid
@@ -10,20 +10,20 @@ from datetime import datetime, timedelta
 
 import django_filters
 from django import forms
-from django.db.models import Q
-from django.db.models.functions import TruncYear
+from django.apps import apps
+from django.db.models import Q, Value
+from django.db.models.functions import Coalesce, Concat, TruncYear
+from django.utils.timezone import now
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django_filters import DateFilter, FilterSet, NumberFilter, filters
 
-from base.filters import FilterSet
 from employee.models import Employee
+from solich.filters import FilterSet, SolichFilterSet, filter_by_name
+from solich_views.templatetags.generic_template_filters import getattribute
 
 from .models import (
     AvailableLeave,
-    CompanyLeave,
-    CompensatoryLeaveRequest,
-    Holiday,
     LeaveAllocationRequest,
     LeaveRequest,
     LeaveType,
@@ -124,19 +124,19 @@ class AssignedLeaveFilter(FilterSet):
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
 
 
-class LeaveRequestFilter(FilterSet):
+class LeaveRequestFilter(SolichFilterSet):
     """
     Filter class for LeaveRequest model.
     This filter allows searching LeaveRequest objects
     based on employee,date range, leave type, and status.
     """
 
-    overall_leave = django_filters.CharFilter(method="overall_leave_filter")
-
     search = django_filters.CharFilter(method="filter_by_name")
+    search_field = django_filters.CharFilter(method="search_in")
+    today_leave = django_filters.BooleanFilter(method="filter_today_leave")
+    overall_leave = django_filters.CharFilter(method="overall_leave_filter")
     from_date = DateFilter(
-        field_name="end_date",
-        lookup_expr="gte",
+        method="filter_from_date",
         widget=forms.DateInput(attrs={"type": "date"}),
     )
     to_date = DateFilter(
@@ -145,15 +145,20 @@ class LeaveRequestFilter(FilterSet):
         widget=forms.DateInput(attrs={"type": "date"}),
     )
 
-    start_date = DateFilter(
-        field_name="start_date",
-        lookup_expr="exact",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
+    # start_date = DateFilter(
+    #     field_name="start_date",
+    #     lookup_expr="exact",
+    #     widget=forms.DateInput(attrs={"type": "date"}),
+    # )
 
-    end_date = DateFilter(
-        field_name="end_date",
-        lookup_expr="exact",
+    # end_date = DateFilter(
+    #     field_name="end_date",
+    #     lookup_expr="exact",
+    #     widget=forms.DateInput(attrs={"type": "date"}),
+    # )
+    start_date_gte = DateFilter(
+        field_name="start_date",
+        lookup_expr="gte",
         widget=forms.DateInput(attrs={"type": "date"}),
     )
     department_name = django_filters.CharFilter(
@@ -175,6 +180,8 @@ class LeaveRequestFilter(FilterSet):
             "department_name",
             "overall_leave",
             "employee_id__employee_work_info__company_id",
+            "employee_id__employee_work_info__employee_type_id",
+            "employee_id__employee_work_info__job_role_id",
             "employee_id__employee_work_info__reporting_manager_id",
             "employee_id__employee_work_info__department_id",
             "employee_id__employee_work_info__job_position_id",
@@ -226,148 +233,59 @@ class LeaveRequestFilter(FilterSet):
             queryset = today_leave_requests
         return queryset
 
+    def filter_today_leave(self, queryset, name, value):
+        if value:
+            today = now().date()
+            return queryset.filter(start_date__lte=today).filter(
+                Q(end_date__gte=today) | Q(end_date__isnull=True, start_date=today)
+            )
+        return queryset
+
+    def filter_from_date(self, queryset, name, value):
+        # end_date >= value, or for single-day leaves (end_date null) start_date >= value
+        return queryset.filter(
+            Q(end_date__gte=value) | Q(end_date__isnull=True, start_date__gte=value)
+        )
+
     def filter_by_name(self, queryset, name, value):
+
+        if self.data.get("search_field"):
+            return queryset
         # Call the imported function
         filter_method = {
-            "leave_type": "leave_type_id__name__icontains",
+            "leave_type_id": "leave_type_id__name__icontains",
             "status": "status__icontains",
-            "department": "employee_id__employee_work_info__department_id__department__icontains",
-            "job_position": "employee_id__employee_work_info__job_position_id__job_position__icontains",
-            "company": "employee_id__employee_work_info__company_id__company__icontains",
+            "employee_id__employee_work_info__department_id": "employee_id__employee_work_info__department_id__department__icontains",
+            "employee_id__employee_work_info__job_position_id__": "employee_id__employee_work_info__job_position_id__job_position__icontains",
+            "employee_id__employee_work_info__company_id": "employee_id__employee_work_info__company_id__company__icontains",
         }
         search_field = self.data.get("search_field")
+        qs = queryset
         if not search_field:
-            parts = value.split()
-            first_name = parts[0]
-            last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+            value = " ".join(value.split())
 
-            # Filter the queryset by first name and last name
-            if first_name and last_name:
-                queryset = queryset.filter(
-                    employee_id__employee_first_name__icontains=first_name,
-                    employee_id__employee_last_name__icontains=last_name,
+            queryset = queryset.annotate(
+                full_name=Concat(
+                    Coalesce("employee_id__employee_first_name", Value("")),
+                    Value(" "),
+                    Coalesce("employee_id__employee_last_name", Value("")),
                 )
-            elif first_name:
-                queryset = queryset.filter(
-                    employee_id__employee_first_name__icontains=first_name
-                )
-            elif last_name:
-                queryset = queryset.filter(
-                    employee_id__employee_last_name__icontains=last_name
-                )
+            )
+
+            queryset = queryset.filter(full_name__icontains=value)
+
+            queryset = (
+                queryset | qs.filter(employee_id__badge_id__icontains=value)
+            ).distinct()
         else:
             filter = filter_method.get(search_field)
             queryset = queryset.filter(**{filter: value})
-
         return queryset
 
     def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
         super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
         for field in self.form.fields.keys():
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
-
-
-class HolidayFilter(FilterSet):
-    """
-    Filter class for Holiday model.
-
-    This filter allows searching Holiday objects based on name and date range.
-    """
-
-    search = filters.CharFilter(field_name="name", lookup_expr="icontains")
-    from_date = DateFilter(
-        field_name="start_date",
-        lookup_expr="gte",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-    to_date = DateFilter(
-        field_name="end_date",
-        lookup_expr="lte",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-
-    start_date = DateFilter(
-        field_name="start_date",
-        lookup_expr="exact",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-
-    end_date = DateFilter(
-        field_name="end_date",
-        lookup_expr="exact",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-
-    class Meta:
-        """
-        Meta class defines the model and fields to filter
-        """
-
-        model = Holiday
-        fields = {
-            "recurring": ["exact"],
-        }
-
-    def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
-        super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
-        for field in self.form.fields.keys():
-            self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
-
-
-class CompanyLeaveFilter(FilterSet):
-    """
-    Filter class for CompanyLeave model.
-
-    This filter allows searching CompanyLeave objects based on
-    name, week day and based_on_week choices.
-    """
-
-    name = filters.CharFilter(field_name="based_on_week_day", lookup_expr="icontains")
-    search = filters.CharFilter(method="filter_week_day")
-
-    class Meta:
-        """ "
-        Meta class defines the model and fields to filter
-        """
-
-        model = CompanyLeave
-        fields = {
-            "based_on_week": ["exact"],
-            "based_on_week_day": ["exact"],
-        }
-
-    def filter_week_day(self, queryset, _, value):
-        week_qry = CompanyLeave.objects.none()
-        weekday_values = []
-        week_values = []
-        WEEK_DAYS = [
-            ("0", __("Monday")),
-            ("1", __("Tuesday")),
-            ("2", __("Wednesday")),
-            ("3", __("Thursday")),
-            ("4", __("Friday")),
-            ("5", __("Saturday")),
-            ("6", __("Sunday")),
-        ]
-        WEEKS = [
-            (None, __("All")),
-            ("0", __("First Week")),
-            ("1", __("Second Week")),
-            ("2", __("Third Week")),
-            ("3", __("Fourth Week")),
-            ("4", __("Fifth Week")),
-        ]
-
-        for day_value, day_name in WEEK_DAYS:
-            if value.lower() in day_name.lower():
-                weekday_values.append(day_value)
-        for day_value, day_name in WEEKS:
-            if value.lower() in day_name.lower() and value.lower() != __("All").lower():
-                week_values.append(day_value)
-                week_qry = queryset.filter(based_on_week__in=week_values)
-            elif value.lower() in __("All").lower():
-                week_qry = queryset.filter(based_on_week__isnull=True)
-        return queryset.filter(based_on_week_day__in=weekday_values) | week_qry
 
 
 class UserLeaveRequestFilter(FilterSet):
@@ -377,6 +295,9 @@ class UserLeaveRequestFilter(FilterSet):
     based on leave type, date range, and status.
     """
 
+    search = filters.CharFilter(
+        field_name="leave_type_id__name", lookup_expr="icontains"
+    )
     leave_type = filters.CharFilter(
         field_name="leave_type_id__name", lookup_expr="icontains"
     )
@@ -388,18 +309,6 @@ class UserLeaveRequestFilter(FilterSet):
     to_date = DateFilter(
         field_name="start_date",
         lookup_expr="lte",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-
-    start_date = DateFilter(
-        field_name="start_date",
-        lookup_expr="exact",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-
-    end_date = DateFilter(
-        field_name="end_date",
-        lookup_expr="exact",
         widget=forms.DateInput(attrs={"type": "date"}),
     )
 
@@ -578,77 +487,80 @@ class RestrictLeaveFilter(FilterSet):
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
 
 
-class CompensatoryLeaveRequestFilter(FilterSet):
-    """
-    Filter class for CompensatoryLeaveRequest model specific to user leave requests.
-    This filter allows searching user-specific LeaveRequest objects
-    based on leave type, date range, and status.
-    """
+if apps.is_installed("attendance"):
+    from .models import CompensatoryLeaveRequest
 
-    id = django_filters.NumberFilter(field_name="id")
-
-    leave_type = filters.CharFilter(
-        field_name="leave_type_id__name", lookup_expr="icontains"
-    )
-    search = filters.CharFilter(method="filter_by_name")
-    created_by__employee_get = django_filters.CharFilter(
-        field_name="created_by__employee_get",
-        lookup_expr="exact",
-        widget=forms.SelectMultiple(attrs={"class": "form-control"}),
-    )
-    number_of_days_up_to = filters.NumberFilter(
-        field_name="requested_days", lookup_expr="lte"
-    )
-    number_of_days_more_than = filters.NumberFilter(
-        field_name="requested_days", lookup_expr="gte"
-    )
-
-    class Meta:
+    class CompensatoryLeaveRequestFilter(FilterSet):
         """
-        Meta class defines the model and fields to filter
+        Filter class for CompensatoryLeaveRequest model specific to user leave requests.
+        This filter allows searching user-specific LeaveRequest objects
+        based on leave type, date range, and status.
         """
 
-        model = CompensatoryLeaveRequest
-        fields = {
-            "id": ["exact"],
-            "created_by__employee_get": ["exact"],
-            "status": ["exact"],
-            "leave_type_id": ["exact"],
-            "employee_id": ["exact"],
-        }
+        id = django_filters.NumberFilter(field_name="id")
 
-    def filter_by_name(self, queryset, name, value):
-        # Call the imported function
-        filter_method = {
-            "leave_type": "leave_type_id__name__icontains",
-            "status": "status__icontains",
-            "department": "employee_id__employee_work_info__department_id__department__icontains",
-            "job_position": "employee_id__employee_work_info__job_position_id__job_position__icontains",
-            "company": "employee_id__employee_work_info__company_id__company__icontains",
-        }
-        search_field = self.data.get("search_field")
-        if not search_field:
-            parts = value.split()
-            first_name = parts[0]
-            last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        leave_type = filters.CharFilter(
+            field_name="leave_type_id__name", lookup_expr="icontains"
+        )
+        search = filters.CharFilter(method="filter_by_name")
+        created_by__employee_get = django_filters.CharFilter(
+            field_name="created_by__employee_get",
+            lookup_expr="exact",
+            widget=forms.SelectMultiple(attrs={"class": "form-control"}),
+        )
+        number_of_days_up_to = filters.NumberFilter(
+            field_name="requested_days", lookup_expr="lte"
+        )
+        number_of_days_more_than = filters.NumberFilter(
+            field_name="requested_days", lookup_expr="gte"
+        )
 
-            # Filter the queryset by first name and last name
-            if first_name and last_name:
-                queryset = queryset.filter(
-                    employee_id__employee_first_name__icontains=first_name,
-                    employee_id__employee_last_name__icontains=last_name,
+        class Meta:
+            """
+            Meta class defines the model and fields to filter
+            """
+
+            model = CompensatoryLeaveRequest
+            fields = {
+                "id": ["exact"],
+                "created_by__employee_get": ["exact"],
+                "status": ["exact"],
+                "leave_type_id": ["exact"],
+                "employee_id": ["exact"],
+            }
+
+        def filter_by_name(self, queryset, name, value):
+            # Call the imported function
+            filter_method = {
+                "leave_type": "leave_type_id__name__icontains",
+                "status": "status__icontains",
+                "department": "employee_id__employee_work_info__department_id__department__icontains",
+                "job_position": "employee_id__employee_work_info__job_position_id__job_position__icontains",
+                "company": "employee_id__employee_work_info__company_id__company__icontains",
+            }
+            search_field = self.data.get("search_field")
+            qs = queryset
+            if not search_field:
+                value = " ".join(value.split())
+
+                queryset = queryset.annotate(
+                    full_name=Concat(
+                        Coalesce("employee_id__employee_first_name", Value("")),
+                        Value(" "),
+                        Coalesce("employee_id__employee_last_name", Value("")),
+                    )
                 )
-            elif first_name:
-                queryset = queryset.filter(
-                    employee_id__employee_first_name__icontains=first_name
-                )
-            elif last_name:
-                queryset = queryset.filter(
-                    employee_id__employee_last_name__icontains=last_name
-                )
-        else:
-            filter = filter_method.get(search_field)
-            queryset = queryset.filter(**{filter: value})
 
-        return queryset
+                queryset = queryset.filter(full_name__icontains=value)
 
+                queryset = (
+                    queryset | qs.filter(employee_id__badge_id__icontains=value)
+                ).distinct()
+            else:
+                filter = filter_method.get(search_field)
+                queryset = queryset.filter(**{filter: value})
+
+            queryset = (
+                queryset | qs.filter(employee_id__badge_id__icontains=value).distinct()
+            )
+            return queryset

@@ -13,4 +13,3 @@ admin.site.register(OnboardingTask)
 admin.site.register(CandidateStage)
 admin.site.register(CandidateTask)
 admin.site.register(OnboardingPortal)
-

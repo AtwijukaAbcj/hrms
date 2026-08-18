@@ -1,7 +1,7 @@
 """
 select_widgets.py
 
-This module is used to write Solich form select widgets
+This module is used to write solich form select widgets
 """
 
 import uuid
@@ -31,46 +31,63 @@ class SolichMultiSelectWidget(forms.Widget):
         *args,
         filter_route_name,
         filter_class=None,
-        filter_instance_contex_name=None,
+        filter_instance_context_name=None,
         filter_template_path=None,
         instance=None,
         required=False,
+        form=None,
+        help_text=None,
         **kwargs
     ) -> None:
         self.filter_route_name = filter_route_name
         self.required = required
         self.filter_class = filter_class
-        self.filter_instance_contex_name = filter_instance_contex_name
+        self.filter_instance_context_name = filter_instance_context_name
         self.filter_template_path = filter_template_path
         self.instance = instance
+        self.form = form
+        self.help_text = help_text
         super().__init__()
 
-    template_name = "solich_widgets/Solich_multiselect_widget.html"
+    template_name = "solich_widgets/solich_multiselect_widget.html"
 
     def get_context(self, name, value, attrs):
         # Get the default context from the parent class
         context = super().get_context(name, value, attrs)
+        # Django form widget templates don't receive `request` in their
+        # context by default, which breaks the {% get_company %} templatetag
+        # (theme lookup) used inside solich_multiselect_widget.html. Pull it
+        # from the thread-local set by ThreadLocalMiddleware instead.
+        context["request"] = solich_middlewares._thread_locals.request
         # Add your custom data to the context
         queryset = self.choices.queryset
         field = self.choices.field
         context["queryset"] = queryset
         context["field_name"] = name
-        if self.instance and self.instance.pk:
+        if self.form and name in self.form.data:
+            initial = self.form.data.getlist(name)
+            context["initial"] = initial
+        elif value:
+            context["initial"] = value
+
+        elif self.instance and self.instance.pk:
             initial = list(getattr(self.instance, name).values_list("id", flat=True))
             context["initial"] = initial
+        else:
+            context["initial"] = []
         context["field"] = field
         context["self"] = self
         context["filter_template_path"] = self.filter_template_path
         context["filter_route_name"] = self.filter_route_name
         context["required"] = self.required
+        context["help_text"] = self.help_text
         self.attrs["id"] = (
             ("id_" + name) if self.attrs.get("id") is None else self.attrs.get("id")
         )
         uid = get_short_uuid(5)
         context["section_id"] = uid
-        context[self.filter_instance_contex_name] = self.filter_class
+        context[self.filter_instance_context_name] = self.filter_class
         request = getattr(solich_middlewares._thread_locals, "request", None)
         ALL_INSTANCES[str(request.user.id)] = self
 
         return context
-

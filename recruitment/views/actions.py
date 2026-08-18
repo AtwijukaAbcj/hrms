@@ -6,23 +6,37 @@ This module is used to register methods to delete/archive/un-archive instances
 
 import json
 
+from django import template
 from django.contrib import messages
 from django.contrib.auth.models import Permission
-from django.db.models import ProtectedError
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.db.models import ProtectedError, Q
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
 
+from base.forms import MailTemplateForm
+from base.methods import (
+    build_safe_template_request,
+    sanitize_mail_template_body,
+    sanitize_mail_template_placeholders,
+)
+from base.models import SolichMailTemplate
 from employee.models import Employee
-from solich.decorators import login_required, permission_required
+from solich.decorators import hx_request_required, login_required, permission_required
 from solich.group_by import group_by_queryset
+from solich.http import SolichRedirect
 from notifications.signals import notify
-from recruitment.decorators import manager_can_enter, recruitment_manager_can_enter
+from recruitment.decorators import (
+    candidate_login_required,
+    manager_can_enter,
+    recruitment_manager_can_enter,
+)
 from recruitment.filters import StageFilter
 from recruitment.forms import StageCreationForm
 from recruitment.models import Candidate, Recruitment, Stage, StageNote
+from recruitment.views.linkedin import delete_post
 from recruitment.views.paginator_qry import paginator_qry
 
 
@@ -40,7 +54,7 @@ def recruitment_delete(request, rec_id):
             recruitment_obj = Recruitment.objects.get(id=rec_id)
         except Recruitment.DoesNotExist:
             messages.error(request, _("Recruitment not found."))
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            return SolichRedirect(request)
         recruitment_mangers = recruitment_obj.recruitment_managers.all()
         all_stage_permissions = Permission.objects.filter(
             content_type__app_label="recruitment", content_type__model="stage"
@@ -60,8 +74,14 @@ def recruitment_delete(request, rec_id):
                         candidate_permission.id
                     )
         try:
+            if delete_post(recruitment_obj):
+                messages.success(request, _("Recruitment deleted successfully."))
+            else:
+                messages.info(
+                    request, _("Couldn’t delete the recruitment post from LinkedIn.")
+                )
             recruitment_obj.delete()
-            messages.success(request, _("Recruitment deleted successfully."))
+
         except ProtectedError as e:
             model_verbose_name_sets = set()
             for obj in e.protected_objects:
@@ -78,7 +98,14 @@ def recruitment_delete(request, rec_id):
         recruitment_obj = Recruitment.objects.all()
     except (Recruitment.DoesNotExist, OverflowError):
         messages.error(request, _("Recruitment Does not exists.."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        return HttpResponse(
+            "<script>"
+            "$('#applyFilter').click();"
+            "$('#reloadMessagesButton').click();"
+            "</script>"
+        )
+    return SolichRedirect(request)
 
 
 @login_required
@@ -90,7 +117,7 @@ def recruitment_delete_pipeline(request, rec_id):
     Args:
         id: recruitment instance id
     Returns:
-        HttpResponseRedirect: Used to refresh the page
+        SolichRedirect: Used to refresh the page
     """
     try:
         recruitment_obj = Recruitment.objects.get(id=rec_id)
@@ -107,7 +134,7 @@ def recruitment_delete_pipeline(request, rec_id):
             request,
             _("Recruitment already in use for {}.".format(models_verbose_name_str)),
         )
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -121,25 +148,32 @@ def note_delete(request, note_id):
         candidate_id = note.candidate_id.id
         note.delete()
         messages.success(request, _("Note deleted"))
+        script = ""
     except StageNote.DoesNotExist:
-        messages.error(request, _("Note not found."))
+        return SolichRedirect(request, message=_("Note not found."))
     except ProtectedError:
         messages.error(request, _("You cannot delete this note."))
+        script = f"""
+            <span hx-trigger='load' hx-get='/recruitment/view-note/{candidate_id}/' hx-target='#activitySidebar'></span>
+            """
+    return HttpResponse(script)
 
-    return redirect("view-note", cand_id=candidate_id)
 
-
-@login_required
-@manager_can_enter(perm="recruitment.delete_stagenote")
+@candidate_login_required
+@hx_request_required
+# @manager_can_enter(perm="recruitment.delete_stagenote")
 def note_delete_individual(request, note_id):
     """
     This method is used to delete the stage note
     """
-    note = StageNote.objects.get(id=note_id)
-    candidate_id = note.candidate_id.id
-    note.delete()
-    messages.success(request, _("Note deleted."))
-    return redirect(f"/recruitment/add-note/{candidate_id}/")
+    note = StageNote.find(note_id)
+    note.delete() if note else None
+    (
+        messages.success(request, _("Note deleted."))
+        if note
+        else messages.error(request, _("No Stage Note found matching the query."))
+    )
+    return HttpResponse("")
 
 
 @login_required
@@ -157,7 +191,7 @@ def stage_delete(request, stage_id):
             recruitment_id = stage_obj.recruitment_id.id
         except Stage.DoesNotExist:
             messages.error(request, _("Stage not found."))
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            return SolichRedirect(request)
 
         stage_managers = stage_obj.stage_managers.all()
         for manager in stage_managers:
@@ -167,7 +201,9 @@ def stage_delete(request, stage_id):
                 manager.employee_user_id.user_permissions.remove(view_recruitment.id)
             initial_stage_manager = all_this_manger.filter(stage_type="initial")
             if len(initial_stage_manager) == 1:
-                add_candidate = Permission.objects.get(codename="add_candidate")
+                add_candidate = Permission.objects.get(
+                    codename="recruitment.add_candidate"
+                )
                 change_candidate = Permission.objects.get(codename="change_candidate")
                 manager.employee_user_id.user_permissions.remove(add_candidate.id)
                 manager.employee_user_id.user_permissions.remove(change_candidate.id)
@@ -192,9 +228,18 @@ def stage_delete(request, stage_id):
         messages.error(request, _("Stage Does not exists.."))
     hx_request = request.META.get("HTTP_HX_REQUEST")
     hx_current_url = request.META.get("HTTP_HX_CURRENT_URL")
-    if hx_request and hx_request == "true" and "stage-view" in hx_current_url:
-        return redirect(f"/recruitment/stage-data/{recruitment_id}/")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if hx_request and hx_request == "true":
+        if hx_current_url and "stage-view" in hx_current_url:
+            return HttpResponse(
+                "<script>"
+                "$('#applyFilter').click();"
+                "$('#reloadMessagesButton').click();"
+                "</script>"
+            )
+        return HttpResponse(
+            "<script>" "$('#reloadMessagesButton').click();" "</script>"
+        )
+    return SolichRedirect(request)
 
 
 @login_required
@@ -227,7 +272,11 @@ def candidate_delete(request, cand_id):
             )
     except (Candidate.DoesNotExist, OverflowError):
         messages.error(request, _("Candidate Does not exists."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        response = HttpResponse(status=204)
+        response["HX-Trigger"] = "candidateContainerReload"
+        return response
+    return SolichRedirect(request)
 
 
 @login_required
@@ -264,13 +313,21 @@ def candidate_archive(request, cand_id):
     """
     try:
         candidate_obj = Candidate.objects.get(id=cand_id)
-        candidate_obj.is_active = not candidate_obj.is_active
-        candidate_obj.save()
-        message = _("archived") if not candidate_obj.is_active else _("un-archived")
+        new_state = not candidate_obj.is_active
+        # Use queryset .update() to bypass Candidate.save() validation
+        # (job_position_id checks against recruitment.open_positions), since
+        # archiving should only toggle is_active and not re-validate the
+        # candidate's recruitment data.
+        Candidate.objects.filter(id=cand_id).update(is_active=new_state)
+        message = _("archived") if not new_state else _("un-archived")
         messages.success(request, _("Candidate is %(message)s") % {"message": message})
     except (Candidate.DoesNotExist, OverflowError):
         messages.error(request, _("Candidate Does not exists."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if request.META.get("HTTP_HX_REQUEST") == "true":
+        response = HttpResponse(status=204)
+        response["HX-Trigger"] = "candidateContainerReload"
+        return response
+    return SolichRedirect(request)
 
 
 @login_required
@@ -288,9 +345,12 @@ def candidate_bulk_archive(request):
         is_active = False
         message = _("archived")
     for cand_id in ids:
-        candidate_obj = Candidate.objects.get(id=cand_id)
-        candidate_obj.is_active = is_active
-        candidate_obj.save()
+        candidate_obj = Candidate.objects.filter(id=cand_id).first()
+        if not candidate_obj:
+            messages.error(request, _("Candidate not found."))
+            continue
+        # Archive actions only need status flip; bypass model-level full save validation.
+        Candidate.objects.filter(id=cand_id).update(is_active=is_active)
         messages.success(
             request,
             _("{candidate} is {message}").format(
@@ -310,8 +370,15 @@ def remove_stage_manager(request, mid, sid):
         mid : manager_id in the stage
         sid : stage_id
     """
-    stage_obj = Stage.objects.get(id=sid)
-    manager = Employee.objects.get(id=mid)
+    stage_obj = Stage.find(sid)
+    manager = Employee.objects.filter(id=mid).first()
+    if not stage_obj or not manager:
+        return SolichRedirect(
+            request,
+            message=_("No %(model_name)s found matching the query.")
+            % {"model_name": "Stage" if not stage_obj else "Employee"},
+        )
+
     notify.send(
         request.user.employee_get,
         recipient=manager.employee_user_id,
@@ -379,12 +446,134 @@ def remove_recruitment_manager(request, mid, rid):
     )
     recruitment_queryset = Recruitment.objects.all()
     previous_data = request.GET.urlencode()
-    return render(
-        request,
-        "recruitment/recruitment_component.html",
-        {
-            "data": paginator_qry(recruitment_queryset, request.GET.get("page")),
-            "pd": previous_data,
-        },
+    return HttpResponse("<script> $('#applyFilter').click();</script>")
+
+    # return render(
+    #     request,
+    #     "recruitment/recruitment_component.html",
+    #     {
+    #         "data": paginator_qry(recruitment_queryset, request.GET.get("page")),
+    #         "pd": previous_data,
+    #     },
+    # )
+
+
+@login_required
+def get_template(request, obj_id=None):
+    """
+    This method is used to return the mail template
+    """
+    body = ""
+    if obj_id:
+        body = (
+            SolichMailTemplate.find(obj_id).body
+            if SolichMailTemplate.find(obj_id)
+            else None
+        )
+        if not body:
+            return JsonResponse({"body": None})
+
+        template_bdy = template.Template(body)
+    if request.GET.get("word"):
+        word = request.GET.get("word")
+        template_bdy = template.Template("{{" + word + "}}")
+    candidate_id = request.GET.get("candidate_id")
+    if candidate_id:
+        candidate_obj = Candidate.objects.get(id=candidate_id)
+        context = template.Context(
+            {"instance": candidate_obj, "self": request.user.employee_get}
+        )
+        # body = template_bdy.render(context) or " "
+    return JsonResponse({"body": body})
+
+
+@login_required
+@permission_required("recruitment.view_candidate")
+def get_template_hint(request, obj_id=None):
+    """
+    This method is used to return the mail template
+    """
+    body = " "
+    template_bdy = None
+    allowed_template_words = set(MailTemplateForm().get_template_language().values())
+    if obj_id:
+        body = SolichMailTemplate.objects.get(id=obj_id).body
+        template_bdy = template.Template(sanitize_mail_template_body(body))
+    if request.GET.get("word"):
+        word = request.GET.get("word").strip()
+        # Allow only known template placeholders used by the editor hints.
+        # This prevents arbitrary attribute traversal through user input.
+        sanitized_word_template = sanitize_mail_template_body("{{" + word + "}}")
+        if word in allowed_template_words and sanitized_word_template.strip():
+            template_bdy = template.Template(sanitized_word_template)
+    candidate_id = request.GET.get("candidate_id")
+    if candidate_id and template_bdy is not None:
+        candidate_qs = Candidate.objects.filter(id=candidate_id)
+        if not request.user.has_perm("recruitment.view_candidate"):
+            employee = request.user.employee_get
+            candidate_qs = candidate_qs.filter(
+                Q(recruitment_id__recruitment_managers=employee)
+                | Q(stage_id__stage_managers=employee)
+            )
+        candidate_obj = candidate_qs.first()
+        if not candidate_obj:
+            return JsonResponse({"body": " "}, status=404)
+        context = template.Context(
+            {"instance": candidate_obj, "self": request.user.employee_get}
+        )
+        body = template_bdy.render(context) or " "
+    return JsonResponse({"body": body})
+
+
+@login_required
+def get_mail_preview(request):
+    """
+    Returns the mail template preview as HTML.
+    """
+    body = request.POST.get("body")
+    if not body:
+        return HttpResponse("No body provided", status=400)
+
+    # Strip dangerous template constructs first.
+    body = sanitize_mail_template_body(body)
+    allowed_template_words = set(MailTemplateForm().get_template_language().values())
+    body = sanitize_mail_template_placeholders(body, allowed_template_words)
+
+    candidate_id = request.GET.get("candidate_id")
+    candidate_ids = request.POST.getlist("candidates")  # 875
+
+    # Fetch one candidate for preview if provided
+    candidate_obj = None
+    if candidate_id or candidate_ids:
+        ids = [candidate_id] if candidate_id else candidate_ids
+        candidate_obj = Candidate.objects.filter(id__in=ids).first()
+        if not candidate_obj:
+            return HttpResponse("Candidate not found", status=404)
+
+    # Keep `request` in context, but only as a sanitized proxy.
+    context = {
+        "instance": candidate_obj,
+        "model_instance": candidate_obj,
+        "self": getattr(request.user, "employee_get", None),
+        "request": build_safe_template_request(request),
+    }
+
+    # Render template
+    rendered_body = template.Template(body).render(template.Context(context)) or " "
+
+    # Add preview note if multiple candidates
+    if candidate_ids and len(candidate_ids) > 1 and candidate_obj:
+        rendered_body = (
+            f"<p style='color:gray; font-size:13px;'>"
+            f"Preview shown for {candidate_obj.name}. "
+            f"Mail will be personalized for {len(candidate_ids)} candidates."
+            f"</p>{rendered_body}"
+        )
+
+    # Wrap in styled div
+    textarea_field = (
+        f'<div class="oh-input oh-input--textarea" '
+        f'style="border: solid .1px #dbd7d7; padding:5px;">{rendered_body}</div>'
     )
 
+    return HttpResponse(textarea_field, content_type="text/html")

@@ -131,9 +131,9 @@
                                                             class="oh-btn oh-btn--light-bkg w-50"
                                                             title="{% trans 'Edit' %}"
                                                             data-toggle="oh-modal-toggle"
-                                                            data-target="#objectDetailsModal"
+                                                            data-target="#genericModal"
                                                             hx-get='{% url "employee-key-result-update" kr.id %}'
-                                                            hx-target="#objectDetailsModalTarget"
+                                                            hx-target="#genericModalBody"
                                                         >
                                                             <ion-icon name="create-outline"></ion-icon>
                                                         </button>
@@ -153,7 +153,7 @@
                                                                     class="me-1 md hydrated"
                                                                     name="trash-outline"
                                                                     role="img"
-                                                                    aria-label="trash outline"
+                                                                    aria-label="{% trans 'trash outline' %}"
                                                                 ></ion-icon>
                                                             </button>
                                                         </form>
@@ -245,12 +245,11 @@
         var numericValue = parseFloat(targetValue.replace(/[^\d.]/g, ''));
         var prgressPercentage = parseInt( currentValue*100/numericValue )
         // Ensure totalProgress doesn't exceed 100
-        if (prgressPercentage > 100) {
-            prgressPercentage = 100;
+        if (prgressPercentage < 0) {
             Swal.fire({
                 icon: 'error',
                 title: 'Oops...',
-                text: 'Current Value cannot exceed target value!',
+                text: 'Current Value Cannot be -ve',
                 timer: 3000, // Display the alert for 3 seconds
                 timerProgressBar: true, // Show the progress bar
                 showConfirmButton: false // Hide the "OK" button
@@ -284,7 +283,7 @@
                 if (totalProgress > 100) {
                     totalProgress = 100;
                 }
-                objectiveProgressContainer = $(element).closest('.oh-accordion-meta__item').find('.progress_barmm');
+                objectiveProgressContainer = $(element).closest('.oh-accordion-meta__item').find('.progress_bar_objective');
                 objectiveProgressContainer.html(
                     '<div class="oh-progress" role="progressbar">'+
                     '<div class="oh-progress__bar oh-progress__bar--secondary" style="width: calc('+ totalProgress + '%)"></div>' +

@@ -11,11 +11,12 @@ import uuid
 
 import django_filters
 from django import forms
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 
 from base.filters import FilterSet
 from employee.models import Employee
-from solich.filters import filter_by_name
+from solich.filters import SolichFilterSet, filter_by_name
 from payroll.models.models import (
     Allowance,
     Contract,
@@ -23,11 +24,13 @@ from payroll.models.models import (
     FilingStatus,
     LoanAccount,
     Payslip,
+    PayslipAutoGenerate,
     Reimbursement,
 )
+from payroll.models.tax_models import TaxBracket
 
 
-class ContractFilter(FilterSet):
+class ContractFilter(SolichFilterSet):
     """
     Filter set class for Contract model
 
@@ -36,14 +39,6 @@ class ContractFilter(FilterSet):
     """
 
     search = django_filters.CharFilter(method="filter_by_contract")
-    contract_start_date = django_filters.DateFilter(
-        field_name="contract_start_date",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-    contract_end_date = django_filters.DateFilter(
-        field_name="contract_end_date",
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
     contract_start_date_from = django_filters.DateFilter(
         widget=forms.DateInput(attrs={"type": "date"}),
         field_name="contract_start_date",
@@ -76,8 +71,6 @@ class ContractFilter(FilterSet):
         fields = [
             "employee_id",
             "contract_name",
-            "contract_start_date",
-            "contract_end_date",
             "wage_type",
             "filing_status",
             "employee_id__employee_work_info__company_id",
@@ -123,7 +116,7 @@ class ContractFilter(FilterSet):
         return queryset
 
 
-class AllowanceFilter(FilterSet):
+class AllowanceFilter(SolichFilterSet):
     """
     Filter set class for Allowance model.
     """
@@ -172,7 +165,7 @@ class AllowanceFilter(FilterSet):
         return queryset.distinct()
 
 
-class DeductionFilter(FilterSet):
+class DeductionFilter(SolichFilterSet):
     """
     Filter set class for Deduction model.
     """
@@ -221,7 +214,7 @@ class DeductionFilter(FilterSet):
         return queryset.distinct()
 
 
-class PayslipFilter(FilterSet):
+class PayslipFilter(SolichFilterSet):
     """
     Filter set class for payslip model.
     """
@@ -230,12 +223,6 @@ class PayslipFilter(FilterSet):
     employee_id = django_filters.ModelMultipleChoiceFilter(
         queryset=Employee.objects.all(),
         widget=forms.SelectMultiple(),
-    )
-    start_date = django_filters.DateFilter(
-        widget=forms.DateInput(attrs={"type": "date"}),
-    )
-    end_date = django_filters.DateFilter(
-        widget=forms.DateInput(attrs={"type": "date"}),
     )
     start_date_from = django_filters.DateFilter(
         widget=forms.DateInput(attrs={"type": "date"}),
@@ -272,12 +259,32 @@ class PayslipFilter(FilterSet):
     net_pay__lte = django_filters.NumberFilter(field_name="net_pay", lookup_expr="lte")
     net_pay__gte = django_filters.NumberFilter(field_name="net_pay", lookup_expr="gte")
 
+    department_id = django_filters.CharFilter(
+        field_name="employee_id__employee_work_info__department_id",
+        lookup_expr="icontains",
+    )
     department = django_filters.CharFilter(
         field_name="employee_id__employee_work_info__department_id__department",
         lookup_expr="icontains",
     )
     month = django_filters.CharFilter(field_name="start_date", lookup_expr="month")
     year = django_filters.CharFilter(field_name="start_date", lookup_expr="year")
+
+    allowance_title = django_filters.CharFilter(
+        method="filter_by_allowance_title", label="Allowance Title"
+    )
+    allowance_amount_gte = django_filters.NumberFilter(
+        method="filter_by_allowance_amount_gte"
+    )
+    allowance_amount_lte = django_filters.NumberFilter(
+        method="filter_by_allowance_amount_lte"
+    )
+    deduction_amount_gte = django_filters.NumberFilter(
+        method="filter_by_deduction_amount_gte"
+    )
+    deduction_amount_lte = django_filters.NumberFilter(
+        method="filter_by_deduction_amount_lte"
+    )
 
     class Meta:
         """
@@ -287,8 +294,6 @@ class PayslipFilter(FilterSet):
         model = Payslip
         fields = [
             "employee_id",
-            "start_date",
-            "end_date",
             "group_name",
             "status",
             "gross_pay__lte",
@@ -298,7 +303,81 @@ class PayslipFilter(FilterSet):
             "net_pay__lte",
             "net_pay__gte",
             "sent_to_employee",
+            "allowance_amount_gte",
+            "allowance_amount_lte",
+            "deduction_amount_gte",
+            "deduction_amount_lte",
         ]
+
+    def filter_by_allowance_amount_gte(self, queryset, name, value):
+        return queryset.filter(
+            id__in=[
+                p.id
+                for p in queryset
+                if any(
+                    float(allowance.get("amount", 0)) >= float(value)
+                    for allowance in (p.pay_head_data or {}).get("allowances", [])
+                )
+            ]
+        )
+
+    def filter_by_allowance_amount_lte(self, queryset, name, value):
+        return queryset.filter(
+            id__in=[
+                p.id
+                for p in queryset
+                if all(
+                    float(allowance.get("amount", 0)) <= float(value)
+                    for allowance in (p.pay_head_data or {}).get("allowances", [])
+                )
+            ]
+        )
+
+    def filter_by_deduction_amount_lte(self, queryset, name, value):
+        value = float(value)
+        deduction_keys = [
+            "pretax_deductions",
+            "gross_pay_deductions",
+            "basic_pay_deductions",
+            "post_tax_deductions",
+            "tax_deductions",
+            "net_deductions",
+        ]
+
+        return queryset.filter(
+            id__in=[
+                p.id
+                for p in queryset
+                if all(
+                    float(d.get("amount", 0)) <= value
+                    for key in deduction_keys
+                    for d in (p.pay_head_data or {}).get(key, [])
+                )
+            ]
+        )
+
+    def filter_by_deduction_amount_gte(self, queryset, name, value):
+        value = float(value)
+        deduction_keys = [
+            "pretax_deductions",
+            "gross_pay_deductions",
+            "basic_pay_deductions",
+            "post_tax_deductions",
+            "tax_deductions",
+            "net_deductions",
+        ]
+
+        return queryset.filter(
+            id__in=[
+                p.id
+                for p in queryset
+                if any(
+                    float(d.get("amount", 0)) >= value
+                    for key in deduction_keys
+                    for d in (p.pay_head_data or {}).get(key, [])
+                )
+            ]
+        )
 
     def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
         super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
@@ -306,17 +385,35 @@ class PayslipFilter(FilterSet):
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
 
 
-class LoanAccountFilter(FilterSet):
+class LoanAccountFilter(SolichFilterSet):
     """
     LoanAccountFilter
     """
 
-    search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+    # search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+    search = django_filters.CharFilter(method="filter_by_search")
     search_employee = django_filters.CharFilter(method=filter_by_name)
     provided_date = django_filters.DateFilter(
         widget=forms.DateInput(attrs={"type": "date"}),
         field_name="provided_date",
     )
+    from_date = django_filters.DateFilter(
+        widget=forms.DateInput(attrs={"type": "date"}),
+        field_name="provided_date",
+        lookup_expr="gte",
+    )
+    to_date = django_filters.DateFilter(
+        widget=forms.DateInput(attrs={"type": "date"}),
+        field_name="provided_date",
+        lookup_expr="lte",
+    )
+
+    def filter_by_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(title__icontains=value)
+            | Q(employee_id__employee_first_name__icontains=value)
+            | Q(employee_id__employee_last_name__icontains=value)
+        )
 
     class Meta:
         model = LoanAccount
@@ -333,12 +430,13 @@ class LoanAccountFilter(FilterSet):
         ]
 
 
-class ReimbursementFilter(FilterSet):
+class ReimbursementFilter(SolichFilterSet):
     """
     ReimbursementFilter
     """
 
-    search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+    # search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+    search = django_filters.CharFilter(method="search_method")
 
     class Meta:
         model = Reimbursement
@@ -352,6 +450,56 @@ class ReimbursementFilter(FilterSet):
             "employee_id__employee_work_info__job_position_id",
             "employee_id__employee_work_info__reporting_manager_id",
         ]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return (
+            (queryset.filter(employee_id__employee_first_name__icontains=value))
+            | queryset.filter(title__icontains=value)
+        ).distinct()
+
+
+class TaxBracketFilter(SolichFilterSet):
+    """
+    Filter set class for TaxBracket model.
+    """
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = TaxBracket
+        fields = "__all__"
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return (
+            queryset.filter(filing_status_id__filing_status__icontains=value)
+        ).distinct()
+
+
+class FilingStatusFilter(SolichFilterSet):
+    """
+    Filter set class for TaxBracket model.
+    """
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = FilingStatus
+        fields = "__all__"
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return (queryset.filter(filing_status__icontains=value)).distinct()
 
 
 class ContractReGroup:
@@ -397,3 +545,18 @@ class PayslipReGroup:
         ("employee_id__employee_work_info__company_id", _("Company")),
     ]
 
+
+class PayslipAutoGenerateFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = PayslipAutoGenerate
+        fields = ["company_id"]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return ((queryset.filter(company_id__company__icontains=value))).distinct()

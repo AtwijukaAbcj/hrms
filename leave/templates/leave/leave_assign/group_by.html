@@ -1,4 +1,4 @@
-{% load attendancefilters %} {% load basefilters %} {% load static %}
+{% load solichfilters %} {% load basefilters %} {% load static %}
 {% load i18n %} {% include 'filter_tags.html' %} {% if messages %}
 <div class="oh-wrapper">
   {% for message in messages %}
@@ -105,7 +105,7 @@
                         <img
                           src="{{available_leave.employee_id.get_avatar}}"
                           class="oh-profile__image"
-                          alt="Mary Magdalene"
+                          alt="{{ available_leave.employee_id }}"
                         />
                       </div>
                       <span class="oh-profile__name oh-text--dark"
@@ -117,13 +117,21 @@
                     {{available_leave.leave_type_id}}
                   </div>
                   <div class="oh-sticky-table__td">
-                    {{available_leave.available_days}}
+                    {% if available_leave.leave_type_id.limit_leave %}
+                      {{available_leave.available_days}}
+                    {% else %}
+                      {% trans "No Limit" %}
+                    {% endif %}
                   </div>
                   <div class="oh-sticky-table__td">
                     {{available_leave.carryforward_days}}
                   </div>
                   <div class="oh-sticky-table__td">
-                    {{available_leave.total_leave_days}}
+                    {% if available_leave.leave_type_id.limit_leave %}
+                      {{available_leave.total_leave_days}}
+                    {% else %}
+                      {% trans "No Limit" %}
+                    {% endif %}
                   </div>
                   <div class="oh-sticky-table__td">
                     {{available_leave.leave_taken}}
@@ -145,13 +153,14 @@
                         data-target="#objectUpdateModal"
                         hx-get="{% url 'available-leave-update' available_leave.id %}?{{pd}}"
                         hx-target="#objectUpdateModalTarget"
+                        hx-on:click="$('#objectUpdateModalTarget').css('max-width', '350px');"
                       >
                         <ion-icon name="create-outline"></ion-icon>
                       </button>
                       {% endif %}
                       {% if perms.leave.delete_availableleave or request.user|is_reportingmanager %}
                       <a
-                        class="oh-btn oh-btn--danger-outline oh-btn--light-bkg w-100"
+                        class="oh-btn oh-btn--danger w-100"
                         hx-confirm="{% trans 'Are you sure you want to delete ?' %}"
                         id="delete-link"
                         hx-post="{% url 'assign-delete' available_leave.id %}?{{pd}}"
@@ -184,7 +193,7 @@
                 class="oh-pagination__input"
                 value="{{assigned_leaves.list.number}}"
                 hx-get="{% url 'assign-filter' %}?{{pd}}"
-                hx-target="#ot-table"
+                hx-target="#assignedLeaves"
                 min="1"
               />
               <span class="oh-pagination__label"
@@ -196,7 +205,7 @@
               {% if assigned_leaves.list.has_previous %}
               <li class="oh-pagination__item oh-pagination__item--wide">
                 <a
-                  hx-target="#ot-table"
+                  hx-target="#assignedLeaves"
                   hx-get="{% url 'assign-filter' %}?{{pd}}&{{assigned_leaves.dynamic_name}}=1"
                   class="oh-pagination__link"
                   >{% trans "First" %}</a
@@ -204,7 +213,7 @@
               </li>
               <li class="oh-pagination__item oh-pagination__item--wide">
                 <a
-                  hx-target="#ot-table"
+                  hx-target="#assignedLeaves"
                   hx-get="{% url 'assign-filter' %}?{{pd}}&{{assigned_leaves.dynamic_name}}={{ assigned_leaves.list.previous_page_number }}"
                   class="oh-pagination__link"
                   >{% trans "Previous" %}</a
@@ -213,7 +222,7 @@
               {% endif %} {% if assigned_leaves.list.has_next %}
               <li class="oh-pagination__item oh-pagination__item--wide">
                 <a
-                  hx-target="#ot-table"
+                  hx-target="#assignedLeaves"
                   hx-get="{% url 'assign-filter' %}?{{pd}}&{{assigned_leaves.dynamic_name}}={{ assigned_leaves.list.next_page_number }}"
                   class="oh-pagination__link"
                   >{% trans "Next" %}</a
@@ -221,7 +230,7 @@
               </li>
               <li class="oh-pagination__item oh-pagination__item--wide">
                 <a
-                  hx-target="#ot-table"
+                  hx-target="#assignedLeaves"
                   hx-get="{% url 'assign-filter' %}?{{pd}}&{{assigned_leaves.dynamic_name}}={{ assigned_leaves.list.paginator.num_pages }}"
                   class="oh-pagination__link"
                   >{% trans "Last" %}</a

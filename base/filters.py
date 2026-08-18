@@ -7,18 +7,38 @@ import uuid
 
 import django_filters
 from django import forms
-from django_filters import CharFilter
+from django.db.models import Q
+from django.utils.translation import gettext as __
+from django_filters import CharFilter, DateFilter, FilterSet, filters
 
 from base.models import (
+    Announcement,
+    AnnouncementView,
+    Company,
+    CompanyLeaves,
+    Department,
+    DynamicEmailConfiguration,
+    EmailLog,
+    EmployeeShift,
+    EmployeeShiftSchedule,
+    EmployeeType,
+    Holidays,
+    JobPosition,
+    MultipleApprovalCondition,
+    PenaltyAccounts,
+    Roster,
+    RotatingShift,
     RotatingShiftAssign,
+    RotatingWorkType,
     RotatingWorkTypeAssign,
     ShiftRequest,
+    WorkType,
     WorkTypeRequest,
 )
-from solich.filters import FilterSet, filter_by_name
+from solich.filters import FilterSet, SolichFilterSet, filter_by_name
 
 
-class ShiftRequestFilter(FilterSet):
+class ShiftRequestFilter(SolichFilterSet):
     """
     Custom filter for Shift Requests.
     """
@@ -37,6 +57,10 @@ class ShiftRequestFilter(FilterSet):
         widget=forms.DateInput(attrs={"type": "date"}),
     )
     search = CharFilter(method=filter_by_name)
+
+    requested = django_filters.BooleanFilter(
+        method="filter_requested", label="Requested?"
+    )
 
     class Meta:
         """
@@ -73,8 +97,16 @@ class ShiftRequestFilter(FilterSet):
         for field in self.form.fields.keys():
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
 
+    def filter_requested(self, queryset, name, value):
+        """
+        Filters the queryset to return entries where 'approved' is False and 'canceled' is False.
+        """
+        if value:
+            return queryset.filter(approved=False, canceled=False)
+        return queryset
 
-class WorkTypeRequestFilter(FilterSet):
+
+class WorkTypeRequestFilter(SolichFilterSet):
     """
     Custom filter for Work Type Requests.
     """
@@ -91,6 +123,9 @@ class WorkTypeRequestFilter(FilterSet):
         field_name="requested_till",
         lookup_expr="lte",
         widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    requested = django_filters.BooleanFilter(
+        method="filter_by_requested", label="Requested"
     )
     search = CharFilter(method=filter_by_name)
 
@@ -128,8 +163,16 @@ class WorkTypeRequestFilter(FilterSet):
         for field in self.form.fields.keys():
             self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
 
+    def filter_by_requested(self, queryset, name, value):
+        """
+        Filters the queryset to return entries where 'approved' is False and 'canceled' is False.
+        """
+        if value:
+            return queryset.filter(approved=False, canceled=False)
+        return queryset
 
-class RotatingShiftAssignFilters(FilterSet):
+
+class RotatingShiftAssignFilters(SolichFilterSet):
     """
     Custom filter for Rotating Shift Assign.
     """
@@ -173,7 +216,7 @@ class RotatingShiftAssignFilters(FilterSet):
         ]
 
 
-class RotatingWorkTypeAssignFilter(FilterSet):
+class RotatingWorkTypeAssignFilter(SolichFilterSet):
     """
     Custom filter for Rotating Work Type Assign.
     """
@@ -280,3 +323,356 @@ class RotatingShiftRequestReGroup:
         ("employee_id__employee_work_info__reporting_manager_id", "Reporting Manager"),
     ]
 
+
+class MultipleApprovalConditionFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = MultipleApprovalCondition
+        fields = [
+            "department",
+        ]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search department
+        """
+
+        return (queryset.filter(department__department__icontains=value)).distinct()
+
+
+class EmployeeShiftFilter(FilterSet):
+
+    search = django_filters.CharFilter(
+        field_name="employee_shift", lookup_expr="icontains"
+    )
+
+    class Meta:
+        model = EmployeeShift
+        fields = [
+            "employee_shift",
+        ]
+
+
+class EmployeeShiftScheduleFilter(FilterSet):
+
+    search = django_filters.CharFilter(field_name="day__day", lookup_expr="icontains")
+
+    class Meta:
+        model = EmployeeShiftSchedule
+        fields = []
+
+
+class RotatingShiftFilter(SolichFilterSet):
+
+    # search = django_filters.CharFilter(
+    #     field_name="name", lookup_expr="icontains"
+    # )
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = RotatingShift
+        fields = ["name", "shift1", "shift2"]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return (
+            queryset.filter(name__icontains=value)
+            | queryset.filter(shift1__employee_shift__icontains=value)
+            | queryset.filter(shift2__employee_shift__icontains=value)
+        ).distinct()
+
+
+class DepartmentViewFilter(SolichFilterSet):
+    search = django_filters.CharFilter(method="filter_by_all_fields")
+
+    class Meta:
+        model = Department
+        fields = [
+            "department",
+        ]
+
+    def filter_by_all_fields(self, queryset, name, value):
+        return queryset.filter(
+            Q(department__icontains=value)
+            | Q(job_position__job_position__icontains=value)
+        ).distinct()
+
+
+class WorkTypeFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(field_name="work_type", lookup_expr="icontains")
+
+    class Meta:
+        model = WorkType
+        fields = [
+            "work_type",
+        ]
+
+
+class RotatingWorkTypeFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(method="search_method")
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search employees and objective
+        """
+
+        return (
+            queryset.filter(name__icontains=value)
+            | queryset.filter(work_type1__work_type__icontains=value)
+            | queryset.filter(work_type2__work_type__icontains=value)
+        ).distinct()
+
+    class Meta:
+        model = RotatingWorkType
+        fields = ["name", "work_type1", "work_type2"]
+
+
+class EmployeeTypeFilter(FilterSet):
+
+    search = django_filters.CharFilter(
+        field_name="employee_type", lookup_expr="icontains"
+    )
+
+    class Meta:
+        model = EmployeeType
+        fields = [
+            "employee_type",
+        ]
+
+
+class JobRoleFilter(SolichFilterSet):
+    search = django_filters.CharFilter(method="filter_by_all_fields")
+
+    class Meta:
+        model = JobPosition
+        fields = [
+            "job_position",
+        ]
+
+    def filter_by_all_fields(self, queryset, name, value):
+        return queryset.filter(
+            Q(job_position__icontains=value) | Q(jobrole__job_role__icontains=value)
+        ).distinct()
+
+
+class CompanyFilter(FilterSet):
+
+    search = CharFilter(method="search_method")
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search company and objective
+        """
+
+        return (
+            queryset.filter(company__icontains=value)
+            | queryset.filter(hq__icontains=value)
+            | queryset.filter(address__icontains=value)
+            | queryset.filter(country__icontains=value)
+            | queryset.filter(state__icontains=value)
+            | queryset.filter(city__icontains=value)
+            | queryset.filter(zip__icontains=value)
+        ).distinct()
+
+    class Meta:
+        model = Company
+        fields = ["company", "hq", "address", "country", "state", "city", "zip"]
+
+
+class MailServerFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = DynamicEmailConfiguration
+        fields = ["username"]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to mail server
+        """
+
+        return ((queryset.filter(username__icontains=value))).distinct()
+
+
+class HolidayFilter(SolichFilterSet):
+    """
+    Filter class for Holidays model.
+
+    This filter allows searching Holidays objects based on name and date range.
+    """
+
+    search = filters.CharFilter(field_name="name", lookup_expr="icontains")
+    from_date = DateFilter(
+        field_name="start_date",
+        lookup_expr="gte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    to_date = DateFilter(
+        field_name="end_date",
+        lookup_expr="lte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+
+    class Meta:
+        """
+        Meta class defines the model and fields to filter
+        """
+
+        model = Holidays
+        fields = {
+            "recurring": ["exact"],
+        }
+
+    def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
+        super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
+        for field in self.form.fields.keys():
+            self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
+        self.form.fields["from_date"].label = (
+            f"{self.Meta.model()._meta.get_field('start_date').verbose_name} From"
+        )
+        self.form.fields["to_date"].label = (
+            f"{self.Meta.model()._meta.get_field('end_date').verbose_name} Till"
+        )
+
+
+class CompanyLeaveFilter(SolichFilterSet):
+    """
+    Filter class for CompanyLeaves model.
+
+    This filter allows searching CompanyLeaves objects based on
+    name, week day and based_on_week choices.
+    """
+
+    name = filters.CharFilter(field_name="based_on_week_day", lookup_expr="icontains")
+    search = filters.CharFilter(method="filter_week_day")
+
+    class Meta:
+        """ "
+        Meta class defines the model and fields to filter
+        """
+
+        model = CompanyLeaves
+        fields = {
+            "based_on_week": ["exact"],
+            "based_on_week_day": ["exact"],
+        }
+
+    def filter_week_day(self, queryset, _, value):
+        week_qry = CompanyLeaves.objects.none()
+        weekday_values = []
+        week_values = []
+        WEEK_DAYS = [
+            ("0", __("Monday")),
+            ("1", __("Tuesday")),
+            ("2", __("Wednesday")),
+            ("3", __("Thursday")),
+            ("4", __("Friday")),
+            ("5", __("Saturday")),
+            ("6", __("Sunday")),
+        ]
+        WEEKS = [
+            (None, __("All")),
+            ("0", __("First Week")),
+            ("1", __("Second Week")),
+            ("2", __("Third Week")),
+            ("3", __("Fourth Week")),
+            ("4", __("Fifth Week")),
+        ]
+
+        for day_value, day_name in WEEK_DAYS:
+            if value.lower() in day_name.lower():
+                weekday_values.append(day_value)
+        for day_value, day_name in WEEKS:
+            if value.lower() in day_name.lower() and value.lower() != __("All").lower():
+                week_values.append(day_value)
+                week_qry = queryset.filter(based_on_week__in=week_values)
+            elif value.lower() in __("All").lower():
+                week_qry = queryset.filter(based_on_week__isnull=True)
+        return queryset.filter(based_on_week_day__in=weekday_values) | week_qry
+
+
+class PenaltyFilter(FilterSet):
+    """
+    PenaltyFilter
+    """
+
+    class Meta:
+        model = PenaltyAccounts
+        fields = "__all__"
+
+
+class MailLogFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(field_name="subject", lookup_expr="icontains")
+
+    class Meta:
+        model = EmailLog
+        fields = "__all__"
+
+
+class AnnouncementFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+
+    class Meta:
+        model = Announcement
+        fields = "__all__"
+
+
+class AnnouncementViewFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(
+        field_name="announcement", lookup_expr="icontains"
+    )
+
+    class Meta:
+        model = AnnouncementView
+        fields = "__all__"
+
+
+# ---------------------------------------------------------------------------
+# Roster Filter
+# ---------------------------------------------------------------------------
+
+
+class RosterFilter(django_filters.FilterSet):
+    """
+    Filters the Roster queryset by department and date range.
+    """
+
+    department = django_filters.ModelChoiceFilter(
+        queryset=None,
+        label="Department",
+        widget=forms.Select(attrs={"class": "oh-select oh-select-2 w-100"}),
+    )
+    from_date = django_filters.DateFilter(
+        field_name="date",
+        lookup_expr="gte",
+        label="From Date",
+        widget=forms.DateInput(attrs={"type": "date", "class": "oh-input w-100"}),
+    )
+    to_date = django_filters.DateFilter(
+        field_name="date",
+        lookup_expr="lte",
+        label="To Date",
+        widget=forms.DateInput(attrs={"type": "date", "class": "oh-input w-100"}),
+    )
+    search = django_filters.CharFilter(method=filter_by_name)
+
+    class Meta:
+        model = Roster
+        fields = ["department", "from_date", "to_date"]
+
+    def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
+        super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
+        from base.models import Department
+
+        self.form.fields["department"].queryset = Department.objects.all()

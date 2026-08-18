@@ -6,4 +6,3 @@ try:
         enabled_restriction = EmployeePastLeaveRestrict.objects.create(enabled=True)
 except:
     pass
-

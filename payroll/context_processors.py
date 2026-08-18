@@ -16,9 +16,14 @@ def default_currency(request):
     if models.PayrollSettings.objects.first() is None:
         settings = models.PayrollSettings()
         settings.currency_symbol = "$"
+        settings.company_id = getattr(request, "selected_company_instance", None)
         settings.save()
     symbol = models.PayrollSettings.objects.first().currency_symbol
-    return {"currency": request.session.get("currency", symbol)}
+    position = models.PayrollSettings.objects.first().position
+    return {
+        "currency": request.session.get("currency", symbol),
+        "position": request.session.get("position", position),
+    }
 
 
 def host(request):
@@ -47,4 +52,3 @@ def get_active_employees(request):
         is_active=True, contract_set__isnull=False, payslip__isnull=False
     ).distinct()
     return {"get_active_employees": employees}
-

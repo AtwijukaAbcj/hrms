@@ -30,5 +30,4 @@ def dynamic_tag(request):
     return JsonResponse({"id": title[0].id})
 
 
-urlpatterns.append(path("Solich-audit-log", dynamic_tag, name="Solich-audit-log"))
-
+urlpatterns.append(path("solich-audit-log", dynamic_tag, name="solich-audit-log"))

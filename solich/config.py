@@ -1,5 +1,5 @@
 """
-Solich/config.py
+solich/config.py
 
 Solich app configurations
 """
@@ -7,16 +7,15 @@ Solich app configurations
 import importlib
 import logging
 
+from django.apps import apps
 from django.conf import settings
 from django.contrib.auth.context_processors import PermWrapper
-
-from .solich_apps import SIDEBARS
 
 logger = logging.getLogger(__name__)
 
 
 def get_apps_in_base_dir():
-    return SIDEBARS
+    return settings.SIDEBARS
 
 
 def import_method(accessibility):
@@ -38,51 +37,88 @@ def sidebar(request):
         MENUS = request.MENUS
 
         for app in base_dir_apps:
+            if apps.is_installed(app):
+                try:
+                    sidebar = importlib.import_module(app + ".sidebar")
 
-            try:
-                sidebar = importlib.import_module(app + ".sidebar")
+                except Exception as e:
+                    logger.error(e)
+                    continue
 
-            except Exception as e:
-                logger.error(e)
-                continue
+                if sidebar:
+                    accessibility = None
+                    if getattr(sidebar, "ACCESSIBILITY", None):
+                        accessibility = import_method(sidebar.ACCESSIBILITY)
 
-            if sidebar:
-                accessibility = None
-                if getattr(sidebar, "ACCESSIBILITY", None):
-                    accessibility = import_method(sidebar.ACCESSIBILITY)
-
-                if not accessibility or accessibility(
-                    request,
-                    sidebar.MENU,
-                    PermWrapper(request.user),
-                ):
-                    MENU = {}
-                    MENU["menu"] = sidebar.MENU
-                    MENU["app"] = app
-                    MENU["img_src"] = sidebar.IMG_SRC
-                    MENU["submenu"] = []
-                    MENUS.append(MENU)
-                    for submenu in sidebar.SUBMENUS:
-
-                        accessibility = None
-
-                        if submenu.get("accessibility"):
-                            accessibility = import_method(submenu["accessibility"])
-                        redirect: str = submenu["redirect"]
-                        redirect = redirect.split("?")
-                        submenu["redirect"] = redirect[0]
-
-                        if not accessibility or accessibility(
+                    if hasattr(sidebar, "MENU") and (
+                        not accessibility
+                        or accessibility(
                             request,
-                            submenu,
+                            sidebar.MENU,
                             PermWrapper(request.user),
-                        ):
-                            MENU["submenu"].append(submenu)
+                        )
+                    ):
+                        MENU = {}
+                        MENU["menu"] = sidebar.MENU
+                        MENU["app"] = app
+                        MENU["img_src"] = sidebar.IMG_SRC
+                        MENU["submenu"] = []
+                        MENUS.append(MENU)
+                        for submenu in sidebar.SUBMENUS:
+
+                            accessibility = None
+
+                            if submenu.get("accessibility"):
+                                accessibility = import_method(submenu["accessibility"])
+                            redirect: str = submenu["redirect"]
+                            redirect = redirect.split("?")
+                            submenu["redirect"] = redirect[0]
+
+                            if not accessibility or accessibility(
+                                request,
+                                submenu,
+                                PermWrapper(request.user),
+                            ):
+                                MENU["submenu"].append(submenu)
         ALL_MENUS[request.session.session_key] = MENUS
 
 
 def get_MENUS(request):
+    # Rebuild at most once per request — accessibility checks hit the DB.
+    cached = getattr(request, "_solich_menus", None)
+    if cached is not None:
+        return {"sidebar": cached}
     ALL_MENUS[request.session.session_key] = []
     sidebar(request)
-    return {"sidebar": ALL_MENUS.get(request.session.session_key)}
+    menus = ALL_MENUS.get(request.session.session_key)
+    request._solich_menus = menus
+    return {"sidebar": menus}
 
+
+def load_ldap_settings():
+    """
+    Fetch LDAP settings dynamically from the database after Django is ready.
+    """
+    try:
+        from django.db import connection
+
+        from solich_ldap.models import LDAPSettings
+
+        # Ensure DB is ready before querying
+        if not connection.introspection.table_names():
+            print("⚠️ Database is empty. Using default LDAP settings.")
+            return settings.DEFAULT_LDAP_CONFIG
+
+        ldap_config = LDAPSettings.objects.first()
+        if ldap_config:
+            return {
+                "LDAP_SERVER": ldap_config.ldap_server,
+                "BIND_DN": ldap_config.bind_dn,
+                "BIND_PASSWORD": ldap_config.bind_password,
+                "BASE_DN": ldap_config.base_dn,
+            }
+    except Exception as e:
+        print(f"⚠️ Warning: Could not load LDAP settings ({e})")
+        return settings.DEFAULT_LDAP_CONFIG  # Return default on error
+
+    return settings.DEFAULT_LDAP_CONFIG  # Fallback in case of an issue

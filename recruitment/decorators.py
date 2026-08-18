@@ -4,11 +4,16 @@ decorators.py
 Custom decorators for permission and manager checks in the application.
 """
 
+from functools import wraps
+
+from django.conf import settings
 from django.contrib import messages
-from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import render
+from django.http import HttpResponse
+from django.shortcuts import redirect, render
 
 from employee.models import Employee
+from solich.config import logger
+from solich.methods import handle_no_permission
 from recruitment.models import Recruitment, Stage
 
 
@@ -56,7 +61,46 @@ def decorator_with_arguments(decorator):
 
 
 @decorator_with_arguments
-def manager_can_enter(function, perm):
+def manager_can_enter(function, perm=None, perms=None):
+    """
+    Decorator that checks if the user has the specified permission(s) or is a manager.
+
+    Args:
+        perm (str): A single permission string.
+        perms (list): A list of permission strings.
+
+    Returns:
+        function: The decorated view.
+    """
+
+    def _function(request, *args, **kwargs):
+        user = request.user
+        employee = Employee.objects.filter(employee_user_id=user).first()
+
+        is_manager = (
+            Stage.objects.filter(stage_managers=employee).exists()
+            or Recruitment.objects.filter(recruitment_managers=employee).exists()
+        )
+
+        # Combine perm and perms into one list to check
+        all_perms = []
+        if perm:
+            all_perms.append(perm)
+        if perms:
+            all_perms.extend(perms)
+
+        has_required_perm = any(user.has_perm(p) for p in all_perms)
+
+        if has_required_perm or is_manager:
+            return function(request, *args, **kwargs)
+
+        return handle_no_permission(request)
+
+    return _function
+
+
+@decorator_with_arguments
+def all_manager_can_enter(function, perm):
     """
     Decorator that checks if the user has the specified permission or is a manager.
 
@@ -89,16 +133,13 @@ def manager_can_enter(function, perm):
         is_manager = (
             Stage.objects.filter(stage_managers=employee).exists()
             or Recruitment.objects.filter(recruitment_managers=employee).exists()
+            or request.user.employee_get.onboardingstage_set.exists()
+            or request.user.employee_get.onboarding_task.exists()
         )
         if user.has_perm(perm) or is_manager:
             return function(request, *args, **kwargs)
-        messages.info(request, "You dont have permission.")
-        previous_url = request.META.get("HTTP_REFERER", "/")
-        script = f'<script>window.location.href = "{previous_url}"</script>'
-        key = "HTTP_HX_REQUEST"
-        if key in request.META.keys():
-            return render(request, "decorator_404.html")
-        return HttpResponse(script)
+
+        return handle_no_permission(request)
 
     return _function
 
@@ -130,20 +171,48 @@ def recruitment_manager_can_enter(function, perm):
 
         Returns:
             HttpResponse: The response from the decorated function.
-
         """
         user = request.user
         employee = Employee.objects.filter(employee_user_id=user).first()
         is_manager = Recruitment.objects.filter(recruitment_managers=employee).exists()
         if user.has_perm(perm) or is_manager:
             return function(request, *args, **kwargs)
-        messages.info(request, "You dont have permission.")
-        previous_url = request.META.get("HTTP_REFERER", "/")
-        script = f'<script>window.location.href = "{previous_url}"</script>'
-        key = "HTTP_HX_REQUEST"
-        if key in request.META.keys():
-            return render(request, "decorator_404.html")
-        return HttpResponse(script)
+
+        return handle_no_permission(request)
 
     return _function
 
+
+def candidate_login_required(view_func):
+    @wraps(view_func)
+    def _wrapped_view(request, *args, **kwargs):
+
+        allow_func = False
+        if request.user.has_perm("recruitment.view_candidate"):
+            allow_func = True
+        if request.user:
+            if request.user.is_authenticated:
+                if (
+                    request.user.employee_get.stage_set.exists()
+                    or request.user.employee_get.recruitment_set.exists()
+                ):
+                    allow_func = True
+
+        if "candidate_id" in request.session:
+            allow_func = True
+
+        if allow_func:
+            try:
+                func = view_func(request, *args, **kwargs)
+            except KeyError:
+                raise
+            except Exception as e:
+                logger.error(e)
+                if not settings.DEBUG:
+                    messages.error(request, str(e))
+                    return render(request, "went_wrong.html", status=404)
+                raise e
+            return func
+        return redirect("candidate-login/")
+
+    return _wrapped_view

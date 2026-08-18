@@ -11,17 +11,23 @@ from itertools import groupby
 from urllib.parse import parse_qs
 
 import pandas as pd
+import pdfkit
+from django.conf import settings as pay_settings
 from django.contrib import messages
 from django.db.models import ProtectedError, Q
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.http import require_http_methods
 
 from base.methods import (
     closest_numbers,
+    eval_validate,
     export_data,
+    filter_own_and_subordinate_recordes,
     generate_colors,
     generate_pdf,
     get_key_instances,
@@ -36,6 +42,7 @@ from solich.decorators import (
     permission_required,
 )
 from solich.group_by import group_by_queryset
+from solich.http.response import SolichRedirect
 from notifications.signals import notify
 from payroll.context_processors import get_active_employees
 from payroll.filters import ContractFilter, ContractReGroup, PayslipFilter
@@ -54,7 +61,6 @@ from payroll.models.models import (
     Reimbursement,
     ReimbursementFile,
     ReimbursementrequestComment,
-    WorkRecord,
 )
 from payroll.models.tax_models import PayrollSettings
 
@@ -68,13 +74,6 @@ status_choices = {
 }
 
 
-def get_language_code(request):
-    scale_x_text = _("Name of Employees")
-    scale_y_text = _("Amount")
-    response = {"scale_x_text": scale_x_text, "scale_y_text": scale_y_text}
-    return JsonResponse(response)
-
-
 @login_required
 @permission_required("payroll.add_contract")
 def contract_create(request):
@@ -84,13 +83,31 @@ def contract_create(request):
     from payroll.forms.forms import ContractForm
 
     form = ContractForm()
+    is_htmx = request.headers.get("HX-Request") is not None
     if request.method == "POST":
         form = ContractForm(request.POST, request.FILES)
         if form.is_valid():
             form.save()
             messages.success(request, _("Contract Created"))
-            return redirect(contract_view)
-    return render(request, "payroll/common/form.html", {"form": form})
+            if is_htmx:
+                response = HttpResponse("", status=200)
+                response["HX-Trigger"] = json.dumps(
+                    {"reloadPayrollContracts": {"target": "body"}}
+                )
+                return response
+            return redirect("view-contract")
+    template_name = (
+        "payroll/common/form_fragment.html" if is_htmx else "payroll/common/form.html"
+    )
+    return render(
+        request,
+        template_name,
+        {
+            "form": form,
+            "post_url": request.get_full_path(),
+            "back_url": reverse("contract-filter"),
+        },
+    )
 
 
 @login_required
@@ -111,21 +128,33 @@ def contract_update(request, contract_id, **kwargs):
     from payroll.forms.forms import ContractForm
 
     contract = Contract.objects.filter(id=contract_id).first()
+    is_htmx = request.headers.get("HX-Request") is not None
     if not contract:
         messages.info(request, _("The contract could not be found."))
-        return redirect(contract_view)
+        return redirect("view-contract")
     contract_form = ContractForm(instance=contract)
     if request.method == "POST":
         contract_form = ContractForm(request.POST, request.FILES, instance=contract)
         if contract_form.is_valid():
             contract_form.save()
             messages.success(request, _("Contract updated"))
-            return redirect(contract_view)
+            if is_htmx:
+                response = HttpResponse("", status=200)
+                response["HX-Trigger"] = json.dumps(
+                    {"reloadPayrollContracts": {"target": "body"}}
+                )
+                return response
+            return redirect(reverse("view-contract"))
+    template_name = (
+        "payroll/common/form_fragment.html" if is_htmx else "payroll/common/form.html"
+    )
     return render(
         request,
-        "payroll/common/form.html",
+        template_name,
         {
             "form": contract_form,
+            "post_url": request.get_full_path(),
+            "back_url": reverse("contract-filter"),
         },
     )
 
@@ -181,14 +210,15 @@ def contract_status_update(request, contract_id):
             for errors in contract_form.errors.values():
                 for error in errors:
                     messages.error(request, error)
-        return HttpResponse("<script>window.location.reload()</script>")
+        return HttpResponse("<script>$('#reloadMessagesButton').click()</script>")
 
 
 @login_required
 @permission_required("payroll.change_contract")
 def bulk_contract_status_update(request):
     status = request.POST.get("status")
-    ids = eval(request.POST.get("ids"))
+    ids = request.POST.get("ids")
+    ids = eval_validate(ids) if ids else []
     all_contracts = Contract.objects.all()
     contracts = all_contracts.filter(id__in=ids)
 
@@ -222,6 +252,7 @@ def bulk_contract_status_update(request):
 
 @login_required
 @permission_required("payroll.change_contract")
+@require_http_methods(["POST"])
 def update_contract_filing_status(request, contract_id):
     if request.method == "POST":
         contract = get_object_or_404(Contract, id=contract_id)
@@ -241,7 +272,7 @@ def update_contract_filing_status(request, contract_id):
                 request, _("You selected the wrong option for filing status.")
             )
         contract.save()
-        return redirect(contract_filter)
+        return redirect("contract-filter")
 
 
 @login_required
@@ -263,14 +294,27 @@ def contract_delete(request, contract_id):
         messages.success(request, _("Contract deleted"))
         request_path = request.path.split("/")
         if "delete-contract-modal" in request_path:
-            return HttpResponse("<script>window.location.reload();</script>")
+            if instances_ids := request.GET.get("instances_ids"):
+                get_data = request.GET.copy()
+                get_data.pop("instances_ids", None)
+                previous_data = get_data.urlencode()
+                instances_list = json.loads(instances_ids)
+                previous_instance, next_instance = closest_numbers(
+                    instances_list, contract_id
+                )
+                if contract_id in instances_list:
+                    instances_list.remove(contract_id)
+                urls = f"/payroll/single-contract-view/{next_instance}/"
+                params = f"?{previous_data}&instances_ids={instances_list}"
+                return redirect(urls + params)
+            return SolichRedirect(request)
         else:
             return redirect(f"/payroll/contract-filter?{request.GET.urlencode()}")
     except Contract.DoesNotExist:
         messages.error(request, _("Contract not found."))
     except ProtectedError:
         messages.error(request, _("You cannot delete this contract."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -286,17 +330,12 @@ def contract_view(request):
     else:
         template = "payroll/contract/contract_empty.html"
 
-    field = request.GET.get("field")
     contracts = paginator_qry(contracts, request.GET.get("page"))
     contract_ids_json = json.dumps([instance.id for instance in contracts.object_list])
     filter_form = ContractFilter(request.GET)
-    export_filter = ContractFilter(request.GET)
-    export_column = ContractExportFieldForm()
     context = {
         "contracts": contracts,
         "f": filter_form,
-        "export_filter": export_filter,
-        "export_column": export_column,
         "contract_ids": contract_ids_json,
         "gp_fields": ContractReGroup.fields,
     }
@@ -305,46 +344,44 @@ def contract_view(request):
 
 
 @login_required
-@hx_request_required
+# @hx_request_required         #this function is also used in payroll dashboard which uses ajax
 @owner_can_enter("payroll.view_contract", Contract)
 def view_single_contract(request, contract_id):
     """
     Renders a single contract view page.
-
-    Parameters:
-    - request (HttpRequest): The HTTP request object.
-    - contract_id (int): The ID of the contract to view.
-
-    Returns:
-        The rendered contract single view page.
-
     """
-    HTTP_REFERERS = [
-        part for part in request.META.get("HTTP_REFERER").split("/") if part
-    ]
+    get_data = request.GET.copy()
+    get_data.pop("instances_ids", None)
+    previous_data = get_data.urlencode()
+    dashboard = request.GET.get("dashboard", "")
+
+    HTTP_REFERERS = request.META.get("HTTP_REFERER", "").split("/")
     delete_hx_target = (
         "#personal_target"
-        if HTTP_REFERERS[:-2]
-        and HTTP_REFERERS[-2] == "employee-view"
-        or HTTP_REFERERS[-1] == "employee-profile"
-        else "#payroll-contract-container"
+        if "employee-view" in HTTP_REFERERS or "employee-profile" in HTTP_REFERERS
+        else "#objectDetailsModalTarget"
     )
-    dashboard = ""
-    if request.GET.get("dashboard"):
-        dashboard = request.GET.get("dashboard")
-    contract = Contract.objects.get(id=contract_id)
+
+    contract = Contract.find(contract_id)
+
     context = {
         "contract": contract,
         "dashboard": dashboard,
         "delete_hx_target": delete_hx_target,
+        "pd": previous_data,
     }
+
     contract_ids_json = request.GET.get("instances_ids")
     if contract_ids_json:
         contract_ids = json.loads(contract_ids_json)
         previous_id, next_id = closest_numbers(contract_ids, contract_id)
-        context["next"] = next_id
-        context["previous"] = previous_id
-        context["contract_ids"] = contract_ids_json
+        context.update(
+            {
+                "previous": previous_id,
+                "next": next_id,
+                "contract_ids": contract_ids_json,
+            }
+        )
     return render(request, "payroll/contract/contract_single_view.html", context)
 
 
@@ -409,73 +446,6 @@ def contract_filter(request):
 
 
 @login_required
-@permission_required("payroll.view_workrecord")
-def work_record_create(request):
-    """
-    Work record create view
-    """
-    from payroll.forms.forms import WorkRecordForm
-
-    form = WorkRecordForm()
-
-    context = {"form": form}
-    if request.POST:
-        form = WorkRecordForm(request.POST)
-        if form.is_valid():
-            form.save()
-        else:
-            context["form"] = form
-    return render(request, "payroll/work_record/work_record_create.html", context)
-
-
-@login_required
-@permission_required("payroll.view_workrecord")
-def work_record_view(request):
-    """
-    Work record view method
-    """
-    contracts = WorkRecord.objects.all()
-    context = {"contracts": contracts}
-    return render(request, "payroll/work_record/work_record_view.html", context)
-
-
-@login_required
-@permission_required("payroll.workrecord")
-def work_record_employee_view(request):
-    """
-    Work record by employee view method
-    """
-    current_month_start_date = datetime.now().replace(day=1)
-    next_month_start_date = current_month_start_date + timedelta(days=31)
-    current_month_records = WorkRecord.objects.filter(
-        start_datetime__gte=current_month_start_date,
-        start_datetime__lt=next_month_start_date,
-    ).order_by("start_datetime")
-    current_date = timezone.now().date()
-    current_month = current_date.strftime("%B")
-    start_of_month = current_date.replace(day=1)
-    employees = Employee.objects.all()
-
-    current_month_dates_list = [
-        datetime.now().replace(day=day).date() for day in range(1, 32)
-    ]
-
-    context = {
-        "days": range(1, 32),
-        "employees": employees,
-        "current_date": current_date,
-        "current_month": current_month,
-        "start_of_month": start_of_month,
-        "current_month_dates_list": current_month_dates_list,
-        "work_records": current_month_records,
-    }
-
-    return render(
-        request, "payroll/work_record/work_record_employees_view.html", context
-    )
-
-
-@login_required
 @permission_required("payroll.view_payrollsettings")
 def settings(request):
     """
@@ -483,6 +453,13 @@ def settings(request):
     """
     instance = PayrollSettings.objects.first()
     currency_form = PayrollSettingsForm(instance=instance)
+    selected_company_id = request.session.get("selected_company")
+
+    if selected_company_id == "all" or not selected_company_id:
+        companies = Company.objects.all()
+    else:
+        companies = Company.objects.filter(id=selected_company_id)
+
     if request.method == "POST":
 
         currency_form = PayrollSettingsForm(request.POST, instance=instance)
@@ -490,8 +467,16 @@ def settings(request):
 
             currency_form.save()
             messages.success(request, _("Payroll settings updated."))
-    # return render(request, "payroll/settings/payroll_settings.html", {"currency_form": currency_form})
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            if request.headers.get("HX-Request"):
+                return HttpResponse("")
+            return SolichRedirect(request)
+        else:
+            messages.error(request, _("There was an error updating the currency."))
+            if request.headers.get("HX-Request"):
+                return HttpResponse("", status=400)
+    if request.headers.get("HX-Request"):
+        return HttpResponse("", status=400)
+    return SolichRedirect(request)
 
 
 @login_required
@@ -503,6 +488,8 @@ def update_payslip_status(request, payslip_id):
     status = request.POST.get("status")
     view = request.POST.get("view")
     payslip = Payslip.objects.filter(id=payslip_id).first()
+    if not payslip:
+        return SolichRedirect(request, message=_("Payslip not found."))
     if payslip:
         payslip.status = status
         payslip.save()
@@ -512,7 +499,7 @@ def update_payslip_status(request, payslip_id):
     if view:
         from .component_views import filter_payslip
 
-        return redirect(filter_payslip)
+        return redirect(reverse("payslip-list"))
     data = payslip.pay_head_data
     data["employee"] = payslip.employee_id
     data["payslip"] = payslip
@@ -523,6 +510,8 @@ def update_payslip_status(request, payslip_id):
     return render(request, "payroll/payslip/individual_payslip_summery.html", data)
 
 
+@login_required
+@hx_request_required
 def update_payslip_status_no_id(request):
     """
     This method is used to update the payslip confirmation status
@@ -542,42 +531,87 @@ def update_payslip_status_no_id(request):
 
 
 @login_required
-@permission_required("payroll.change_payslip")
-def bulk_update_payslip_status(request):
-    """
-    This method is used to update payslip status when generating payslip through
-    generate payslip method
-    """
-    json_data = request.GET["json_data"]
-    pay_data = json.loads(json_data)
-    status = request.GET["status"]
+def view_payslip_pdf(request, payslip_id):
 
-    for json_entry in pay_data:
-        data = json.loads(json_entry)
-        emp_id = data["employee"]
-        employee = Employee.objects.get(id=emp_id)
+    from .component_views import filter_payslip
 
-        payslip_kwargs = {
-            "employee_id": employee,
-            "start_date": data["start_date"],
-            "end_date": data["end_date"],
-        }
-        filtered_instance = Payslip.objects.filter(**payslip_kwargs).first()
-        instance = filtered_instance if filtered_instance is not None else Payslip()
+    if Payslip.objects.filter(id=payslip_id).exists():
+        payslip = Payslip.objects.get(id=payslip_id)
+        company = Company.objects.filter(hq=True).first()
+        if (
+            request.user.has_perm("payroll.view_payslip")
+            or payslip.employee_id.employee_user_id == request.user
+        ):
+            user = request.user
+            employee = user.employee_get
 
-        instance.employee_id = employee
-        instance.start_date = data["start_date"]
-        instance.end_date = data["end_date"]
-        instance.status = status
-        instance.basic_pay = data["basic_pay"]
-        instance.contract_wage = data["contract_wage"]
-        instance.gross_pay = data["gross_pay"]
-        instance.deduction = data["total_deductions"]
-        instance.net_pay = data["net_pay"]
-        instance.pay_head_data = data
-        instance.save()
+            # Taking the company_name of the user
+            info = EmployeeWorkInformation.objects.filter(employee_id=employee)
+            if info.exists():
+                for data in info:
+                    employee_company = data.company_id
+                company_name = Company.objects.filter(company=employee_company)
+                emp_company = company_name.first()
 
-    return JsonResponse({"type": "success", "message": "Payslips status updated"})
+                # Access the date_format attribute directly
+                date_format = (
+                    emp_company.date_format
+                    if emp_company and emp_company.date_format
+                    else "MMM. D, YYYY"
+                )
+            else:
+                date_format = "MMM. D, YYYY"
+
+            data = payslip.pay_head_data
+            start_date_str = data["start_date"]
+            end_date_str = data["end_date"]
+
+            # Convert the string to a datetime.date object
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+            month_start_name = start_date.strftime("%B %d, %Y")
+            month_end_name = end_date.strftime("%B %d, %Y")
+            # Formatted date for each format
+            for format_name, format_string in pay_settings.SOLICH_DATE_FORMATS.items():
+                if format_name == date_format:
+                    formatted_start_date = start_date.strftime(format_string)
+
+            for format_name, format_string in pay_settings.SOLICH_DATE_FORMATS.items():
+                if format_name == date_format:
+                    formatted_end_date = end_date.strftime(format_string)
+            data["month_start_name"] = month_start_name
+            data["month_end_name"] = month_end_name
+            data["formatted_start_date"] = formatted_start_date
+            data["formatted_end_date"] = formatted_end_date
+            data["employee"] = payslip.employee_id
+            data["payslip"] = payslip
+            data["json_data"] = data.copy()
+            data["json_data"]["employee"] = payslip.employee_id.id
+            data["json_data"]["payslip"] = payslip.id
+            data["instance"] = payslip
+            data["currency"] = PayrollSettings.objects.first().currency_symbol
+            data["all_deductions"] = []
+            for deduction_list in [
+                data["basic_pay_deductions"],
+                data["gross_pay_deductions"],
+                data["pretax_deductions"],
+                data["post_tax_deductions"],
+                data["tax_deductions"],
+                data["net_deductions"],
+            ]:
+                data["all_deductions"].extend(deduction_list)
+
+            data["all_allowances"] = data["allowances"].copy()
+            equalize_lists_length(data["allowances"], data["all_deductions"])
+            data["zipped_data"] = zip(data["allowances"], data["all_deductions"])
+            data["host"] = request.get_host()
+            data["protocol"] = "https" if request.is_secure() else "http"
+            data["company"] = company
+
+            return render(request, "payroll/payslip/payslip_pdf.html", context=data)
+        return redirect(filter_payslip)
+    return render(request, "405.html")
 
 
 @login_required
@@ -620,9 +654,15 @@ def delete_payslip(request, payslip_id):
         messages.error(request, _("Payslip not found."))
     except ProtectedError:
         messages.error(request, _("Something went wrong"))
+    if request.headers.get("HX-Request"):
+        response = HttpResponse("", status=200)
+        response["HX-Trigger"] = json.dumps(
+            {"reloadPayrollPayslips": {"target": "body"}}
+        )
+        return response
     if not Payslip.objects.filter():
-        return HttpResponse("<script>window.location.reload()</script>")
-    return redirect(filter_payslip)
+        return SolichRedirect(request)
+    return redirect(reverse("payslip-list"))
 
 
 @login_required
@@ -632,7 +672,12 @@ def contract_info_initial(request):
     This is an ajax method to return json response to auto fill the contract
     form fields
     """
-    employee_id = request.GET["employee_id"]
+    employee_id = request.GET.get("employee_id")
+    if not employee_id:
+        messages.error(request, _("Missing required parameter"))
+        return JsonResponse(
+            {"error": "Missing required parameter: employee_id"}, status=400
+        )
     work_info = EmployeeWorkInformation.objects.filter(employee_id=employee_id).first()
     response_data = {
         "department": (
@@ -688,11 +733,18 @@ def dashboard_employee_chart(request):
     payroll dashboard employee chart data
     """
 
-    date = request.GET.get("period")
-    year = date.split("-")[0]
-    month = date.split("-")[1]
+    date = request.GET.get("period", datetime.now().strftime("%Y-%m"))
+    year, month = date.split("-")
     dataset = []
+    employee_label = []
+    list_of_employees = []
 
+    response = {
+        "dataset": dataset,
+        "labels": employee_label,
+        "employees": list_of_employees,
+        "message": _("No payslips generated for this month."),
+    }
     is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
     if is_ajax and request.method == "GET":
         employee_list = Payslip.objects.filter(
@@ -736,7 +788,6 @@ def dashboard_employee_chart(request):
                 total_pay_with_status[dataset_label][label] for label in employees
             ]
 
-        employee_label = []
         for employee in employees:
             employee_label.append(
                 f"{employee.employee_first_name} {employee.employee_last_name}"
@@ -757,17 +808,17 @@ def dashboard_employee_chart(request):
             "employees": list_of_employees,
             "message": _("No payslips generated for this month."),
         }
-        return JsonResponse(response)
+    return JsonResponse(response)
 
 
+@login_required
 def payslip_details(request):
     """
     payroll dashboard payslip details data
     """
 
-    date = request.GET.get("period")
-    year = date.split("-")[0]
-    month = date.split("-")[1]
+    date = request.GET.get("period", datetime.now().strftime("%Y-%m"))
+    year, month = date.split("-")
     employee_list = []
     employee_list = Payslip.objects.filter(
         Q(start_date__month=month) & Q(start_date__year=year)
@@ -789,9 +840,8 @@ def dashboard_department_chart(request):
     payroll dashboard department chart data
     """
 
-    date = request.GET.get("period")
-    year = date.split("-")[0]
-    month = date.split("-")[1]
+    date = request.GET.get("period", datetime.now().strftime("%Y-%m"))
+    year, month = date.split("-")
     dataset = [
         {
             "label": "",
@@ -802,51 +852,50 @@ def dashboard_department_chart(request):
     department = []
     department_total = []
 
+    response = {
+        "dataset": dataset,
+        "labels": department,
+        "department_total": department_total,
+        "message": _("No payslips generated for this month."),
+    }
+
     is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
     if is_ajax and request.method == "GET":
-        employee_list = Payslip.objects.filter(
-            Q(start_date__month=month) & Q(start_date__year=year)
+        payslips = Payslip.objects.filter(
+            start_date__month=month, start_date__year=year
         )
 
-        for employee in employee_list:
-            department.append(
-                employee.employee_id.employee_work_info.department_id.department
-            )
+        department_totals = defaultdict(float)
 
-        department = list(set(department))
-        for depart in department:
-            department_total.append({"department": depart, "amount": 0})
+        for slip in payslips:
+            try:
+                dept = slip.employee_id.get_department().department
+                department_totals[dept] += round(slip.net_pay, 2)
+            except Exception as e:
+                print(e)
 
-        for employee in employee_list:
-            employee_department = (
-                employee.employee_id.employee_work_info.department_id.department
-            )
+        departments = list(department_totals.keys())
 
-            for depart in department_total:
-                if depart["department"] == employee_department:
-                    depart["amount"] += round(employee.net_pay, 2)
+        department_total = [
+            {"department": dept, "amount": amount}
+            for dept, amount in department_totals.items()
+        ]
 
-        colors = generate_colors(len(department))
-
+        colors = generate_colors(len(departments))
         dataset = [
             {
                 "label": "",
-                "data": [],
+                "data": list(department_totals.values()),
                 "backgroundColor": colors,
             }
         ]
-
-        for depart_total, depart in zip(department_total, department):
-            if depart == depart_total["department"]:
-                dataset[0]["data"].append(depart_total["amount"])
-
         response = {
             "dataset": dataset,
-            "labels": department,
+            "labels": departments,
             "department_total": department_total,
             "message": _("No payslips generated for this month."),
         }
-        return JsonResponse(response)
+    return JsonResponse(response)
 
 
 def contract_ending(request):
@@ -884,6 +933,7 @@ def contract_ending(request):
     return JsonResponse(response)
 
 
+@login_required
 def payslip_export(request):
     """
     payroll dashboard exporting to excell data
@@ -928,8 +978,6 @@ def payslip_export(request):
     if status:
         employee_payslip_list = employee_payslip_list.filter(status=status)
 
-    emp = request.user.employee_get
-
     for employ in contributions:
         payslips = Payslip.objects.filter(employee_id__id=employ)
         if end_date:
@@ -943,7 +991,7 @@ def payslip_export(request):
             if end_date:
                 payslips = payslips.filter(end_date__lte=end_date)
         pay_heads = payslips.values_list("pay_head_data", flat=True)
-        contribution_deductions = []
+        # contribution_deductions = []
         deductions = []
         for head in pay_heads:
             for deduction in head["gross_pay_deductions"]:
@@ -971,72 +1019,37 @@ def payslip_export(request):
         }
 
         for deduction_id, group in grouped_deductions.items():
-            title = group[0]["title"]
             employee_contribution = sum(item["amount"] for item in group)
-            employer_contribution = sum(
-                item["employer_contribution_amount"] for item in group
-            )
-            total_contribution = employee_contribution + employer_contribution
-            if employer_contribution > 0:
-                contribution_deductions.append(
-                    {
-                        "deduction_id": deduction_id,
-                        "title": title,
-                        "employee_contribution": employee_contribution,
-                        "employer_contribution": employer_contribution,
-                        "total_contribution": total_contribution,
-                    }
+            try:
+                employer_contribution = sum(
+                    item["employer_contribution_amount"] for item in group
                 )
+            except:
+                employer_contribution = 0
+            if employer_contribution > 0:
                 table5_data.append(
                     {
-                        "Employee": Employee.objects.get(id=emp),
+                        "Employee": Employee.objects.get(id=employ),
                         "Employer Contribution": employer_contribution,
                         "Employee Contribution": employee_contribution,
                     }
                 )
 
+    date_format = request.user.employee_get.get_date_format()
     if employee_payslip_list:
         for payslip in employee_payslip_list:
-            # Taking the company_name of the user
-            info = EmployeeWorkInformation.objects.filter(employee_id=emp).first()
 
-            if info:
-                employee_company = info.company_id
-                company_name = Company.objects.filter(company=employee_company).first()
-                date_format = (
-                    company_name.date_format
-                    if company_name and company_name.date_format
-                    else "MMM. D, YYYY"
-                )
-            else:
-                date_format = "MMM. D, YYYY"
-
-            # Define date formats
-            date_formats = {
-                "DD-MM-YYYY": "%d-%m-%Y",
-                "DD.MM.YYYY": "%d.%m.%Y",
-                "DD/MM/YYYY": "%d/%m/%Y",
-                "MM/DD/YYYY": "%m/%d/%Y",
-                "YYYY-MM-DD": "%Y-%m-%d",
-                "YYYY/MM/DD": "%Y/%m/%d",
-                "MMMM D, YYYY": "%B %d, %Y",
-                "DD MMMM, YYYY": "%d %B, %Y",
-                "MMM. D, YYYY": "%b. %d, %Y",
-                "D MMM. YYYY": "%d %b. %Y",
-                "dddd, MMMM D, YYYY": "%A, %B %d, %Y",
-            }
             start_date_str = str(payslip.start_date)
             end_date_str = str(payslip.end_date)
 
             # Convert the string to a datetime.date object
             start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
             end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-
-            for format_name, format_string in date_formats.items():
+            for format_name, format_string in pay_settings.SOLICH_DATE_FORMATS.items():
                 if format_name == date_format:
                     formatted_start_date = start_date.strftime(format_string)
 
-            for format_name, format_string in date_formats.items():
+            for format_name, format_string in pay_settings.SOLICH_DATE_FORMATS.items():
                 if format_name == date_format:
                     formatted_end_date = end_date.strftime(format_string)
 
@@ -1069,9 +1082,12 @@ def payslip_export(request):
         )
 
     for employee in employee_payslip_list:
-        department.append(
-            employee.employee_id.employee_work_info.department_id.department
-        )
+        try:
+            department.append(
+                employee.employee_id.employee_work_info.department_id.department
+            )
+        except Exception as e:
+            print(e)
 
     department = list(set(department))
 
@@ -1079,9 +1095,12 @@ def payslip_export(request):
         table2_data.append({"Department": depart, "Amount": 0})
 
     for employee in employee_payslip_list:
-        employee_department = (
-            employee.employee_id.employee_work_info.department_id.department
-        )
+        try:
+            employee_department = (
+                employee.employee_id.employee_work_info.department_id.department
+            )
+        except Exception as e:
+            print(e)
 
         for depart in table2_data:
             if depart["Department"] == employee_department:
@@ -1305,7 +1324,11 @@ def payslip_bulk_delete(request):
     """
     This method is used to bulk delete for Payslip
     """
-    ids = request.POST["ids"]
+    ids = request.POST.get("ids")
+    if not ids:
+        messages.error(request, _("Missing required parameters."))
+        return JsonResponse({"message": "Missing required parameters."}, status=400)
+
     ids = json.loads(ids)
     for id in ids:
         try:
@@ -1334,8 +1357,14 @@ def slip_group_name_update(request):
     """
     This method is used to update the group of the payslip
     """
-    new_name = request.POST["newName"]
-    group_name = request.POST["previousName"]
+    new_name = request.POST.get("newName")
+    group_name = request.POST.get("previousName")
+
+    if not new_name or not group_name:
+        return JsonResponse(
+            {"type": "error", "message": "Missing required parameters."}, status=400
+        )
+
     Payslip.objects.filter(group_name=group_name).update(group_name=new_name)
     return JsonResponse(
         {"type": "success", "message": "Batch name updated.", "new_name": new_name}
@@ -1345,6 +1374,19 @@ def slip_group_name_update(request):
 @login_required
 @permission_required("payroll.add_contract")
 def contract_export(request):
+    hx_request = request.META.get("HTTP_HX_REQUEST")
+    if hx_request:
+        export_filter = ContractFilter()
+        export_column = ContractExportFieldForm()
+        content = {
+            "export_filter": export_filter,
+            "export_column": export_column,
+        }
+        return render(
+            request,
+            "payroll/contract/contract_export_filter.html",
+            context=content,
+        )
     return export_data(
         request=request,
         model=Contract,
@@ -1360,7 +1402,10 @@ def contract_bulk_delete(request):
     """
     This method is used to bulk delete Contract
     """
-    ids = request.POST["ids"]
+    ids = request.POST.get("ids")
+    if not ids:
+        messages.error(request, _("No IDs provided for deletion."))
+        return JsonResponse({"message": "error."}, status=400)
     ids = json.loads(ids)
     for id in ids:
         try:
@@ -1406,103 +1451,176 @@ def equalize_lists_length(allowances, deductions):
     return deductions, allowances
 
 
-def payslip_pdf(request, id):
-    payslip = Payslip.objects.get(id=id)
-    if (
-        request.user.has_perm("payroll.view_payslip")
-        or payslip.employee_id.employee_user_id == request.user
-    ):
-        user = request.user
-        employee = user.employee_get
+def generate_payslip_pdf(template_path, context, html=False):
+    """
+    Generate a PDF file from an HTML template and context data.
 
-        # Taking the company_name of the user
-        info = EmployeeWorkInformation.objects.filter(employee_id=employee)
-        if info.exists():
-            for data in info:
-                employee_company = data.company_id
-            company_name = Company.objects.filter(company=employee_company)
-            emp_company = company_name.first()
+    Args:
+        template_path (str): The path to the HTML template.
+        context (dict): The context data to render the template.
+        html (bool): If True, return raw HTML instead of a PDF.
 
-            # Access the date_format attribute directly
-            date_format = (
-                emp_company.date_format
-                if emp_company and emp_company.date_format
-                else "MMM. D, YYYY"
-            )
-        else:
-            date_format = "MMM. D, YYYY"
+    Returns:
+        HttpResponse: A response with the generated PDF file or raw HTML.
+    """
 
-        data = payslip.pay_head_data
-        start_date_str = data["start_date"]
-        end_date_str = data["end_date"]
+    from solich.solich_middlewares import _thread_locals
 
-        # Define date formats
-        date_formats = {
-            "DD-MM-YYYY": "%d-%m-%Y",
-            "DD.MM.YYYY": "%d.%m.%Y",
-            "DD/MM/YYYY": "%d/%m/%Y",
-            "MM/DD/YYYY": "%m/%d/%Y",
-            "YYYY-MM-DD": "%Y-%m-%d",
-            "YYYY/MM/DD": "%Y/%m/%d",
-            "MMMM D, YYYY": "%B %d, %Y",
-            "DD MMMM, YYYY": "%d %B, %Y",
-            "MMM. D, YYYY": "%b. %d, %Y",
-            "D MMM. YYYY": "%d %b. %Y",
-            "dddd, MMMM D, YYYY": "%A, %B %d, %Y",
+    try:
+        # Render the HTML content from the template and context
+        html_content = render_to_string(template_path, context)
+        request = getattr(_thread_locals, "request")
+        cookies = None
+        if request:
+            cookies = request.META.get("HTTP_COOKIE", "")
+
+        # Return raw HTML if requested
+        if html:
+            return HttpResponse(html_content, content_type="text/html")
+
+        # PDF options for pdfkit
+        pdf_options = {
+            "page-size": "A4",
+            "margin-top": "10mm",
+            "margin-bottom": "10mm",
+            "margin-left": "10mm",
+            "margin-right": "10mm",
+            "encoding": "UTF-8",
+            "enable-local-file-access": None,  # Required to load local CSS/images
+            "dpi": 300,
+            "zoom": 1.3,
+            "footer-center": "[page]/[topage]",  # Required to load local CSS/images
         }
 
-        # Convert the string to a datetime.date object
-        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        if cookies:
+            pdf_options.update(
+                {
+                    "custom-header": [
+                        ("Cookie", cookies),
+                    ],
+                    "custom-header-propagation": None,
+                }
+            )
 
-        # Print the formatted date for each format
-        for format_name, format_string in date_formats.items():
-            if format_name == date_format:
-                formatted_start_date = start_date.strftime(format_string)
+        # Generate the PDF as binary content
+        pdf = pdfkit.from_string(html_content, False, options=pdf_options)
 
-        for format_name, format_string in date_formats.items():
-            if format_name == date_format:
-                formatted_end_date = end_date.strftime(format_string)
-
-        data["formatted_start_date"] = formatted_start_date
-        data["formatted_end_date"] = formatted_end_date
-        data["employee"] = payslip.employee_id
-        data["payslip"] = payslip
-        data["json_data"] = data.copy()
-        data["json_data"]["employee"] = payslip.employee_id.id
-        data["json_data"]["payslip"] = payslip.id
-        data["instance"] = payslip
-        data["currency"] = PayrollSettings.objects.first().currency_symbol
-        data["all_deductions"] = []
-        for deduction_list in [
-            data["basic_pay_deductions"],
-            data["gross_pay_deductions"],
-            data["pretax_deductions"],
-            data["post_tax_deductions"],
-            data["tax_deductions"],
-            data["net_deductions"],
-        ]:
-            data["all_deductions"].extend(deduction_list)
-
-        data["all_allowances"] = data["allowances"].copy()
-        equalize_lists_length(data["allowances"], data["all_deductions"])
-        data["zipped_data"] = zip(data["allowances"], data["all_deductions"])
-        data["host"] = request.get_host()
-        data["protocol"] = "https" if request.is_secure() else "http"
-
-    return generate_pdf("payroll/payslip/individual_pdf.html", context=data, html=False)
+        # Return an HttpResponse containing the PDF content
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = "inline; filename=payslip.pdf"
+        return response
+    except Exception as e:
+        # Handle errors gracefully
+        return HttpResponse(f"Error generating PDF: {str(e)}", status=500)
 
 
 @login_required
+def payslip_pdf(request, id):
+    """
+    Generate the payslip as a PDF and return it in an HttpResponse.
+
+    Args:
+        request (HttpRequest): The request object.
+        id (int): The ID of the payslip to generate.
+
+    Returns:
+        HttpResponse: A response containing the PDF content.
+    """
+
+    from .component_views import filter_payslip
+
+    if Payslip.objects.filter(id=id).exists():
+        payslip = Payslip.objects.get(id=id)
+        company = Company.objects.filter(hq=True).first()
+        if (
+            request.user.has_perm("payroll.view_payslip")
+            or payslip.employee_id.employee_user_id == request.user
+        ):
+            user = request.user
+            employee = user.employee_get
+
+            # Taking the company_name of the user
+            info = EmployeeWorkInformation.objects.filter(employee_id=employee)
+            date_format = "MMM. D, YYYY"
+            if info.exists():
+                for data in info:
+                    employee_company = data.company_id
+                company_name = Company.objects.filter(company=employee_company)
+                emp_company = company_name.first()
+
+                # Access the date_format attribute directly
+                date_format = (
+                    emp_company.date_format
+                    if emp_company and emp_company.date_format
+                    else "MMM. D, YYYY"
+                )
+
+            data = payslip.pay_head_data
+            start_date_str = data["start_date"]
+            end_date_str = data["end_date"]
+
+            # Convert the string to a datetime.date object
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+            # Format the start and end dates
+            for format_name, format_string in pay_settings.SOLICH_DATE_FORMATS.items():
+                if format_name == date_format:
+                    formatted_start_date = start_date.strftime(format_string)
+                    formatted_end_date = end_date.strftime(format_string)
+
+            # Prepare context for the template
+            data.update(
+                {
+                    "month_start_name": start_date.strftime("%B %d, %Y"),
+                    "month_end_name": end_date.strftime("%B %d, %Y"),
+                    "formatted_start_date": formatted_start_date,
+                    "formatted_end_date": formatted_end_date,
+                    "employee": payslip.employee_id,
+                    "payslip": payslip,
+                    "json_data": data.copy(),
+                    "currency": PayrollSettings.objects.first().currency_symbol,
+                    "all_deductions": [],
+                    "all_allowances": data["allowances"].copy(),
+                    "host": request.get_host(),
+                    "protocol": "https" if request.is_secure() else "http",
+                    "company": company,
+                }
+            )
+
+            # Merge deductions and allowances for display
+            for deduction_list in [
+                data["basic_pay_deductions"],
+                data["gross_pay_deductions"],
+                data["pretax_deductions"],
+                data["post_tax_deductions"],
+                data["tax_deductions"],
+                data["net_deductions"],
+            ]:
+                data["all_deductions"].extend(deduction_list)
+
+            equalize_lists_length(data["allowances"], data["all_deductions"])
+            data["zipped_data"] = zip(data["allowances"], data["all_deductions"])
+            data["request"] = request
+            template_path = "payroll/payslip/payslip_pdf.html"
+
+            return generate_payslip_pdf(template_path, context=data, html=False)
+        return redirect(filter_payslip)
+    return render(request, "405.html")
+
+
+@login_required
+@hx_request_required
 @permission_required("payroll.view_contract")
 def contract_select(request):
     page_number = request.GET.get("page")
+    contracts = Contract.objects.none()
 
     if page_number == "all":
-        employees = Contract.objects.all()
+        contracts = Contract.objects.all()
 
-    contract_ids = [str(emp.id) for emp in employees]
-    total_count = employees.count()
+    contract_ids = [str(contract.id) for contract in contracts]
+    total_count = contracts.count()
 
     context = {"contract_ids": contract_ids, "total_count": total_count}
 
@@ -1510,39 +1628,41 @@ def contract_select(request):
 
 
 @login_required
+@hx_request_required
 def contract_select_filter(request):
     page_number = request.GET.get("page")
     filtered = request.GET.get("filter")
     filters = json.loads(filtered) if filtered else {}
+    context = {}
 
     if page_number == "all":
         contract_filter = ContractFilter(filters, queryset=Contract.objects.all())
 
         # Get the filtered queryset
-        filtered_employees = contract_filter.qs
+        filtered_contracts = contract_filter.qs
 
-        contract_ids = [str(emp.id) for emp in filtered_employees]
-        total_count = filtered_employees.count()
+        contract_ids = [str(contract.id) for contract in filtered_contracts]
+        total_count = filtered_contracts.count()
 
         context = {"contract_ids": contract_ids, "total_count": total_count}
 
-        return JsonResponse(context)
+    return JsonResponse(context)
 
 
 @login_required
+@hx_request_required
 def payslip_select(request):
     page_number = request.GET.get("page")
+    payslip = Payslip.objects.none()
 
     if page_number == "all":
         if request.user.has_perm("payroll.view_payslip"):
-            employees = Payslip.objects.all()
+            payslip = Payslip.objects.all()
         else:
-            employees = Payslip.objects.filter(
-                employee_id__employee_user_id=request.user
-            )
+            payslip = Payslip.objects.filter(employee_id__employee_user_id=request.user)
 
-    payslip_ids = [str(emp.id) for emp in employees]
-    total_count = employees.count()
+    payslip_ids = [str(emp.id) for emp in payslip]
+    total_count = payslip.count()
 
     context = {"payslip_ids": payslip_ids, "total_count": total_count}
 
@@ -1550,10 +1670,12 @@ def payslip_select(request):
 
 
 @login_required
+@hx_request_required
 def payslip_select_filter(request):
     page_number = request.GET.get("page")
     filtered = request.GET.get("filter")
     filters = json.loads(filtered) if filtered else {}
+    context = {}
 
     if page_number == "all":
         payslip_filter = PayslipFilter(filters, queryset=Payslip.objects.all())
@@ -1566,10 +1688,11 @@ def payslip_select_filter(request):
 
         context = {"payslip_ids": payslip_ids, "total_count": total_count}
 
-        return JsonResponse(context)
+    return JsonResponse(context)
 
 
 @login_required
+@hx_request_required
 def create_payrollrequest_comment(request, payroll_id):
     """
     This method renders form and template to create Reimbursement request comments
@@ -1688,6 +1811,7 @@ def view_payrollrequest_comment(request, payroll_id):
         request_id=payroll_id
     ).order_by("-created_at")
 
+    req = Reimbursement.objects.get(id=payroll_id)
     no_comments = False
     if not comments.exists():
         no_comments = True
@@ -1710,6 +1834,7 @@ def view_payrollrequest_comment(request, payroll_id):
             "comments": comments,
             "no_comments": no_comments,
             "request_id": payroll_id,
+            "req": req,
         },
     )
 
@@ -1719,14 +1844,34 @@ def delete_payrollrequest_comment(request, comment_id):
     """
     This method is used to delete Reimbursement request comments
     """
-    comment = ReimbursementrequestComment.objects.filter(id=comment_id)
-    if not request.user.has_perm("delete_reimbursementrequestcomment"):
-        comment = comment.filter(employee_id__employee_user_id=request.user)
-    reimbursementrequest = comment.first().request_id.id
-    comment.delete()
 
-    messages.success(request, _("Comment deleted successfully!"))
-    return redirect("payroll-request-view-comment", payroll_id=reimbursementrequest)
+    comment = ReimbursementrequestComment.objects.filter(id=comment_id)
+    if not comment.exists():
+        messages.error(request, _("Comment not found."))
+        return SolichRedirect(request)
+    comment_obj = comment.first()
+
+    # Mirrors reimbursement_comment.html's delete-control condition, but
+    # scoped to the comment's specific parent Reimbursement instead of the
+    # template's coarse is_reportingmanager check (which only asks "does
+    # this user manage *someone*", not whether they manage the request's
+    # actual employee). filter_own_and_subordinate_recordes() checks: own
+    # record, subordinate-of-an-authorized-manager, or the global perm.
+    is_author = comment_obj.employee_id == request.user.employee_get
+    if not is_author:
+        authorized_requests = filter_own_and_subordinate_recordes(
+            request,
+            Reimbursement.objects.filter(pk=comment_obj.request_id_id),
+            "payroll.delete_reimbursementrequestcomment",
+        )
+        if not authorized_requests.exists():
+            messages.error(
+                request, _("You don't have permission to delete this comment.")
+            )
+            return SolichRedirect(request)
+
+    comment.delete()
+    return SolichRedirect(request, message=_("Comment deleted successfully!"))
 
 
 @login_required
@@ -1735,24 +1880,13 @@ def delete_reimbursement_comment_file(request):
     Used to delete attachment
     """
     ids = request.GET.getlist("ids")
+    if not ids:
+        return SolichRedirect(request, message=_("No file IDs provided for deletion."))
     records = ReimbursementFile.objects.filter(id__in=ids)
-    if not request.user.has_perm("payroll.delete_reimbursmentfile"):
+    if not request.user.has_perm("payroll.delete_reimbursementfile"):
         records = records.filter(employee_id__employee_user_id=request.user)
-
     records.delete()
-
-    payroll_id = request.GET["payroll_id"]
-    comments = ReimbursementrequestComment.objects.filter(
-        request_id=payroll_id
-    ).order_by("-created_at")
-    return render(
-        request,
-        "payroll/reimbursement/reimbursement_comment.html",
-        {
-            "comments": comments,
-            "request_id": payroll_id,
-        },
-    )
+    return SolichRedirect(request, message=_("File deleted successfully"))
 
 
 @login_required
@@ -1761,23 +1895,29 @@ def initial_notice_period(request):
     """
     This method is used to set initial value notice period
     """
-    notice_period = eval(request.GET["notice_period"])
+    if not request.GET.get("notice_period"):
+        return SolichRedirect(request, message=_("required parameter is missing"))
+
+    notice_period = eval_validate(request.GET["notice_period"])
     settings = PayrollGeneralSetting.objects.first()
     settings = settings if settings else PayrollGeneralSetting()
     settings.notice_period = max(notice_period, 0)
     settings.save()
-    messages.success(request, "Initial notice period updated")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    messages.success(
+        request, _("The initial notice period has been successfully updated.")
+    )
+    if request.META.get("HTTP_HX_REQUEST"):
+        return HttpResponse()
+    return SolichRedirect(request)
 
 
 # ===========================Auto payslip generate================================
 
 
 @login_required
-@permission_required("payroll.view_PayslipAutoGenerate")
+@permission_required("payroll.view_payslipautogenerate")
 def auto_payslip_settings_view(request):
     payslip_auto_generate = PayslipAutoGenerate.objects.all()
-    print("All autopayslip", payslip_auto_generate)
 
     context = {"payslip_auto_generate": payslip_auto_generate}
     return render(request, "payroll/settings/auto_payslip_settings.html", context)
@@ -1785,7 +1925,7 @@ def auto_payslip_settings_view(request):
 
 @login_required
 @hx_request_required
-@permission_required("payroll.change_PayslipAutoGenerate")
+@permission_required("payroll.change_payslipautogenerate")
 def create_or_update_auto_payslip(request, auto_id=None):
     auto_payslip = None
     if auto_id:
@@ -1798,27 +1938,45 @@ def create_or_update_auto_payslip(request, auto_id=None):
             company = (
                 auto_payslip.company_id if auto_payslip.company_id else "All company"
             )
+            action = _("updated") if auto_id else _("created")
             messages.success(
-                request, _(f"Payslip Auto generate for {company} created successfully ")
+                request,
+                _(f"Payslip Auto generate for {company} {action} successfully "),
             )
-            return HttpResponse("<script>window.location.reload()</script>")
+            return SolichRedirect(request)
     return render(
         request, "payroll/settings/auto_payslip_create_or_update.html", {"form": form}
     )
 
 
 @login_required
-@permission_required("payroll.change_PayslipAutoGenerate")
+@hx_request_required
+@permission_required("payroll.change_payslipautogenerate")
 def activate_auto_payslip_generate(request):
     """
-    ajax function to update is active field in grace time.
+    ajax function to update is active field in PayslipAutoGenerate.
     Args:
-    - isChecked: Boolean value representing the state of grace time,
+    - isChecked: Boolean value representing the state of PayslipAutoGenerate,
     - autoId: Id of PayslipAutoGenerate object
     """
     isChecked = request.POST.get("isChecked")
     autoId = request.POST.get("autoId")
-    payslip_auto = PayslipAutoGenerate.objects.get(id=autoId)
+    if not autoId or not isChecked:
+        return JsonResponse(
+            {
+                "type": "error",
+                "message": _("Invalid request. Missing required parameters."),
+            }
+        )
+    payslip_auto = PayslipAutoGenerate.objects.filter(id=autoId).first()
+    if not payslip_auto:
+        return JsonResponse(
+            {
+                "type": "error",
+                "message": _("Payslip auto generate setting not found."),
+            }
+        )
+
     if isChecked == "true":
         payslip_auto.auto_generate = True
         response = {
@@ -1837,7 +1995,7 @@ def activate_auto_payslip_generate(request):
 
 @login_required
 @hx_request_required
-@permission_required("payroll.delete_PayslipAutoGenerate")
+@permission_required("payroll.delete_payslipautogenerate")
 def delete_auto_payslip(request, auto_id):
     """
     Delete a PayslipAutoGenerate object.
@@ -1850,8 +2008,10 @@ def delete_auto_payslip(request, auto_id):
 
     """
     try:
+        count = PayslipAutoGenerate.objects.count()
         auto_payslip = PayslipAutoGenerate.objects.get(id=auto_id)
         if not auto_payslip.auto_generate:
+            delete_error = False
             company = (
                 auto_payslip.company_id if auto_payslip.company_id else "All company"
             )
@@ -1860,9 +2020,27 @@ def delete_auto_payslip(request, auto_id):
                 request, _(f"Payslip auto generate for {company} deleted successfully.")
             )
         else:
+            delete_error = True
             messages.info(request, _(f"Active 'Payslip auto generate' cannot delete."))
-        return HttpResponse("<script>window.location.reload();</script>")
     except PayslipAutoGenerate.DoesNotExist:
+        delete_error = True
         messages.error(request, _("Payslip auto generate not found."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if delete_error or count == 1:
+        return HttpResponse("<script>$('.reload-record').click();</script>")
+    return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
 
+
+@login_required
+def payroll_tab(request, pk, **kwargs):
+    """
+    method for rendering payroll tab
+    """
+
+    employee = Employee.objects.get(id=pk)
+    return render(
+        request,
+        "tabs/payroll-tab.html",
+        {
+            "employee": employee,
+        },
+    )

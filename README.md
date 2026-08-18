@@ -1,351 +1,192 @@
+# Solich HRMS
 
-# **Solich 🦍** [![AGPL License](https://img.shields.io/badge/license-AGPL-blue.svg)](http://www.gnu.org/licenses/agpl-3.0)
-Solich is a Free and Open Source HRMS Software.
+[![License: LGPL v2.1](https://img.shields.io/badge/License-LGPL%20v2.1-blue.svg)](https://www.gnu.org/licenses/lgpl-2.1)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Django](https://img.shields.io/badge/django-5.0+-green.svg)](https://www.djangoproject.com/)
+[![Stars](https://img.shields.io/github/stars/solich/solich-hr)](https://github.com/solich/solich-hr/stargazers)
+[![Forks](https://img.shields.io/github/forks/solich/solich-hr)](https://github.com/solich/solich-hr/network/members)
 
-<img width="1470" alt="Screenshot 2024-03-15 at 3 05 20 PM" src="https://github.com/Solich-opensource/Solich/assets/131998600/1317bd0a-03a8-40be-8fb2-ecb655bb5c13">
+> [!IMPORTANT]
+> **`2.0` is now this repository’s default branch.** Use it to run or deploy Solich (a plain `git clone` checks it out). To contribute code, branch from and open PRs against `dev/v2.0` — GitHub still pre-selects `2.0` as the PR base, so switch it manually. v1 (`1.0`/`master`) is deprioritized, with fixes considered case-by-case rather than on a guaranteed schedule. Full details → [Discussion #1127](https://github.com/solich/solich-hr/discussions/1127).
+
+> **A comprehensive, free, and open-source Human Resource Management System (HRMS) designed to streamline HR operations and enhance organizational efficiency.**
+
+## 🚀 Features
+
+### Core HR Modules
+- 👥 **Employee Management** - Centralized workforce data with LDAP integration
+- 🎯 **Recruitment** - End-to-end hiring process from job posting to onboarding
+- 📋 **Onboarding & Offboarding** - Structured workflows for employee lifecycle
+- ⏰ **Attendance & Time Tracking** - Biometric integration and automated check-in/out
+- 🏖️ **Leave Management** - Policy enforcement, approvals, and balance tracking
+- 💰 **Payroll** - Automated salary processing, tax calculations, and compliance
+- 📊 **Performance Management** - Goal setting, reviews, and continuous feedback
+- 🏢 **Asset Management** - Track and manage company resources
+- 🎫 **Helpdesk** - Centralized HR support and ticketing system
 
 
-## **Installation**
-____
-Solich can be installed on your system by following the below commands.
+## 📋 Table of Contents
 
-You'll have to install python, django and the database you wish to use for the project as a prerequisites.
+- [Which Branch Do I Want?](#-which-branch-do-i-want)
+- [Quick Start](#-quick-start)
+- [Installation](#-installation)
+- [Deployment](#-deployment)
+- [Contributing](#-contributing)
+- [Security](#-security)
+- [Support](#-support)
+- [License](#-license)
 
-### **Python Installation**
-___
+## 🌳 Which Branch Do I Want?
 
-**Ubuntu**
+- **`2.0`** (default) — the latest stable v2 snapshot. This is what a plain `git clone` gives you. Use it to run or deploy Solich.
+- **`dev/v2.0`** — the active integration branch. If you want to contribute code, branch from and open PRs against this, not `2.0`.
+- **`1.0`/`master`** — v1, now deprioritized (fixes considered case-by-case, no guaranteed schedule). Not deleted, but no longer where active development happens.
 
-Ubuntu comes with Python pre-installed, but if you need to install a specific version or if Python is not installed, you can use the terminal to install it.
+See [Discussion #1127](https://github.com/solich/solich-hr/discussions/1127) for full background on this transition.
 
-Open the terminal and type the following command:
+## ⚡ Quick Start
+
+### Using Docker (Recommended)
+
 ```bash
-  sudo apt-get install python3
+# Clone the repository (defaults to the stable 2.0 branch)
+git clone https://github.com/solich/solich-hr.git
+cd solich-hr
+
+# Start with Docker Compose
+docker-compose up -d
+
+# Access the application
+open http://localhost:8000
 ```
-This will install the latest version of Python 3.
 
-To check if Python is installed correctly, type the following command:
+### Manual Installation
+
 ```bash
-python3 --version
-```
-This should output the version number of Python that you just installed.
+# Clone and setup (defaults to the stable 2.0 branch)
+git clone https://github.com/solich/solich-hr.git
+cd solich-hr
 
-**Windows**
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-To install Python on Windows, follow these steps:
-1. Download the latest version of Python from the official website: https://www.python.org/downloads/windows/ .
-2. Run the installer and select "Add Python to PATH" during the installation process.
-3. Choose the installation directory and complete the installation process.
-4. To check if Python is installed correctly, open the Command Prompt and type the following command:
-```bash
-python3 --version
-```
-This should output the version number of Python that you just installed.
+# Install dependencies
+pip install -r requirements.txt
 
-**macOS**
+# Setup environment
+cp .env.dist .env
+# Edit .env with your configuration
 
-macOS comes with Python pre-installed, but if you need to install a specific version or if Python is not installed, you can use Homebrew to install it.
-
-Follow these steps:
-1. Install Homebrew by running the following command in the terminal:
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-2. Install Python by running the following command in the terminal:
-```bash
-brew install python
-```
-To check if Python is installed correctly, type the following command in the terminal:
-```bash
-python3 --version
-```
-This should output the version number of Python that you just installed.
-
-Congratulations, you have successfully installed Python on Ubuntu, Windows, or macOS! You can now start using Python to build applications.
-
-
-### **Installing Django**
-___
-
-Before installing Django, you must have Python installed on your machine.
-
-To install Django, follow the following steps:
-1. Create a virtual environment:
-
-It is highly recommended to create a virtual environment before installing Django.
-
-A virtual environment allows you to isolate your Python environment and avoid conflicts with other Python packages that may be installed on your machine.
-
-To create a virtual environment, open the terminal and navigate to the directory where you want to create the environment. Then type the following command:
-```bash
-python -m venv myenv
-```
-This will create a new virtual environment named "myenv".
-
-To activate the virtual environment, type the following command:
-```bash
-source myenv/bin/activate
-```
-This will activate the virtual environment and you should see the name of the environment in the terminal prompt.
-
->Note that to activate your virtual environment on Widows, you will need to run the following code below (See this <a href="https://docs.python.org/3/library/venv.html">link</a> to fully understand the differences between platforms):
-```bash
- env/Scripts/activate.bat //In CMD
- env/Scripts/Activate.ps1 //In Powershel
- ```
-2. Install Django:
-
-With the virtual environment activated, you can now install Django using pip, the Python package manager. Type the following command:
-```bash
-pip install Django
-```
-This will download and install the latest stable version of Django.
-
-3. Verify the installation:
-
-To verify that Django is installed correctly, type the following command in the terminal:
-```bash
-python -m django --version
-```
-This should output the version number of Django that you just installed.
-
-Congratulations, you have successfully installed Django on your machine!
-You can now start building web applications using Django.
-
-### **Installing Solich**
-___
-
-For installing the Solich, follow the following steps:
-1. Clone the project repository from GitHub:
-```bash
-git clone https://github.com/Solich-opensource/Solich.git
-```
-2. Install the required dependencies using pip:
-
-For installing the python dependencies required for the project, run the following command by going into the project directory.
- ```bash
- pip install -r requirements.txt
- ```
->If you face any issue with the installing the pycairo package in ubuntu or macos, please follow the following commands and try the requirements installation command after this command.
->>**Ubuntu**
->>```sudo apt-get install libcairo2-dev```
->>
->>**MacOS**
->>```brew install py3cairo```
-
->Run the requirement installation command again
-
-3. Set up the database by running the following commands:
-   _By default the test database will be loaded which will have demo data inside it. If you wish to start with a fresh database, you can either remove the TestDB_Solich.sqlite3 from the project directory or change the name of the database inside the Solich/settings.py file. (You can configure different database based on your choice, of which configurations settings is given below in the documentation._
-```bash
-python manage.py makemigrations
+# Initialize database
 python manage.py migrate
-```
-4. Create an admin employee account (use this command if you are starting with a fresh database, for the demo database there is already a Solich admin user created with credentials _admin_ and _admin_ as username and password respectively).
-```bash
-python manage.py createSolichuser
-```
->Note: createSolichuser is a similar command to createsuperuser in Django,  which creates an admin user along with a related admin employee into the database.
+python manage.py compilemessages
+python manage.py collectstatic
 
-<br>
-Enter the details asked for creating the admin user for the project.
-
-5. Enabling the translations and breadcrumbs text
-   ```bash
-   python manage.py compilemessages
-   ```
-
-6. Collect all the static files in the 'settings.STATIC_ROOT' directory (your_project/staticfiles/ by default). In production, you should serve this directory directly by your webserver.
-   ```bash
-   python manage.py collectstatic
-
-7. Running the project
-To run the project locally, execute the following command:
-
-```bash
+# Run development server
 python manage.py runserver
 ```
-If everything is configured correctly, you should be able to access your Solich app at http://localhost:8000.
 
->Note:
->>If you wish to run the Solich application to any other port, you can specify the port number after the runserver command.
 
->>eg: *python  manage.py runserver <port_number>*
+## 🛠 Installation
 
->Note:
->>By default a SQLite database will be setup for the project with demo data already loaded.
+For detailed installation instructions, configuration guides, and platform-specific setup instructions, please visit our comprehensive documentation:
 
->>If you wish to start with a fresh database, remove the db.sqlite3 file from the project directory and run the migrate command followed by the createSolichuser command to start with a fresh database.
+### 📖 [Complete Installation Guide → docs.solich.com/technical/v2.0/ ](https://docs.solich.com/technical/v2.0/)
 
->>Or if you wish to change the database, refer the below section.
+Our documentation includes:
+- **Step-by-step installation** for all supported platforms
+- **Database configuration** guides
+- **Environment setup** instructions
+- **Production deployment** best practices
+- **Troubleshooting** common issues
+- **Advanced configuration** options
 
-### **Database Setup**
-___
+<!-- Need help? Check out the [Installation FAQ](https://docs.solich.com) or reach out to our [community support](#-support). -->
 
-By default an SQLite database will be setup for the project, incase you wish to change the database of your choice, please use the below reference to do the same.
+## 🚀 Deployment
 
-**PostgreSQL**
+For production deployment guides including Nginx, Apache, and cloud platforms:
+### 📖 [Deployment Guide → docs.solich.com/technical/v2.0/doc/deployment/nginx-gunicorn](https://docs.solich.com/technical/v2.0/doc/deployment/nginx-gunicorn)
 
-To setup postgresql database for the project, first you have to install the PostgreSQL and its python package ***psycopg2*** .
-1. Install the psycopg2 package using pip. This package is a PostgreSQL database adapter for Python.
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+
+### Development Setup
+
 ```bash
-pip install psycopg2
+# Fork and clone your fork
+git clone -b dev/v2.0 https://github.com/YOUR_USERNAME/solich-hr.git
+cd solich-hr
+
+# Add upstream remote
+git remote add upstream https://github.com/solich/solich-hr.git
+
+# Create feature branch
+git checkout -b feature/your-feature-name
+
+# Install development dependencies
+pip install -r requirements.txt
+
+# Submit pull request
 ```
-2. In the project settings file (settings.py), add the following database settings:
-```python
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': '<database_name>',
-        'USER': '<database_user>',
-        'PASSWORD': '<database_password>',
-        'HOST': '<database_host>',
-        'PORT': '<database_port>',
-    }
-}
-```
-Replace *<database_name>, <database_user>, <database_password>, <database_host>, and <database_port>* with your PostgreSQL database settings.
 
-3. Run migrations to create the necessary database tables.
-```bash
-python manage.py makemigrations
-python manage.py migrate
-```
-For more details:
-[Django PostgreSQL Database](https://docs.djangoproject.com/en/4.2/ref/databases/#postgresql-notes)
+> **Note:** `2.0` is the repo default, so GitHub pre-selects it as your PR base. Before submitting, change the base branch to `dev/v2.0` — that's where active development and reviews happen, not `2.0`.
 
-**MySQL**
+### Code Standards
 
-To configure a MySQL database in Django, follow these steps:
-1. Install the ***mysqlclient*** package which will allow Django to interact with MySQL. You can install it using pip:
-```bash
-pip install mysqlclient
-```
-2. In the project settings file (settings.py), add the following database settings:
-```python
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': '<database_name>',
-        'USER': '<database_user>',
-        'PASSWORD': '<database_password>',
-        'HOST': '<database_host>',
-        'PORT': '<database_port>',
-    }
-}
-```
-Replace *<database_name>, <database_user>, <database_password>, <database_host>, and <database_port>* with the appropriate values for your MySQL installation.
+- Follow [PEP 8](https://pep8.org/) for Python code
+- Use [Black](https://black.readthedocs.io/) for code formatting
+- Write tests for new features
+- Update documentation for user-facing changes
 
+## 🔒 Security
 
-3. Run migrations to create the necessary database tables.
-```bash
-python manage.py makemigrations
-python manage.py migrate
-```
-For more details:
-[Django MySQL Database](https://docs.djangoproject.com/en/4.2/ref/databases/#mysql-notes)
+### Security Features
 
-**MariaDB**
+- 🔐 **Authentication & Authorization** - Role-based access control
+- 🛡️ **Data Protection** - Encrypted sensitive data storage
+- 🔍 **Audit Trails** - Comprehensive activity logging
+- 🚫 **Input Validation** - XSS and injection protection
+- 🔒 **Session Security** - Secure session management
 
-To configure a MariaDB database with Django, you can follow the same steps used for MySQL database configuration as shown above.
-For more details:
-[Django MariaDB Database](https://docs.djangoproject.com/en/4.2/ref/databases/#mariadb-notes)
+### Reporting Security Issues
 
-**SQLite**
+Please report security vulnerabilities via [GitHub Private Vulnerability Reporting](https://github.com/solich/solich-hr/security/advisories/new), not email. Do not create public GitHub issues for security vulnerabilities. See [SECURITY.md](SECURITY.md) for full details.
 
-To configure a SQLite database with Django, you can follow these steps:
-1. In the project settings file (settings.py), add the following database settings:
-```python
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
-```
-This will create a SQLite database in your project directory named db.sqlite3.
+### Security Best Practices
+
+- Always use HTTPS in production
+- Regularly update dependencies
+- Use strong passwords and enable 2FA
+- Monitor logs for suspicious activities
+
+## 📞 Support
+
+### Community Support
+
+- 📖 **Documentation**: [docs.solich.com](https://docs.solich.com)
+- 💬 **GitHub Discussions**: [GitHub Discussions](https://github.com/solich/solich-hr/discussions)
+- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/solich/solich-hr/issues)
+- ✨ **Feature Requests**: [GitHub Issues](https://github.com/solich/solich-hr/issues)
+
+### Professional Support
+
+For enterprise support, custom development, and consulting services:
+- 📧 **Email**: support@solich.com
+- 🌐 **Website**: [www.solich.com](https://www.solich.com)
 
 
+## 📄 License
 
-2. Run migrations to create the necessary database tables.
-```bash
-python manage.py makemigrations
-python manage.py migrate
-```
->*Note that SQLite has some limitations compared to other databases, so you may need to consider these limitations if you have a large amount of data or a high level of concurrency in your application.*
+This project is licensed under the [LGPL-2.1 License](LICENSE) - see the LICENSE file for details.
 
-For more details:
-[Django SQLite Database](https://docs.djangoproject.com/en/4.2/ref/databases/#sqlite-notes)
+<div align="center">
 
-**Oracle**
+**Made with ❤️ by the Solich Team**
 
-To configure an Oracle database with Django, you can follow these steps:
-1. Install the cx_Oracle package which will allow Django to interact with Oracle. You can install it using pip:
-```bash
-pip install cx_Oracle
-```
-2. In the project settings file (settings.py), add the following database settings:
-```python
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.oracle',
-        'NAME': '<database_name>',
-        'USER': '<database_user>',
-        'PASSWORD': '<database_password>',
-        'HOST': '<database_host>',
-        'PORT': '<database_port>',
-    }
-}
-```
-Replace *<database_name>, <database_user>, <database_password>, <database_host>, and <database_port>* with the appropriate values for your Oracle installation.
+[⭐ Star us on GitHub](https://github.com/solich/solich-hr) | [🐛 Report Bug](https://github.com/solich/solich-hr/issues) | [💡 Request Feature](https://github.com/solich/solich-hr/issues)
 
-
-3. Run migrations to create the necessary database tables.
-```bash
-python manage.py makemigrations
-python manage.py migrate
-```
->*Note that Oracle has some specific requirements for its database setup, so you may need to consult Oracle's documentation for more information on how to set up your database correctly.*
-
-For more details:
-[Django Oracle Database](https://docs.djangoproject.com/en/4.2/ref/databases/#oracle-notes)
-
-
-###  **Features**
-
-- Recruitment
-- Onboarding
-- Employee
-- Attendance
-- Leave
-- Asset
-- Payroll
-- Performance Management System
-
-### **Roadmap**
-
-
-
-- Calendar App - Development Under Process
-
-- Project Management - Development Under Process
-
-- Chat App - Development Under Process
-
-- More to come.....
-
-___
-<br>
-
-### **Laguages and Tools Used:**
-<br>
-<p align="left"> <a href="https://getbootstrap.com" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/bootstrap/bootstrap-plain-wordmark.svg" alt="bootstrap" width="40" height="40"/> </a> <a href="https://www.chartjs.org" target="_blank" rel="noreferrer"> <img src="https://www.chartjs.org/media/logo-title.svg" alt="chartjs" width="40" height="40"/> </a> <a href="https://www.w3schools.com/css/" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/css3/css3-original-wordmark.svg" alt="css3" width="40" height="40"/> </a> <a href="https://www.djangoproject.com/" target="_blank" rel="noreferrer"> <img src="https://cdn.worldvectorlogo.com/logos/django.svg" alt="django" width="40" height="40"/> </a> <a href="https://git-scm.com/" target="_blank" rel="noreferrer"> <img src="https://www.vectorlogo.zone/logos/git-scm/git-scm-icon.svg" alt="git" width="40" height="40"/> </a> <a href="https://www.w3.org/html/" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/html5/html5-original-wordmark.svg" alt="html5" width="40" height="40"/> </a> <a href="https://www.linux.org/" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/linux/linux-original.svg" alt="linux" width="40" height="40"/> </a> <a href="https://www.mysql.com/" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/mysql/mysql-original-wordmark.svg" alt="mysql" width="40" height="40"/> </a> <a href="https://www.oracle.com/" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/oracle/oracle-original.svg" alt="oracle" width="40" height="40"/> </a> <a href="https://www.postgresql.org" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/postgresql/postgresql-original-wordmark.svg" alt="postgresql" width="40" height="40"/> </a> <a href="https://www.python.org" target="_blank" rel="noreferrer"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/python/python-original.svg" alt="python" width="40" height="40"/> </a> <a href="https://www.sqlite.org/" target="_blank" rel="noreferrer"> <img src="https://www.vectorlogo.zone/logos/sqlite/sqlite-icon.svg" alt="sqlite" width="40" height="40"/> </a> </p>
-<br>
-
-___
-
-### **AUTHORS**
-[Cybrosys Technologies](https://www.cybrosys.com/)
-
-### **ABOUT**
-[Solich](https://www.Solich.com/)
+</div>

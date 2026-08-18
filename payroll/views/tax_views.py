@@ -14,13 +14,16 @@ import math
 from urllib.parse import parse_qs
 
 from django.contrib import messages
-from django.http import HttpResponse, HttpResponseRedirect
+from django.db.models import ProtectedError
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import redirect, render
 from django.utils.translation import gettext_lazy as _
 
 from base.methods import get_key_instances
 from solich.decorators import hx_request_required, login_required, permission_required
+from solich.http.response import SolichRedirect
 from payroll.forms.tax_forms import FilingStatusForm, TaxBracketForm
+from payroll.methods.safe_tax_code import TaxCodeValidationError, validate_tax_code
 from payroll.models.models import FilingStatus
 from payroll.models.tax_models import TaxBracket
 
@@ -60,7 +63,7 @@ def create_filing_status(request):
             messages.success(request, _("Filing status created successfully "))
             filing_status_form = FilingStatusForm()
             if len(FilingStatus.objects.filter()) == 1:
-                return HttpResponse("<script>window.location.reload()</script>")
+                return SolichRedirect(request)
     return render(
         request,
         "payroll/tax/filing_status_creation.html",
@@ -85,7 +88,7 @@ def update_filing_status(request, filing_status_id):
     filing_status = FilingStatus.find(filing_status_id)
     if not filing_status:
         messages.error(request, _("Filing status not found"))
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+        return SolichRedirect(request)
     filing_status_form = FilingStatusForm(instance=filing_status)
     if request.method == "POST":
         filing_status_form = FilingStatusForm(request.POST, instance=filing_status)
@@ -112,14 +115,25 @@ def filing_status_delete(request, filing_status_id):
     database and redirects to the filing status view.
 
     """
-    filing_status = FilingStatus.find(filing_status_id)
-    if filing_status:
-        filing_status.delete()
-        messages.info(request, _("Filing status successfully deleted."))
-    else:
-        messages.error(request, _("This filing status was not found."))
+    try:
+        filing_status = FilingStatus.find(filing_status_id)
+        if filing_status:
+            try:
+                filing_status.delete()
+                messages.info(request, _("Filing status successfully deleted."))
+            except ProtectedError:
+                messages.error(
+                    request,
+                    _("Filing status is in use by tax brackets. Remove them first."),
+                )
+        else:
+            messages.error(request, _("This filing status was not found."))
+    except Exception as e:
+        messages.error(
+            request, _("An error occurred while trying to delete the filing status.")
+        )
     if not FilingStatus.objects.exists():
-        return HttpResponse("<script>window.location.reload()</script>")
+        return SolichRedirect(request)
     return redirect(filing_status_search)
 
 
@@ -166,12 +180,11 @@ def tax_bracket_list(request, filing_status_id):
         The rendered "tax_bracket_view.html" template with the tax brackets for the
         specified filing status.
     """
+    filing_status = FilingStatus.objects.get(id=filing_status_id)
     tax_brackets = TaxBracket.objects.filter(
         filing_status_id=filing_status_id
     ).order_by("max_income")
-    context = {
-        "tax_brackets": tax_brackets,
-    }
+    context = {"tax_brackets": tax_brackets, "filing_status": filing_status}
     return render(request, "payroll/tax/tax_bracket_view.html", context)
 
 
@@ -243,7 +256,7 @@ def update_tax_bracket(request, tax_bracket_id):
         }
         return render(request, "payroll/tax/tax_bracket_edit.html", context)
     messages.error(request, _("Tax bracket not found"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -274,3 +287,30 @@ def delete_tax_bracket(request, tax_bracket_id):
         else HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
     )
 
+
+@login_required
+@permission_required("payroll.change_taxbracket")
+def update_py_code(request, pk):
+    """
+    Ajax method to update python code of filing status
+    """
+    code = request.POST.get("code")
+    if not code:
+        messages.error(request, _("Missing required parameter"))
+        return JsonResponse({"message": "Missing required parameter: code"}, status=400)
+    filing = FilingStatus.find(pk)
+    if not filing:
+        messages.error(request, _("Filing status not found"))
+        return JsonResponse({"message": "Filing status not found"}, status=404)
+
+    try:
+        validate_tax_code(code)
+    except TaxCodeValidationError as exc:
+        messages.error(request, _("Invalid tax code"))
+        return JsonResponse({"message": str(exc)}, status=400)
+
+    if not filing.python_code == code:
+        filing.python_code = code
+        filing.save()
+        messages.success(request, _("Python code saved successfully!"))
+    return JsonResponse({"message": "success"})

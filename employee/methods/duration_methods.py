@@ -23,4 +23,3 @@ def format_time(seconds):
     minutes = int((seconds % 3600) // 60)
     seconds = int((seconds % 3600) % 60)
     return f"{hour:02d}:{minutes:02d}"
-

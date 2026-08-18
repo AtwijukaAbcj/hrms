@@ -1,5 +1,4 @@
 $(document).ready(function () {
-  alert('ededdsdsdsd')
   // $('#id_aassignees').hide();
   // $('#id_start_date').hide();
 

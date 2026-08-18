@@ -8,131 +8,43 @@ This module is used to register models for recruitment app
 import contextlib
 import datetime as dt
 import json
-from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+from django.apps import apps
 from django.core.exceptions import ValidationError
-from django.db import models
-from django.db.models import Q
-from django.db.models.signals import post_save
-from django.dispatch import receiver
+from django.db import models, transaction
+from django.db.models import F, Q
+from django.urls import reverse
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from attendance.methods.differentiate import get_diff_dict
+from attendance.methods.utils import (
+    MONTH_MAPPING,
+    attendance_date_validate,
+    format_time,
+    get_diff_dict,
+    strtime_seconds,
+    validate_hh_mm_ss_format,
+    validate_time_format,
+    validate_time_in_minutes,
+)
 from base.solich_company_manager import SolichCompanyManager
+from base.methods import is_company_leave, is_holiday
 from base.models import Company, EmployeeShift, EmployeeShiftDay, WorkType
 from employee.models import Employee
-from solich.models import SolichModel
-from solich_audit.models import SolichAuditInfo, SolichAuditLog
-from leave.methods import is_company_leave, is_holiday
-from leave.models import (
-    WEEK_DAYS,
-    WEEKS,
-    CompanyLeave,
-    Holiday,
-    LeaveRequest,
-    LeaveType,
-)
 
 # Create your models here.
+from solich.methods import get_solich_model_class
+from solich.models import SolichModel, upload_path
+from solich_audit.models import SolichAuditInfo, SolichAuditLog
+from solich_views.cbv_methods import render_template
+
+# to skip the migration issue with the old migrations
+_validate_time_in_minutes = validate_time_in_minutes
 
 
-def strtime_seconds(time):
-    """
-    this method is used to reconvert time in H:M formate string back to seconds and return it
-    args:
-        time : time in H:M format
-    """
-    ftr = [3600, 60, 1]
-    return sum(a * b for a, b in zip(ftr, map(int, time.split(":"))))
-
-
-def format_time(seconds):
-    """
-    This method is used to formate seconds to H:M and return it
-    args:
-        seconds : seconds
-    """
-    hour = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = int((seconds % 3600) % 60)
-    return f"{hour:02d}:{minutes:02d}"
-
-
-def validate_hh_mm_ss_format(value):
-    timeformat = "%H:%M:%S"
-    try:
-        validtime = datetime.strptime(value, timeformat)
-        return validtime.time()  # Return the time object if needed
-    except ValueError as e:
-        raise ValidationError(_("Invalid format, it should be HH:MM:SS format"))
-
-
-def validate_time_format(value):
-    """
-    this method is used to validate the format of duration like fields.
-    """
-    if len(value) > 6:
-        raise ValidationError(_("Invalid format, it should be HH:MM format"))
-    try:
-        hour, minute = value.split(":")
-        if len(hour) > 3 or len(minute) > 2:
-            raise ValidationError(_("Invalid time"))
-        hour = int(hour)
-        minute = int(minute)
-        if len(str(hour)) > 3 or len(str(minute)) > 2 or minute not in range(60):
-            raise ValidationError(_("Invalid time, excepted MM:SS"))
-    except ValueError as error:
-        raise ValidationError(_("Invalid format")) from error
-
-
-def validate_time_in_minutes(value):
-    """
-    this method is used to validate the format of duration like fields.
-    """
-    if len(value) > 5:
-        raise ValidationError(_("Invalid format, it should be MM:SS format"))
-    try:
-        minutes, sec = value.split(":")
-        if len(minutes) > 2 or len(sec) > 2:
-            raise ValidationError(_("Invalid time, excepted MM:SS"))
-        minutes = int(minutes)
-        sec = int(sec)
-        if minutes not in range(60) or sec not in range(60):
-            raise ValidationError(_("Invalid time, excepted MM:SS"))
-    except ValueError as e:
-        raise ValidationError(_("Invalid format,  excepted MM:SS")) from e
-
-
-def attendance_date_validate(date):
-    """
-    Validates if the provided date is not a future date.
-
-    :param date: The date to validate.
-    :raises ValidationError: If the provided date is in the future.
-    """
-    today = datetime.today().date()
-    if not date:
-        raise ValidationError(_("Check date format."))
-    elif date > today:
-        raise ValidationError(_("You cannot choose a future date."))
-
-
-month_mapping = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-}
+# Create your models here.
 
 
 class AttendanceActivity(SolichModel):
@@ -166,6 +78,12 @@ class AttendanceActivity(SolichModel):
     objects = SolichCompanyManager(
         related_company_field="employee_id__employee_work_info__company_id"
     )
+    history = SolichAuditLog(
+        related_name="history_set",
+        bases=[
+            SolichAuditInfo,
+        ],
+    )
 
     class Meta:
         """
@@ -173,6 +91,109 @@ class AttendanceActivity(SolichModel):
         """
 
         ordering = ["-attendance_date", "employee_id__employee_first_name", "clock_in"]
+
+    def get_status(self):
+        """
+        Display status
+        """
+
+        DAY = [
+            ("monday", _("Monday")),
+            ("tuesday", _("Tuesday")),
+            ("wednesday", _("Wednesday")),
+            ("thursday", _("Thursday")),
+            ("friday", _("Friday")),
+            ("saturday", _("Saturday")),
+            ("sunday", _("Sunday")),
+        ]
+        return dict(DAY).get(self.shift_day.day)
+
+    def get_delete_attendance(self):
+        """
+        for delete button
+        """
+
+        return render_template(
+            path="cbv/attendance_activity/delete_action.html",
+            context={"instance": self},
+        )
+
+    def attendance_detail_subtitle(self):
+        """
+        Return subtitle containing both department and job position information.
+        """
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def attendance_detail_view(self):
+        """
+        for detail view of page
+        """
+        url = reverse("attendance-activity-single-view", kwargs={"pk": self.pk})
+        return url
+
+    def diff_cell(self):
+        if self.clock_out == None:
+            return 'style="background-color: #FFE4B3"'
+
+    def detail_view_delete_attendance(self):
+        """
+        for delete button
+        """
+
+        return render_template(
+            path="cbv/attendance_activity/detail_delete_action.html",
+            context={"instance": self},
+        )
+
+    def duration_format_time(self, seconds):
+        """
+        This method is used to format seconds to H:M:S and return it
+        args:
+            seconds : seconds
+        """
+        hour = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int((seconds % 3600) % 60)
+        return f"{hour:02d}:{minutes:02d}:{seconds:02d}"
+
+    def duration(self):
+        """
+        Duration calc b/w in-out method
+        """
+
+        if not self.clock_out or not self.clock_out_date:
+            self.clock_out_date = datetime.today().date()
+            self.clock_out = datetime.now().time()
+
+        clock_in_datetime = datetime.combine(self.clock_in_date, self.clock_in)
+        clock_out_datetime = datetime.combine(self.clock_out_date, self.clock_out)
+
+        time_difference = clock_out_datetime - clock_in_datetime
+
+        return time_difference.total_seconds()
+
+    def duration_format(self):
+        """
+        Function to return the duration time in hh:mm:ss
+        """
+        total_seconds = self.duration()
+        formatted_duration = self.duration_format_time(total_seconds)
+
+        return formatted_duration
+
+    def __str__(self):
+        return f"{self.employee_id} - {self.attendance_date} - {self.clock_in} - {self.clock_out}"
+
+
+class BatchAttendance(SolichModel):
+    """
+    Batch attendance model
+    """
+
+    title = models.CharField(max_length=150, verbose_name=_("Title"))
+
+    def __str__(self):
+        return f"{self.title}-{self.id}"
 
 
 class Attendance(SolichModel):
@@ -182,12 +203,11 @@ class Attendance(SolichModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.first_save = True
 
     status = [
         ("create_request", _("Create Request")),
         ("update_request", _("Update Request")),
-        ("revalidate_request", _("Re-validate Request")),
+        ("created_request", _("Created Request")),
     ]
 
     employee_id = models.ForeignKey(
@@ -203,13 +223,13 @@ class Attendance(SolichModel):
         verbose_name=_("Attendance date"),
     )
     shift_id = models.ForeignKey(
-        EmployeeShift, on_delete=models.DO_NOTHING, null=True, verbose_name=_("Shift")
+        EmployeeShift, on_delete=models.SET_NULL, null=True, verbose_name=_("Shift")
     )
     work_type_id = models.ForeignKey(
         WorkType,
         null=True,
         blank=True,
-        on_delete=models.DO_NOTHING,
+        on_delete=models.SET_NULL,  # 796
         verbose_name=_("Work Type"),
     )
     attendance_day = models.ForeignKey(
@@ -243,6 +263,13 @@ class Attendance(SolichModel):
         validators=[validate_time_format],
         verbose_name=_("Minimum hour"),
     )
+    batch_attendance_id = models.ForeignKey(
+        BatchAttendance,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        verbose_name=_("Batch Attendance"),
+    )
     attendance_overtime = models.CharField(
         default="00:00",
         validators=[validate_time_format],
@@ -250,10 +277,10 @@ class Attendance(SolichModel):
         verbose_name=_("Overtime"),
     )
     attendance_overtime_approve = models.BooleanField(
-        default=False, verbose_name=_("Overtime approved")
+        default=False, verbose_name=_("Overtime Approve")
     )
     attendance_validated = models.BooleanField(
-        default=False, verbose_name=_("Attendance validated")
+        default=False, verbose_name=_("Attendance Validate")
     )
     at_work_second = models.IntegerField(null=True, blank=True)
     overtime_second = models.IntegerField(
@@ -267,12 +294,22 @@ class Attendance(SolichModel):
     is_validate_request_approved = models.BooleanField(
         default=False, verbose_name=_("Is validate request approved")
     )
-    request_description = models.TextField(null=True, max_length=255)
+    request_description = models.TextField(
+        null=True, verbose_name=_("Request Description")
+    )
     request_type = models.CharField(
         max_length=18, null=True, choices=status, default="update_request"
     )
     is_holiday = models.BooleanField(default=False)
     requested_data = models.JSONField(null=True, editable=False)
+    approved_by = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        verbose_name=_("Approved By"),
+        editable=False,
+    )
     objects = SolichCompanyManager(
         related_company_field="employee_id__employee_work_info__company_id"
     )
@@ -282,6 +319,48 @@ class Attendance(SolichModel):
             SolichAuditInfo,
         ],
     )
+
+    def get_instance_id(self):
+        return self.id
+
+    def diff_cell(self):
+        if self.request_type == "created_request":
+            return 'style="background-color: #FFE4B3"'
+
+    def status_col(self):
+        """
+        This method for get custome coloumn for rating.
+        """
+
+        return render_template(
+            path="cbv/attendance_request/status.html",
+            context={"instance": self},
+        )
+
+    def my_attendance_subtitle(self):
+        """
+        Detail view subtitle
+        """
+
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def my_attendance_detail(self):
+        """
+        detail view
+        """
+
+        url = reverse("my-attendance-detail", kwargs={"pk": self.pk})
+
+        return url
+
+    def attendance_detail_view(self):
+        """
+        detail view
+        """
+
+        url = reverse("attendances-tab-detail-view", kwargs={"pk": self.pk})
+
+        return url
 
     class Meta:
         """
@@ -298,10 +377,227 @@ class Attendance(SolichModel):
             "employee_id__employee_first_name",
             "attendance_clock_in",
         ]
+        verbose_name = _("Attendance")
+        verbose_name_plural = _("Attendances")
+
+    def check_min_ot(self):
+        """
+        Method to check the min ot for the attendance
+        """
+
+    def is_night_shift(self):
+        """
+        check is night shift or not
+        """
+        day = self.attendance_day
+        if day is None:
+            return False
+        schedule = day.day_schedule.filter(shift_id=self.shift_id).first()
+        if not schedule:
+            return False
+        return schedule.is_night_shift
 
     def __str__(self) -> str:
         return f"{self.employee_id.employee_first_name} \
             {self.employee_id.employee_last_name} - {self.attendance_date}"
+
+    def activities(self):
+        """
+        This method is used to return the activites and count of activites comes for an attendance
+        """
+        activities = AttendanceActivity.objects.filter(
+            attendance_date=self.attendance_date, employee_id=self.employee_id
+        )
+        return {"query": activities, "count": activities.count()}
+
+    def attendance_actions(self):
+        """
+        method for rendering actions(edit,delete)
+        """
+
+        return render_template(
+            path="cbv/attendances/attendance_actions.html",
+            context={"instance": self},
+        )
+
+    def comment_col(self):
+        """
+        This method for get custom coloumn for comment.
+        """
+
+        return render_template(
+            path="cbv/attendance_request/comment.html",
+            context={"instance": self},
+        )
+
+    def attendance_detail_activity_col(self):
+        """
+        this method is used to return attendance detail view activity custom col
+        """
+
+        return render_template(
+            path="cbv/attendances/detail_view_activity_col.html",
+            context={"instance": self},
+        )
+
+    def request_actions(self):
+        """
+        This method for get custom coloumn for comment.
+        """
+
+        return render_template(
+            path="cbv/attendance_request/request_actions.html",
+            context={"instance": self},
+        )
+
+    def request_options(self):
+        """
+        This method for get custom options for request.
+        """
+        return render_template(
+            path="cbv/attendance_request/attendance_request_option.html",
+            context={"instance": self},
+        )
+
+    def validate_detail_view(self):
+        """
+        detail view of validate tab
+        """
+        url = reverse("validate-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def individual_validate_detail_view(self):
+        """
+        detail view of validate tab
+        """
+        url = reverse("individual-validate-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def ot_detail_view(self):
+        """
+        detail view of OT tab
+        """
+        url = reverse("ot-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def validated_detail_view(self):
+        """
+        detail view of validated tab
+        """
+        url = reverse("validated-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def detail_view(self):
+        """
+        deteil view of requested attendances
+        """
+        url = reverse("validate-attendance-request", kwargs={"attendance_id": self.pk})
+        return url
+
+    def change_attendance(self):
+        """
+        Edit url
+        """
+        url = reverse("update-attendance-request", kwargs={"pk": self.pk})
+        return url
+
+    def ot_approve(self):
+        """
+        method for rendering approve OT
+        """
+        minot = strtime_seconds("00:30")
+        condition = AttendanceValidationCondition.objects.first()
+        if condition is not None:
+            minot = strtime_seconds(condition.minimum_overtime_to_approve)
+
+        return render_template(
+            path="cbv/attendances/ot_confirmation.html",
+            context={"instance": self, "minot": minot},
+        )
+
+    def validate_actions(self):
+        """
+        combined actions column for validate tab: validate + edit + delete
+        """
+
+        return render_template(
+            path="cbv/attendances/validate_actions.html",
+            context={"instance": self},
+        )
+
+    def ot_actions(self):
+        """
+        combined actions column for OT tab: approve OT + edit + delete
+        """
+        minot = strtime_seconds("00:30")
+        condition = AttendanceValidationCondition.objects.first()
+        if condition is not None:
+            minot = strtime_seconds(condition.minimum_overtime_to_approve)
+
+        return render_template(
+            path="cbv/attendances/ot_actions.html",
+            context={"instance": self, "minot": minot},
+        )
+
+    def validate_detail_actions(self):
+        """
+        detail view actions of validate tab
+        """
+
+        return render_template(
+            path="cbv/attendances/validate_tab_action.html",
+            context={"instance": self},
+        )
+
+    def ot_detail_actions(self):
+        """
+        detail view actions of OT tab
+        """
+
+        minot = strtime_seconds("00:30")
+        condition = AttendanceValidationCondition.objects.first()
+        if condition is not None:
+            minot = strtime_seconds(condition.minimum_overtime_to_approve)
+
+        return render_template(
+            path="cbv/attendances/ot_tab_action.html",
+            context={"instance": self, "minot": minot},
+        )
+
+    def validated_detail_actions(self):
+        """
+        detail view actions of validated tab
+        """
+
+        return render_template(
+            path="cbv/attendances/validated_tab_action.html",
+            context={"instance": self},
+        )
+
+    def validate_button(self):
+        """
+        detail view actions of validated tab
+        """
+
+        return render_template(
+            path="cbv/attendances/validate_button.html",
+            context={"instance": self},
+        )
+
+    def attendances_detail_subtitle(self):
+        """
+        Return subtitle containing both department and job position information.
+        """
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def activities(self):
+        """
+        This method is used to return the activites and count of activites comes for an attendance
+        """
+        activities = AttendanceActivity.objects.filter(
+            attendance_date=self.attendance_date, employee_id=self.employee_id
+        )
+        return {"query": activities, "count": activities.count()}
 
     def requested_fields(self):
         """
@@ -357,96 +653,184 @@ class Attendance(SolichModel):
         pending_seconds = minimum_hours - worked_hour
         if pending_seconds < 0:
             return "00:00"
+        pending_hours = format_time(pending_seconds)
+        return pending_hours
+
+    def adjust_minimum_hour(self):
+        """
+        Set minimum_hour to 00:00 if the attendance date falls on a holiday or company leave.
+        """
+        if is_holiday(self.attendance_date, self.employee_id) or is_company_leave(
+            self.attendance_date
+        ):
+            self.minimum_hour = "00:00"
+            self.is_holiday = True
         else:
-            pending_hours = format_time(pending_seconds)
-            return pending_hours
+            self.is_holiday = False
 
-    def save(self, *args, **kwargs):
-        minimum_hour = self.minimum_hour
-        self_at_work = self.attendance_worked_hour
+    def update_attendance_overtime(self):
+        """
+        Calculate and update attendance overtime and worked seconds.
+        """
         self.attendance_overtime = format_time(
-            max(0, (strtime_seconds(self_at_work) - strtime_seconds(minimum_hour)))
+            max(
+                0,
+                (
+                    strtime_seconds(self.attendance_worked_hour)
+                    - strtime_seconds(self.minimum_hour)
+                ),
+            )
         )
-        self_overtime = self.attendance_overtime
+        self.at_work_second = strtime_seconds(self.attendance_worked_hour)
+        self.overtime_second = strtime_seconds(self.attendance_overtime)
 
-        self.at_work_second = strtime_seconds(self_at_work)
-        self.overtime_second = strtime_seconds(self_overtime)
-        self.attendance_day = EmployeeShiftDay.objects.get(
-            day=self.attendance_date.strftime("%A").lower()
-        )
-        prev_attendance_approved = False
-
-        # Taking all holidays into a list
-        leaves = []
-        holidays = Holiday.objects.all()
-        for holi in holidays:
-            start_date = holi.start_date
-            end_date = holi.end_date
-
-            # Convert start_date and end_date to datetime objects
-            start_date = datetime.strptime(str(start_date), "%Y-%m-%d")
-            end_date = datetime.strptime(str(end_date), "%Y-%m-%d")
-
-            # Add dates in between start date and end date including both
-            current_date = start_date
-            while current_date <= end_date:
-                leaves.append(current_date.strftime("%Y-%m-%d"))
-                current_date += timedelta(days=1)
-
-        # Checking attendance date is in holiday list, if found making the minimum hour to 00:00
-        if is_holiday(self.attendance_date):
-            self.minimum_hour = "00:00"
-            self.is_holiday = True
-
-        # Checking attendance date is in company leave list, if found making the minimum hour to 00:00
-        if is_company_leave(self.attendance_date):
-            self.minimum_hour = "00:00"
-            self.is_holiday = True
-
+    def handle_overtime_conditions(self):
         condition = AttendanceValidationCondition.objects.first()
         if self.is_validate_request:
-            self.is_validate_request_approved = False
-            self.attendance_validated = False
+            self.is_validate_request_approved = self.attendance_validated = False
 
-        if condition is not None and condition.overtime_cutoff is not None:
-            overtime_cutoff = condition.overtime_cutoff
-            cutoff_seconds = strtime_seconds(overtime_cutoff)
-            overtime = self.overtime_second
-            if overtime > cutoff_seconds:
-                self.overtime_second = cutoff_seconds
-                self.attendance_overtime = format_time(cutoff_seconds)
+        if condition:
+            # Handle overtime cutoff
+            if condition.overtime_cutoff:
+                cutoff_seconds = strtime_seconds(condition.overtime_cutoff)
+                if self.overtime_second > cutoff_seconds:
+                    self.overtime_second = cutoff_seconds
+                    self.attendance_overtime = format_time(cutoff_seconds)
 
-        if self.pk is not None:
-            # Get the previous values of the boolean field
-            prev_state = Attendance.objects.get(pk=self.pk)
-            prev_attendance_approved = prev_state.attendance_overtime_approve
+            # Auto-approve overtime if conditions are met
+            if condition.auto_approve_ot and self.overtime_second >= strtime_seconds(
+                condition.minimum_overtime_to_approve
+            ):
+                self.attendance_overtime_approve = True
 
-        super().save(*args, **kwargs)
-        self.first_save = False
-        employee_ot = self.employee_id.employee_overtime.filter(
-            month=self.attendance_date.strftime("%B").lower(),
-            year=self.attendance_date.strftime("%Y"),
-        )
-        if employee_ot.exists():
-            self.update_ot(employee_ot.first())
+    # def save(self, *args, **kwargs):
+    #     self.update_attendance_overtime()
+    #     self.attendance_day = EmployeeShiftDay.objects.get(
+    #         day=self.attendance_date.strftime("%A").lower()
+    #     )
+    #     prev_attendance_approved = False
+    #     self.adjust_minimum_hour()
+
+    #     # Handle overtime cutoff and auto-approval
+    #     self.handle_overtime_conditions()
+
+    #     if self.pk is not None:
+    #         # Get the previous values of the boolean field
+    #         prev_state = Attendance.objects.get(pk=self.pk)
+    #         prev_attendance_approved = prev_state.attendance_overtime_approve
+
+    #     # super().save(*args, **kwargs)  #commend this line, it take too much time to complete
+    #     employee_ot = self.employee_id.employee_overtime.filter(
+    #         month=self.attendance_date.strftime("%B").lower(),
+    #         year=self.attendance_date.year,
+    #     ).first()
+    #     if employee_ot:
+    #         # Update if exists
+    #         self.update_ot(employee_ot)
+    #     else:
+    #         # Create and update in one call
+    #         employee_ot = self.create_ot()
+    #         self.update_ot(employee_ot)
+    #     approved = self.attendance_overtime_approve
+    #     attendance_account = self.employee_id.employee_overtime.filter(
+    #         month=self.attendance_date.strftime("%B").lower(),
+    #         year=self.attendance_date.year,
+    #     ).first()
+    #     total_ot_seconds = attendance_account.overtime_second
+    #     if approved and prev_attendance_approved is False:
+    #         self.approved_overtime_second = self.overtime_second
+    #         total_ot_seconds = total_ot_seconds + self.approved_overtime_second
+    #     elif not approved:
+    #         total_ot_seconds = total_ot_seconds - self.approved_overtime_second
+    #         self.approved_overtime_second = 0
+    #     attendance_account.overtime = format_time(total_ot_seconds)
+    #     attendance_account.save()
+    #     super().save(*args, **kwargs)
+    #     self.first_save = False
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        old = None
+
+        if not self.attendance_day:
+            self.attendance_day = EmployeeShiftDay.objects.get(
+                day=self.attendance_date.strftime("%A").lower()
+            )
+
+        if not is_new:
+            old = Attendance.objects.only(
+                "at_work_second",
+                "approved_overtime_second",
+                "minimum_hour",
+                "attendance_overtime_approve",
+            ).get(pk=self.pk)
+
+            old_work = old.at_work_second or 0
+            old_approved_ot = old.approved_overtime_second or 0
+            old_approved_flag = old.attendance_overtime_approve or False
+
+            old_min = strtime_seconds(old.minimum_hour)
+            old_pending_today = max(0, old_min - old_work)
         else:
-            self.create_ot()
-            self.update_ot(employee_ot.first())
-        approved = self.attendance_overtime_approve
-        attendance_account = self.employee_id.employee_overtime.filter(
-            month=self.attendance_date.strftime("%B").lower(),
-            year=self.attendance_date.year,
-        ).first()
-        total_ot_seconds = attendance_account.overtime_second
-        if approved and prev_attendance_approved is False:
+            old_work = 0
+            old_approved_ot = 0
+            old_pending_today = 0
+            old_approved_flag = False
+
+        self.update_attendance_overtime()
+        self.adjust_minimum_hour()
+        self.handle_overtime_conditions()
+
+        if self.attendance_overtime_approve and not old_approved_flag:
             self.approved_overtime_second = self.overtime_second
-            total_ot_seconds = total_ot_seconds + self.approved_overtime_second
-        elif not approved:
-            total_ot_seconds = total_ot_seconds - self.approved_overtime_second
+        elif not self.attendance_overtime_approve:
             self.approved_overtime_second = 0
-        attendance_account.overtime = format_time(total_ot_seconds)
-        attendance_account.save()
+        else:
+            self.approved_overtime_second = old_approved_ot
+
+        new_work = self.at_work_second or 0
+        new_approved_ot = self.approved_overtime_second or 0
+
+        new_min = strtime_seconds(self.minimum_hour)
+        new_pending_today = max(0, new_min - new_work)
+
+        diff_work = new_work - old_work
+        diff_approved_ot = new_approved_ot - old_approved_ot
+        diff_pending = new_pending_today - old_pending_today
+
         super().save(*args, **kwargs)
+
+        if diff_work == diff_approved_ot == diff_pending == 0:
+            return
+
+        month = self.attendance_date.strftime("%B").lower()
+        year = self.attendance_date.year
+
+        with transaction.atomic():
+            ot, _ = AttendanceOverTime.objects.get_or_create(
+                employee_id=self.employee_id,
+                month=month,
+                year=year,
+                defaults={
+                    "hour_account_second": 0,
+                    "hour_pending_second": 0,
+                    "overtime_second": 0,
+                },
+            )
+
+            AttendanceOverTime.objects.filter(pk=ot.pk).update(
+                hour_account_second=F("hour_account_second") + diff_work,
+                overtime_second=F("overtime_second") + diff_approved_ot,
+                hour_pending_second=F("hour_pending_second") + diff_pending,
+            )
+
+            ot.refresh_from_db(
+                fields=["hour_account_second", "hour_pending_second", "overtime_second"]
+            )
+            ot.worked_hours = format_time(ot.hour_account_second or 0)
+            ot.pending_hours = format_time(ot.hour_pending_second or 0)
+            ot.overtime = format_time(ot.overtime_second or 0)
+            ot.save(update_fields=["worked_hours", "pending_hours", "overtime"])
 
     def serialize(self):
         """
@@ -466,6 +850,9 @@ class Attendance(SolichModel):
             "work_type_id": self.work_type_id.id if self.work_type_id else "",
             "attendance_worked_hour": self.attendance_worked_hour,
             "minimum_hour": self.minimum_hour,
+            "batch_attendance_id": (
+                self.batch_attendance_id.id if self.batch_attendance_id else ""
+            ),
             # Add other fields you want to store
         }
         return serialized_data
@@ -481,8 +868,8 @@ class Attendance(SolichModel):
                 month=self.attendance_date.strftime("%B").lower(),
                 year=self.attendance_date.strftime("%Y"),
             )
-        if employee_ot.exists():
-            self.update_ot(employee_ot.first())
+            if employee_ot.exists():
+                self.update_ot(employee_ot.first())
         # Call the superclass delete() method to delete the object
         super().delete(*args, **kwargs)
 
@@ -490,96 +877,121 @@ class Attendance(SolichModel):
 
     def create_ot(self):
         """
-        this method is used to create new AttendanceOvertime's instance if there
-        is no existing for a specific month and year
+        Create a new Hours Balance instance if it doesn't exist for a specific month and year.
+        Returns:
+            AttendanceOverTime: The created or fetched AttendanceOverTime instance.
         """
-        employee_ot = AttendanceOverTime()
-        employee_ot.employee_id = self.employee_id
-        employee_ot.month = self.attendance_date.strftime("%B").lower()
-        employee_ot.year = self.attendance_date.year
+        # Create or fetch the AttendanceOverTime instance
+        employee_ot, created = AttendanceOverTime.objects.get_or_create(
+            employee_id=self.employee_id,
+            month=self.attendance_date.strftime("%B").lower(),
+            year=self.attendance_date.year,
+        )
+
+        # Update only if the fields are available
         if self.attendance_overtime_approve:
             employee_ot.overtime = self.attendance_overtime
+
         if self.attendance_validated:
             employee_ot.hour_account = self.attendance_worked_hour
+
         employee_ot.save()
-        return self
+        return employee_ot
 
     def update_ot(self, employee_ot):
         """
-        This method is used to update the overtime
+        Update the hour account for the given employee.
 
         Args:
             employee_ot (obj): AttendanceOverTime instance
         """
-        approved_leave_requests = self.employee_id.leaverequest_set.filter(
-            start_date__lte=self.attendance_date,
-            end_date__gte=self.attendance_date,
-            status="approved",
+        if apps.is_installed("leave"):
+            approved_leave_requests = self.employee_id.leaverequest_set.filter(
+                start_date__lte=self.attendance_date,
+                end_date__gte=self.attendance_date,
+                status="approved",
+            )
+        else:
+            approved_leave_requests = []
+
+        # Create exclude condition using Q objects
+        exclude_condition = Q()
+        if approved_leave_requests:
+            # Combine multiple conditions for the exclude clause
+            for leave in approved_leave_requests:
+                exclude_condition |= Q(
+                    attendance_date__range=(leave.start_date, leave.end_date)
+                )
+
+        # Filter month attendances in a single query
+        month_attendances = (
+            Attendance.objects.filter(
+                employee_id=self.employee_id,
+                attendance_date__month=self.attendance_date.month,
+                attendance_date__year=self.attendance_date.year,
+                attendance_validated=True,
+            )
+            .exclude(exclude_condition)
+            .values("minimum_hour", "at_work_second")
         )
 
-        # Create a Q object to combine multiple conditions for the exclude clause
-        exclude_condition = Q()
-        for leave_request in approved_leave_requests:
-            exclude_condition |= Q(
-                attendance_date__range=(
-                    leave_request.start_date,
-                    leave_request.end_date,
-                )
-            )
-
-        # Filter Attendance objects
-        month_attendances = Attendance.objects.filter(
-            employee_id=self.employee_id,
-            attendance_date__month=self.attendance_date.month,
-            attendance_date__year=self.attendance_date.year,
-            attendance_validated=True,
-        ).exclude(exclude_condition)
+        # Calculate hour balance and hours pending in a single loop
         hour_balance = 0
-        hours_pending = 0
         minimum_hour_second = 0
         for attendance in month_attendances:
-            required_work_second = strtime_seconds(attendance.minimum_hour)
-            at_work_second = min(
-                required_work_second,
-                attendance.at_work_second,
-            )
-            hour_balance = hour_balance + at_work_second
-            minimum_hour_second += strtime_seconds(attendance.minimum_hour)
-            hours_pending = minimum_hour_second - hour_balance
+            required_work_second = strtime_seconds(attendance["minimum_hour"])
+            at_work_second = min(required_work_second, attendance["at_work_second"])
+            hour_balance += at_work_second
+            minimum_hour_second += required_work_second
+
+        hours_pending = minimum_hour_second - hour_balance
         employee_ot.worked_hours = format_time(hour_balance)
         employee_ot.pending_hours = format_time(hours_pending)
         employee_ot.save()
+
         return employee_ot
 
     def clean(self, *args, **kwargs):
         super().clean(*args, **kwargs)
         now = datetime.now().time()
         today = datetime.today().date()
-        out_time = self.attendance_clock_out
-        if self.attendance_clock_in_date < self.attendance_date:
+
+        # Convert to time if it's a string
+        if isinstance(self.attendance_clock_out, str):
+            out_time = datetime.strptime(self.attendance_clock_out, "%H:%M:%S").time()
+        else:
+            out_time = self.attendance_clock_out
+
+        if (
+            self.attendance_clock_in_date
+            and self.attendance_clock_in_date < self.attendance_date
+        ):
             raise ValidationError(
                 {
-                    "attendance_clock_in_date": "Attendance check-in date never smaller than attendance date"
+                    "attendance_clock_in_date": "Attendance check-in date cannot be earlier than attendance date"
                 }
             )
+
         if (
             self.attendance_clock_out_date
+            and self.attendance_clock_in_date
             and self.attendance_clock_out_date < self.attendance_clock_in_date
         ):
             raise ValidationError(
                 {
-                    "attendance_clock_out_date": "Attendance check-out date never smaller than attendance check-in date"
+                    "attendance_clock_out_date": "Attendance check-out date cannot be earlier than check-in date"
                 }
             )
+
         if self.attendance_clock_out_date and self.attendance_clock_out_date >= today:
             if out_time > now:
                 raise ValidationError(
-                    {"attendance_clock_out": "Check out time not allow in the future"}
+                    {"attendance_clock_out": "Check-out time cannot be in the future"}
                 )
 
 
 class AttendanceRequestFile(SolichModel):
-    file = models.FileField(upload_to="attendance/request_files")
+    file = models.FileField(upload_to=upload_path)
 
 
 class AttendanceRequestComment(SolichModel):
@@ -664,6 +1076,84 @@ class AttendanceOverTime(SolichModel):
 
         unique_together = [("employee_id"), ("month"), ("year")]
         ordering = ["-year", "-month_sequence"]
+        verbose_name = _("Hours Balance")
+        verbose_name_plural = _("Hours Balances")
+
+    def __str__(self):
+        return f"{self.employee_id} - {self.month}"
+
+    def get_month_capitalized(self):
+        """
+        capitalize month
+        """
+        return self.month.capitalize()
+
+    def edit_url_overtime(self):
+        """
+        Edit url
+        """
+
+        url = reverse("attendance-overtime-update", kwargs={"obj_id": self.pk})
+
+        return url
+
+    def delete_url_overtime(self):
+        """
+        delete url
+        """
+
+        url = reverse("attendance-overtime-delete", kwargs={"obj_id": self.pk})
+
+        return url
+
+    def hour_actions(self):
+        """
+        actions in hour account
+
+        """
+
+        return render_template(
+            path="cbv/hour_account/hour_actions.html",
+            context={"instance": self},
+        )
+
+    def hour_options(self):
+        """
+        options in hour account
+
+        """
+
+        return render_template(
+            path="cbv/hour_account/hour_options.html",
+            context={"instance": self},
+        )
+
+    def hour_account_subtitle(self):
+        """
+        Detail view subtitle
+        """
+
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def hour_account_detail(self):
+        """
+        detail view
+        """
+
+        url = reverse("hour-account-detail-view", kwargs={"pk": self.pk})
+
+        return url
+
+    def hour_detail_actions(self):
+        """
+        actions in hour account detail view
+
+        """
+
+        return render_template(
+            path="cbv/hour_account/hour_detail_action.html",
+            context={"instance": self},
+        )
 
     def clean(self):
         try:
@@ -698,7 +1188,7 @@ class AttendanceOverTime(SolichModel):
         hrs_to_vlaidate = sum(
             list(
                 Attendance.objects.filter(
-                    attendance_date__month=month_mapping[self.month],
+                    attendance_date__month=MONTH_MAPPING[self.month],
                     attendance_date__year=self.year,
                     employee_id=self.employee_id,
                     attendance_validated=False,
@@ -714,11 +1204,12 @@ class AttendanceOverTime(SolichModel):
         hrs_to_approve = sum(
             list(
                 Attendance.objects.filter(
-                    attendance_date__month=month_mapping[self.month],
+                    attendance_date__month=MONTH_MAPPING[self.month],
                     attendance_date__year=self.year,
                     employee_id=self.employee_id,
                     attendance_validated=True,
                     attendance_overtime_approve=False,
+                    overtime_second__isnull=False,
                 ).values_list("overtime_second", flat=True)
             )
         )
@@ -728,12 +1219,35 @@ class AttendanceOverTime(SolichModel):
         """
         This method will return the index of the month
         """
-        return month_mapping[self.month]
+        return MONTH_MAPPING[self.month]
+
+    # def save(self, *args, **kwargs):
+    #     self.hour_account_second = strtime_seconds(self.worked_hours)
+    #     self.hour_pending_second = strtime_seconds(self.pending_hours)
+    #     self.overtime_second = strtime_seconds(self.overtime)
+    #     month_name = self.month.split("-")[0]
+    #     months = [
+    #         "january",
+    #         "february",
+    #         "march",
+    #         "april",
+    #         "may",
+    #         "june",
+    #         "july",
+    #         "august",
+    #         "september",
+    #         "october",
+    #         "november",
+    #         "december",
+    #     ]
+    #     self.month_sequence = months.index(month_name)
+    #     super().save(*args, **kwargs)
 
     def save(self, *args, **kwargs):
-        self.hour_account_second = strtime_seconds(self.worked_hours)
-        self.hour_pending_second = strtime_seconds(self.pending_hours)
-        self.overtime_second = strtime_seconds(self.overtime)
+        self.worked_hours = format_time(self.hour_account_second or 0)
+        self.pending_hours = format_time(self.hour_pending_second or 0)
+        self.overtime = format_time(self.overtime_second or 0)
+
         month_name = self.month.split("-")[0]
         months = [
             "january",
@@ -750,6 +1264,7 @@ class AttendanceOverTime(SolichModel):
             "december",
         ]
         self.month_sequence = months.index(month_name)
+
         super().save(*args, **kwargs)
 
 
@@ -759,8 +1274,8 @@ class AttendanceLateComeEarlyOut(SolichModel):
     """
 
     choices = [
-        ("late_come", _("Late Come")),
-        ("early_out", _("Early Out")),
+        ("late_come", _("Late Arrival")),
+        ("early_out", _("Early Departure")),
     ]
 
     attendance_id = models.ForeignKey(
@@ -787,7 +1302,7 @@ class AttendanceLateComeEarlyOut(SolichModel):
         """
         This method is used to return the total penalties in the late early instance
         """
-        return self.penaltyaccount_set.count()
+        return self.penaltyaccounts_set.count()
 
     def save(self, *args, **kwargs) -> None:
         super().save(*args, **kwargs)
@@ -802,6 +1317,71 @@ class AttendanceLateComeEarlyOut(SolichModel):
         unique_together = [("attendance_id"), ("type")]
         ordering = ["-attendance_id__attendance_date"]
 
+    def get_type(self):
+        """
+        Display work type
+        """
+        choices = [
+            ("late_come", _("Late Arrival")),
+            ("early_out", _("Early Departure")),
+        ]
+        return dict(choices).get(self.type)
+
+    def penalities_column(self):
+        """
+        To get penalities
+
+        """
+
+        return render_template(
+            path="cbv/late_come_and_early_out/penality.html",
+            context={"instance": self},
+        )
+
+    def actions_column(self):
+        """
+        actions in hour account
+
+        """
+
+        return render_template(
+            path="cbv/late_come_and_early_out/actions_column.html",
+            context={"instance": self},
+        )
+
+    def detail_actions(self):
+        """
+        actions in hour account
+
+        """
+
+        return render_template(
+            path="cbv/late_come_and_early_out/detail_action.html",
+            context={"instance": self},
+        )
+
+    def late_come_subtitle(self):
+        """
+        Detail view subtitle
+        """
+
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def attendance_validated_check(self):
+        if self.attendance_id.attendance_validated == True:
+            return _("Yes")
+        else:
+            return _("No")
+
+    def late_come_detail(self):
+        """
+        detail view
+        """
+
+        url = reverse("late-in-early-out-single-view", kwargs={"pk": self.pk})
+
+        return url
+
     def __str__(self) -> str:
         return f"{self.attendance_id.employee_id.employee_first_name} \
             {self.attendance_id.employee_id.employee_last_name} - {self.type}"
@@ -813,13 +1393,18 @@ class AttendanceValidationCondition(SolichModel):
     """
 
     validation_at_work = models.CharField(
-        max_length=10, validators=[validate_time_format]
+        max_length=10,
+        validators=[validate_time_format],
+        verbose_name=_("Worked Hours Auto Approve Till"),
     )
     minimum_overtime_to_approve = models.CharField(
         blank=True, null=True, max_length=10, validators=[validate_time_format]
     )
     overtime_cutoff = models.CharField(
         blank=True, null=True, max_length=10, validators=[validate_time_format]
+    )
+    auto_approve_ot = models.BooleanField(
+        default=False, verbose_name=_("Auto Approve OT")
     )
     company_id = models.ManyToManyField(Company, blank=True, verbose_name=_("Company"))
     objects = SolichCompanyManager()
@@ -832,131 +1417,16 @@ class AttendanceValidationCondition(SolichModel):
         if not self.id and AttendanceValidationCondition.objects.exists():
             raise ValidationError(_("You cannot add more conditions."))
 
+    def break_point_actions(self):
+        """
+        actions in hour account
 
-months = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
+        """
 
-
-class PenaltyAccount(SolichModel):
-    """
-    LateComeEarlyOutPenaltyAccount
-    """
-
-    employee_id = models.ForeignKey(
-        Employee,
-        on_delete=models.PROTECT,
-        related_name="penalty_set",
-        editable=False,
-        verbose_name="Employee",
-        null=True,
-    )
-    late_early_id = models.ForeignKey(
-        AttendanceLateComeEarlyOut, on_delete=models.CASCADE, null=True, editable=False
-    )
-    leave_request_id = models.ForeignKey(
-        LeaveRequest, null=True, on_delete=models.CASCADE, editable=False
-    )
-    leave_type_id = models.ForeignKey(
-        LeaveType,
-        on_delete=models.DO_NOTHING,
-        blank=True,
-        null=True,
-        verbose_name="Leave type",
-    )
-    minus_leaves = models.FloatField(default=0.0, null=True)
-    deduct_from_carry_forward = models.BooleanField(default=False)
-    penalty_amount = models.FloatField(default=0.0, null=True)
-
-    def clean(self) -> None:
-        super().clean()
-        if not self.leave_type_id and self.minus_leaves:
-            raise ValidationError(
-                {"leave_type_id": _("Specify the leave type to deduct the leave.")}
-            )
-        if self.leave_type_id and not self.minus_leaves:
-            raise ValidationError(
-                {
-                    "minus_leaves": _(
-                        "If a leave type is chosen for a penalty, minus leaves are required."
-                    )
-                }
-            )
-        if not self.minus_leaves and not self.penalty_amount:
-            raise ValidationError(
-                {
-                    "leave_type_id": _(
-                        "Either minus leaves or a penalty amount is required"
-                    )
-                }
-            )
-
-        if (
-            self.minus_leaves or self.deduct_from_carry_forward
-        ) and not self.leave_type_id:
-            raise ValidationError({"leave_type_id": _("Leave type is required")})
-        return
-
-    class Meta:
-        ordering = ["-created_at"]
-
-
-@receiver(post_save, sender=PenaltyAccount)
-def create_initial_stage(sender, instance, created, **kwargs):
-    """
-    This is post save method, used to create initial stage for the recruitment
-    """
-    # only work when creating
-    if created:
-        penalty_amount = instance.penalty_amount
-        if penalty_amount:
-            from payroll.models.models import Deduction
-
-            penalty = Deduction()
-            if instance.late_early_id:
-                penalty.title = f"{instance.late_early_id.get_type_display()} penalty"
-                penalty.one_time_date = (
-                    instance.late_early_id.attendance_id.attendance_date
-                )
-            elif instance.leave_request_id:
-                penalty.title = f"Leave penalty {instance.leave_request_id.end_date}"
-                penalty.one_time_date = instance.leave_request_id.end_date
-            else:
-                penalty.title = f"Penalty on {datetime.today()}"
-                penalty.one_time_date = datetime.today()
-            penalty.include_active_employees = False
-            penalty.is_fixed = True
-            penalty.amount = instance.penalty_amount
-            penalty.only_show_under_employee = True
-            penalty.save()
-            penalty.include_active_employees = False
-            penalty.specific_employees.add(instance.employee_id)
-            penalty.save()
-
-        if instance.leave_type_id and instance.minus_leaves:
-            available = instance.employee_id.available_leave.filter(
-                leave_type_id=instance.leave_type_id
-            ).first()
-            unit = round(instance.minus_leaves * 2) / 2
-            if not instance.deduct_from_carry_forward:
-                available.available_days = max(0, (available.available_days - unit))
-            else:
-                available.carryforward_days = max(
-                    0, (available.carryforward_days - unit)
-                )
-
-            available.save()
+        return render_template(
+            path="cbv/settings/break_point_action.html",
+            context={"instance": self},
+        )
 
 
 class GraceTime(SolichModel):
@@ -968,14 +1438,18 @@ class GraceTime(SolichModel):
         default="00:00:00",
         validators=[validate_hh_mm_ss_format],
         max_length=10,
-        verbose_name=_("Allowed time"),
+        verbose_name=_("Allowed Time"),
     )
     allowed_time_in_secs = models.IntegerField()
     allowed_clock_in = models.BooleanField(
-        default=True, help_text=_("Allcocate this grace time for Check-In Attendance")
+        default=True,
+        help_text=_("Allcocate this grace time for Check-In Attendance"),
+        verbose_name=_("Allowed Clock-In"),
     )
     allowed_clock_out = models.BooleanField(
-        default=False, help_text=_("Allcocate this grace time for Check-Out Attendance")
+        default=False,
+        help_text=_("Allcocate this grace time for Check-Out Attendance"),
+        verbose_name=_("Allowed Clock-Out"),
     )
     is_default = models.BooleanField(default=False)
 
@@ -984,6 +1458,71 @@ class GraceTime(SolichModel):
 
     def __str__(self) -> str:
         return str(f"{self.allowed_time} - Hours")
+
+    def get_instance_id(self):
+        return self.id
+
+    def is_active_col(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/settings/is_active_col_grace_time.html",
+            context={"instance": self},
+        )
+
+    def allowed_time_col(self):
+        """
+        Allowed time col
+        """
+        return f"{self.allowed_time} Hours"
+
+    def is_default_col(self):
+        """
+        Allowed time col
+        """
+        return _("Yes") if self.is_default else _("No")
+
+    def action_col(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/settings/grace_time_default_action.html",
+            context={"instance": self},
+        )
+
+    def applicable_on_clock_in_col(self):
+        """
+        This method for get custom column .
+        """
+
+        return render_template(
+            path="cbv/settings/applicable_on_clock_in_col.html",
+            context={"instance": self},
+        )
+
+    def applicable_on_clock_out_col(self):
+        """
+        This method for get custom column .
+        """
+
+        return render_template(
+            path="cbv/settings/applicable_on_clock_out_col.html",
+            context={"instance": self},
+        )
+
+    def get_shifts_display(self):
+        """
+        This method for get custom column .
+        """
+
+        return render_template(
+            path="cbv/settings/grace_time_shift.html",
+            context={"instance": self},
+        )
 
     def clean(self):
         """
@@ -1037,5 +1576,242 @@ class AttendanceGeneralSetting(SolichModel):
     """
 
     time_runner = models.BooleanField(default=True)
+    enable_check_in = models.BooleanField(
+        default=True,
+        verbose_name=_("Enable Check in/Check out"),
+        help_text=_(
+            "Enabling this feature allows employees to record their attendance using the Check-In/Check-Out button."
+        ),
+    )
     company_id = models.ForeignKey(Company, on_delete=models.CASCADE, null=True)
+    objects = SolichCompanyManager()
 
+    def company_col(self):
+        if self.company_id:
+            return self.company_id.company
+        else:
+            return "All Company"
+
+    def check_in_check_out_col(self):
+        """
+        This method for get custom coloumn .
+        """
+
+        return render_template(
+            path="cbv/settings/check_in_check_out_col.html",
+            context={"instance": self},
+        )
+
+
+class WorkRecords(models.Model):
+    """
+    WorkRecord Model
+    """
+
+    choices = [
+        ("FDP", _("Present")),
+        ("HDP", _("Half Day Present")),
+        ("ABS", _("Absent")),
+        ("HD", _("Holiday / Weekly Off")),
+        ("CONF", _("Conflict")),
+        ("DFT", _("Draft")),
+    ]
+
+    record_name = models.CharField(max_length=250, null=True, blank=True)
+    work_record_type = models.CharField(max_length=10, null=True, choices=choices)
+    employee_id = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, verbose_name=_("Employee")
+    )
+    date = models.DateField(null=True, blank=True)
+    at_work = models.CharField(
+        null=True,
+        blank=True,
+        validators=[
+            validate_time_format,
+        ],
+        default="00:00",
+        max_length=10,
+    )  # 841
+    min_hour = models.CharField(
+        null=True,
+        blank=True,
+        validators=[
+            validate_time_format,
+        ],
+        default="00:00",
+        max_length=10,
+    )
+    at_work_second = models.IntegerField(null=True, blank=True, default=0)
+    min_hour_second = models.IntegerField(null=True, blank=True, default=0)
+    note = models.TextField(max_length=255)
+    message = models.CharField(max_length=30, null=True, blank=True)
+    is_attendance_record = models.BooleanField(default=False)
+    attendance_id = models.ForeignKey(
+        Attendance, on_delete=models.SET_NULL, blank=True, null=True
+    )
+    is_leave_record = models.BooleanField(default=False)
+    if apps.is_installed("leave"):
+        leave_request_id = models.ForeignKey(
+            "leave.LeaveRequest",
+            on_delete=models.SET_NULL,
+            blank=True,
+            null=True,
+        )
+    shift_id = models.ForeignKey(
+        EmployeeShift, on_delete=models.SET_NULL, blank=True, null=True
+    )
+    day_percentage = models.FloatField(default=0)
+    last_update = models.DateTimeField(null=True, blank=True)
+    objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    def title_message(self):
+        title_message = self.message
+        if title_message == "Leave":
+            if apps.is_installed("leave"):
+                title_message += f" | {self.leave_request_id.leave_type_id}"
+        return title_message
+
+    def save(self, *args, **kwargs):
+        self.last_update = timezone.now()
+
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        if not 0.0 <= self.day_percentage <= 1.0:
+            raise ValidationError(_("Day percentage must be between 0.0 and 1.0"))
+
+    def __str__(self):
+        return (
+            self.record_name
+            if self.record_name is not None
+            else f"{self.work_record_type}-{self.date}-{self.employee_id}"
+        )
+
+    class Meta:
+        verbose_name = _("Daily Work Status")
+        verbose_name_plural = _("Daily Work Status")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee_id", "date"],
+                name="unique_work_record_per_employee_per_date",
+            )
+        ]
+
+
+class AttendanceConflictResolution(SolichModel):
+    """
+    HR decision for days where an attendance record overlaps a leave/holiday/week-off.
+    resolution="attendance" → the day counts as attendance (leave/holiday ignored in summary).
+    resolution="leave"      → the day counts as leave/holiday (attendance ignored in summary).
+    """
+
+    employee_id = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="conflict_resolutions",
+        verbose_name=_("Employee"),
+    )
+    date = models.DateField(verbose_name=_("Date"))
+    resolution = models.CharField(
+        max_length=20,
+        choices=[
+            ("full_present", _("Full Present")),
+            ("half_present", _("Half Day")),
+            ("partial_hours", _("Partial Hours")),
+            ("absent", _("Absent")),
+            ("paid_leave", _("Paid Leave")),
+            ("unpaid_leave", _("Unpaid Leave")),
+            ("holiday", _("Holiday")),
+            ("week_off", _("Week Off")),
+            # legacy values kept for existing records
+            ("attendance", _("Count as Attendance")),
+            ("leave", _("Count as Leave / Holiday")),
+        ],
+        verbose_name=_("Resolution"),
+    )
+    conflict_type = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        verbose_name=_("Conflict Type"),
+    )
+    objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    class Meta:
+        unique_together = [["employee_id", "date"]]
+        verbose_name = _("Attendance Conflict Resolution")
+        verbose_name_plural = _("Attendance Conflict Resolutions")
+
+    def __str__(self):
+        return f"{self.employee_id} — {self.date} → {self.resolution}"
+
+
+class AttendanceSummaryHours(SolichModel):
+    """
+    Stores computed (or HR-overridden) total worked seconds for an employee
+    over a specific date range.  Created/updated on every summary load;
+    is_manually_edited=True records are never overwritten by the auto-compute.
+    """
+
+    employee_id = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="summary_hours",
+        verbose_name=_("Employee"),
+    )
+    from_date = models.DateField(verbose_name=_("From Date"))
+    to_date = models.DateField(verbose_name=_("To Date"))
+    hours_second = models.IntegerField(
+        default=0,
+        verbose_name=_("Hours (seconds)"),
+    )
+    is_manually_edited = models.BooleanField(
+        default=False,
+        verbose_name=_("Manually Edited"),
+    )
+
+    objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    class Meta:
+        unique_together = [["employee_id", "from_date", "to_date"]]
+        verbose_name = _("Attendance Summary Hours")
+        verbose_name_plural = _("Attendance Summary Hours")
+
+    def __str__(self):
+        h, m = self.hours_second // 3600, (self.hours_second % 3600) // 60
+        return f"{self.employee_id} {self.from_date}–{self.to_date}: {h}h{m:02d}m"
+
+
+class AttendanceDailyHours(SolichModel):
+    """
+    Per-employee per-date worked hours, editable inside the calendar modal.
+    Created when a manager manually edits a single day's hours.
+    When present with is_manually_edited=True, overrides the computed daily
+    contribution in build_monthly_summary.
+    """
+
+    employee_id = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="daily_hours",
+        verbose_name=_("Employee"),
+    )
+    date = models.DateField(verbose_name=_("Date"))
+    hours_second = models.IntegerField(default=0, verbose_name=_("Hours (seconds)"))
+    is_manually_edited = models.BooleanField(
+        default=False,
+        verbose_name=_("Manually Edited"),
+    )
+    modified_at = models.DateTimeField(auto_now=True, verbose_name=_("Modified At"))
+
+    objects = SolichCompanyManager("employee_id__employee_work_info__company_id")
+
+    class Meta:
+        unique_together = [["employee_id", "date"]]
+        verbose_name = _("Attendance Daily Hours")
+        verbose_name_plural = _("Attendance Daily Hours")
+
+    def __str__(self):
+        h, m = self.hours_second // 3600, (self.hours_second % 3600) // 60
+        return f"{self.employee_id} {self.date}: {h}h{m:02d}m"

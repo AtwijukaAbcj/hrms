@@ -13,29 +13,39 @@ provide the main entry points for interacting with the application's functionali
 
 import ast
 import calendar
+import contextlib
 import json
 import operator
 import os
-import re
+import threading
 from datetime import date, datetime, timedelta
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import pandas as pd
+from django.apps import apps
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.models import User
+from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
-from django.db.models import F, ProtectedError
-from django.forms import DateInput, Select
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, QueryDict
+from django.db.models import F, ProtectedError, Q
+from django.db.models.query import QuerySet
+from django.forms import DateInput, HiddenInput, Select
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.html import format_html
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
 
-from attendance.models import Attendance, AttendanceOverTime
+from accessibility.decorators import enter_if_accessible
+from accessibility.methods import update_employee_accessibility_cache
+from accessibility.middlewares import ACCESSIBILITY_CACHE_USER_KEYS
+from accessibility.models import DefaultAccessibility
 from base.forms import ModelForm
 from base.methods import (
     choosesubordinates,
@@ -43,23 +53,22 @@ from base.methods import (
     filtersubordinatesemployeemodel,
     get_key_instances,
     get_pagination,
+    has_export_access,
     sortby,
 )
 from base.models import (
     Company,
     Department,
     EmailLog,
-    EmployeeShift,
-    EmployeeType,
     JobPosition,
     JobRole,
     RotatingShiftAssign,
     RotatingWorkTypeAssign,
     ShiftRequest,
-    WorkType,
     WorkTypeRequest,
-    clear_messages,
 )
+from base.views import generate_error_report
+from employee.cbv.document_request import htmx_refresh_document_request_container
 from employee.filters import DocumentRequestFilter, EmployeeFilter, EmployeeReGroup
 from employee.forms import (
     BonusPointAddForm,
@@ -69,18 +78,36 @@ from employee.forms import (
     EmployeeBankDetailsUpdateForm,
     EmployeeExportExcelForm,
     EmployeeForm,
+    EmployeeGeneralSettingPrefixForm,
     EmployeeNoteForm,
+    EmployeeTagForm,
     EmployeeWorkInformationForm,
     EmployeeWorkInformationUpdateForm,
     excel_columns,
 )
-from employee.methods.methods import get_ordered_badge_ids
+from employee.methods.methods import (
+    bulk_create_department_import,
+    bulk_create_employee_import,
+    bulk_create_employee_types,
+    bulk_create_job_position_import,
+    bulk_create_job_role_import,
+    bulk_create_shifts,
+    bulk_create_user_import,
+    bulk_create_work_info_import,
+    bulk_create_work_types,
+    error_data_template,
+    get_ordered_badge_ids,
+    process_employee_records,
+    set_initial_password,
+    valid_import_file_headers,
+)
 from employee.models import (
     BonusPoint,
     Employee,
     EmployeeBankDetails,
     EmployeeGeneralSetting,
     EmployeeNote,
+    EmployeeTag,
     EmployeeWorkInformation,
     NoteFiles,
 )
@@ -94,7 +121,10 @@ from solich.decorators import (
 )
 from solich.filters import SolichPaginator
 from solich.group_by import group_by_queryset
+from solich.http.response import SolichRedirect
+from solich.methods import dynamic_attr, get_solich_model_class
 from solich_audit.models import AccountBlockUnblock, HistoryTrackingFields
+from solich_auth.models import SolichUser
 from solich_documents.forms import (
     DocumentForm,
     DocumentRejectForm,
@@ -102,19 +132,12 @@ from solich_documents.forms import (
     DocumentUpdateForm,
 )
 from solich_documents.models import Document, DocumentRequest
-from leave.models import LeaveGeneralSetting, LeaveRequest
 from notifications.signals import notify
-from onboarding.models import OnboardingStage, OnboardingTask
-from payroll.methods.payslip_calc import dynamic_attr
-from payroll.models.models import (
-    Allowance,
-    Contract,
-    Deduction,
-    EncashmentGeneralSettings,
-    Reimbursement,
-)
-from pms.models import Feedback
-from recruitment.models import Candidate, InterviewSchedule, Recruitment, Stage
+
+
+def return_none(a, b):
+    return None
+
 
 operator_mapping = {
     "equal": operator.eq,
@@ -124,6 +147,7 @@ operator_mapping = {
     "le": operator.le,
     "ge": operator.ge,
     "icontains": operator.contains,
+    "range": return_none,
 }
 filter_mapping = {
     "work_type_id": {
@@ -155,18 +179,32 @@ filter_mapping = {
     },
 }
 
+BLOCKED_EXTENSIONS = {
+    ".html",
+    ".htm",
+    ".js",
+    ".svg",
+    ".xml",
+    ".php",
+    ".py",
+    ".sh",
+    ".exe",
+}
 
-# Create your views here.
-@login_required
-def get_language_code(request):
-    """
-    Retrieve the language code for the current request.
 
-    This view function extracts the LANGUAGE_CODE from the request object and
-    returns it as a JSON response. This function requires the user to be logged in.
-    """
-    language_code = request.LANGUAGE_CODE
-    return JsonResponse({"language_code": language_code})
+def _check_reporting_manager(request, *args, **kwargs):
+    if kwargs.get("obj_id"):
+        obj_id = kwargs["obj_id"]
+        emp = Employee.objects.get(id=obj_id)
+        re_manager = None
+        if emp.employee_work_info.reporting_manager_id != None:
+            re_manager = emp.employee_work_info.reporting_manager_id
+        employee = request.user.employee_get
+        if re_manager != None:
+            return re_manager == employee
+        else:
+            return False
+    return request.user.employee_get.reporting_manager.exists()
 
 
 @login_required
@@ -174,23 +212,21 @@ def employee_profile(request):
     """
     This method is used to view own profile of employee.
     """
-    user = request.user
     employee = request.user.employee_get
-    user_leaves = employee.available_leave.all().exclude(
-        leave_type_id__is_compensatory_leave=True
-    )
-    if (
-        LeaveGeneralSetting.objects.first()
-        and LeaveGeneralSetting.objects.first().compensatory_leave
-    ):
-        user_leaves = employee.available_leave.all()
-    instances = LeaveRequest.objects.filter(employee_id=employee)
-    leave_request_ids = json.dumps([instance.id for instance in instances])
-    assets = employee.allocated_employee.all()
-    feedback_own = Feedback.objects.filter(employee_id=employee, archive=False)
-    interviews = InterviewSchedule.objects.filter(employee_id=employee).order_by(
-        "-interview_date"
-    )
+    selected_company = request.session.get("selected_company")
+    if selected_company != "all":
+        company_id = getattr(
+            getattr(getattr(employee, "employee_work_info", None), "company_id", None),
+            "id",
+            None,
+        )
+
+        if str(company_id) != str(selected_company):
+            messages.error(
+                request, _("Employee is not working in the selected company.")
+            )
+            return redirect("employee-view")
+
     today = datetime.today()
     now = timezone.now()
     return render(
@@ -198,24 +234,24 @@ def employee_profile(request):
         "employee/profile/profile_view.html",
         {
             "employee": employee,
-            "user_leaves": user_leaves,
-            "assets": assets,
-            "leave_request_ids": leave_request_ids,
-            "self_feedback": feedback_own,
             "current_date": today,
-            "interviews": interviews,
             "now": now,
         },
     )
 
 
 @login_required
+@enter_if_accessible(
+    feature="profile_edit",
+    perm="employee.change_employee",
+)
 def self_info_update(request):
     """
     This method is used to update own profile of an employee.
     """
     user = request.user
     employee = Employee.objects.filter(employee_user_id=user).first()
+    badge_id = employee.badge_id
     bank_form = EmployeeBankDetailsForm(
         instance=EmployeeBankDetails.objects.filter(employee_id=employee).first()
     )
@@ -227,6 +263,8 @@ def self_info_update(request):
             if form.is_valid():
                 instance = form.save(commit=False)
                 instance.employee_user_id = user
+                if instance.badge_id is None:
+                    instance.badge_id = badge_id
                 instance.save()
                 messages.success(request, _("Profile updated."))
         elif request.POST.get("any_other_code1") is not None:
@@ -247,255 +285,139 @@ def self_info_update(request):
     )
 
 
+def profile_edit_access(request, emp_id):
+    feature = request.GET.get("feature", None)
+    accessibility = DefaultAccessibility.objects.filter(feature=feature).first()
+    if accessibility:
+        employees = Employee.objects.filter(id=emp_id)
+
+        if employee := employees.first():
+            if employee in accessibility.employees.all():
+                accessibility.employees.remove(employee)
+            else:
+                accessibility.employees.add(employee)
+
+            user_cache_key = ACCESSIBILITY_CACHE_USER_KEYS.get(
+                employees.first().employee_user_id.id, None
+            )
+            if user_cache_key:
+                cache.delete(user_cache_key[-1])
+                update_employee_accessibility_cache(user_cache_key[-1], employee)
+
+    return SolichRedirect(request)
+
+
 @login_required
+@enter_if_accessible(
+    feature="employee_detailed_view",
+    perm="employee.view_employee",
+    method=_check_reporting_manager,
+)
 def employee_view_individual(request, obj_id, **kwargs):
     """
     This method is used to view profile of an employee.
     """
-    employee = Employee.objects.get(id=obj_id)
-    instances = LeaveRequest.objects.filter(employee_id=employee)
-    leave_request_ids = json.dumps([instance.id for instance in instances])
-    employee_leaves = employee.available_leave.all()
-    enabled_block_unblock = (
-        AccountBlockUnblock.objects.exists()
-        and AccountBlockUnblock.objects.first().is_enabled
-    )
-    # Retrieve the filtered employees from the session
-    filtered_employee_ids = request.session.get("filtered_employees", [])
-    filtered_employees = Employee.objects.filter(id__in=filtered_employee_ids)
+    try:
+        employee = Employee.objects.get(id=obj_id)
+    except ObjectDoesNotExist:
+        try:
+            employee = Employee.objects.entire().get(id=obj_id)
+            company = getattr(
+                getattr(employee, "employee_work_info", None), "company_id", None
+            )
+            company_id = getattr(company, "pk", None)
+            if company_id != request.session["selected_company"]:
+                messages.error(
+                    request, _("Employee is not working in the selected company.")
+                )
+                return redirect("employee-view")
+        except Exception as e:
+            return render(request, "404.html", status=404)
 
-    request_ids_str = json.dumps(
-        [
-            instance.id
-            for instance in paginator_qry(
-                filtered_employees, request.GET.get("page")
-            ).object_list
-        ]
-    )
+    # request_ids_str = json.dumps(
+    #     [
+    #         instance.id
+    #         for instance in paginator_qry(
+    #             filtered_employees, request.GET.get("page")
+    #         ).object_list
+    #     ]
+    # )
 
-    # Convert the string to an actual list of integers
-    requests_ids = (
-        ast.literal_eval(request_ids_str)
-        if isinstance(request_ids_str, str)
-        else request_ids_str
-    )
+    # # Convert the string to an actual list of integers
+    # requests_ids = (
+    #     ast.literal_eval(request_ids_str)
+    #     if isinstance(request_ids_str, str)
+    #     else request_ids_str
+    # )
 
-    employee_id = employee.id
-    previous_id = None
-    next_id = None
+    # employee_id = employee.id
+    # previous_id = None
+    # next_id = None
 
-    for index, req_id in enumerate(requests_ids):
-        if req_id == employee_id:
+    # for index, req_id in enumerate(requests_ids):
+    #     if req_id == employee_id:
 
-            if index == len(requests_ids) - 1:
-                next_id = None
-            else:
-                next_id = requests_ids[index + 1]
-            if index == 0:
-                previous_id = None
-            else:
-                previous_id = requests_ids[index - 1]
-            break
+    #         if index == len(requests_ids) - 1:
+    #             next_id = None
+    #         else:
+    #             next_id = requests_ids[index + 1]
+    #         if index == 0:
+    #             previous_id = None
+    #         else:
+    #             previous_id = requests_ids[index - 1]
+    #         break
 
-    context = {
-        "employee": employee,
-        "previous": previous_id,
-        "next": next_id,
-        "requests_ids": requests_ids,
-        "current_date": date.today(),
-        "leave_request_ids": leave_request_ids,
-        "enabled_block_unblock": enabled_block_unblock,
-    }
-    # if the requesting user opens own data
-    if request.user.employee_get == employee:
-        context["user_leaves"] = employee_leaves
-    else:
-        context["employee_leaves"] = employee_leaves
+    # context = {
+    #     "employee": employee,
+    #     "previous": previous_id,
+    #     "next": next_id,
+    #     "requests_ids": requests_ids,
+    #     "current_date": date.today(),
+    #     "leave_request_ids": json.dumps([]),
+    #     "enabled_block_unblock": enabled_block_unblock,
+    # }
+    # # if the requesting user opens own data
+    # if request.user.employee_get == employee:
+    #     context["user_leaves"] = employee_leaves
+    # else:
+    #     context["employee_leaves"] = employee_leaves
 
     return render(
         request,
         "employee/view/individual.html",
-        context,
+        # context,
     )
 
 
 @login_required
 @hx_request_required
-def contract_tab(request, obj_id, **kwargs):
+def about_tab(request, pk, **kwargs):
     """
     This method is used to view profile of an employee.
     """
-    employee = Employee.objects.get(id=obj_id)
-    employee_leaves = employee.available_leave.all()
-    contracts = Contract.objects.filter(employee_id=obj_id)
+    employee = Employee.objects.get(id=pk)
+    contracts = employee.contract_set.all() if apps.is_installed("payroll") else None
+    employee_leaves = (
+        employee.available_leave.all() if apps.is_installed("leave") else None
+    )
+    bank_details = EmployeeBankDetails.objects.filter(employee_id=employee).first()
+    work_info = EmployeeWorkInformation.objects.filter(employee_id=employee).first()
     return render(
         request,
-        "tabs/personal-tab.html",
+        "tabs/personal_tab.html",
         {
             "employee": employee,
             "employee_leaves": employee_leaves,
             "contracts": contracts,
+            "bank_details": bank_details,
+            "work_info": work_info,
         },
     )
 
 
 @login_required
-@owner_can_enter("asset.view_asset", Employee)
-def asset_tab(request, emp_id):
-    """
-    This function is used to view asset tab of an employee in employee individual view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return asset-tab template
-
-    """
-    employee = Employee.objects.get(id=emp_id)
-    assets_requests = employee.requested_employee.all()
-    assets = employee.allocated_employee.all()
-    assets_ids = json.dumps([instance.id for instance in assets])
-    context = {
-        "assets": assets,
-        "requests": assets_requests,
-        "assets_ids": assets_ids,
-        "employee": emp_id,
-    }
-    return render(request, "tabs/asset-tab.html", context=context)
-
-
-@login_required
 @hx_request_required
-def profile_asset_tab(request, emp_id):
-    """
-    This function is used to view asset tab of an employee in employee profile view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return profile-asset-tab template
-
-    """
-    employee = Employee.objects.get(id=emp_id)
-    assets = employee.allocated_employee.all()
-    assets_ids = json.dumps([instance.id for instance in assets])
-    context = {
-        "assets": assets,
-        "assets_ids": assets_ids,
-    }
-    return render(request, "tabs/profile-asset-tab.html", context=context)
-
-
-@login_required
-@hx_request_required
-def asset_request_tab(request, emp_id):
-    """
-    This function is used to view asset request tab of an employee in employee individual view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return asset-request-tab template
-
-    """
-    employee = Employee.objects.get(id=emp_id)
-    assets_requests = employee.requested_employee.all()
-    context = {"asset_requests": assets_requests, "emp_id": emp_id}
-    return render(request, "tabs/asset-request-tab.html", context=context)
-
-
-@login_required
-@hx_request_required
-@owner_can_enter("pms.view_feedback", Employee)
-def performance_tab(request, emp_id):
-    """
-    This function is used to view performance tab of an employee in employee individual
-    & profile view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return performance-tab template
-
-    """
-    feedback_own = Feedback.objects.filter(employee_id=emp_id, archive=False)
-    today = datetime.today()
-    context = {
-        "self_feedback": feedback_own,
-        "current_date": today,
-    }
-    return render(request, "tabs/performance-tab.html", context=context)
-
-
-@login_required
-@hx_request_required
-def profile_attendance_tab(request):
-    """
-    This function is used to view attendance tab of an employee in profile view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return asset-request-tab template
-
-    """
-    user = request.user
-    employee = user.employee_get
-    employee_attendances = employee.employee_attendances.all()
-    attendances_ids = json.dumps([instance.id for instance in employee_attendances])
-    context = {
-        "attendances": employee_attendances,
-        "attendances_ids": attendances_ids,
-    }
-    return render(request, "tabs/profile-attendance-tab.html", context)
-
-
-@login_required
-@manager_can_enter("employee.view_employee")
-def attendance_tab(request, emp_id):
-    """
-    This function is used to view attendance tab of an employee in individual view.
-
-    Parameters:
-    request (HttpRequest): The HTTP request object.
-    emp_id (int): The id of the employee.
-
-    Returns: return attendance-tab template
-    """
-
-    requests = Attendance.objects.filter(
-        is_validate_request=True,
-        employee_id=emp_id,
-    )
-    attendances_ids = json.dumps([instance.id for instance in requests])
-    validate_attendances = Attendance.objects.filter(
-        attendance_validated=False, employee_id=emp_id
-    )
-    validate_attendances_ids = json.dumps(
-        [instance.id for instance in validate_attendances]
-    )
-    accounts = AttendanceOverTime.objects.filter(employee_id=emp_id)
-    accounts_ids = json.dumps([instance.id for instance in accounts])
-
-    context = {
-        "requests": requests,
-        "attendances_ids": attendances_ids,
-        "accounts": accounts,
-        "accounts_ids": accounts_ids,
-        "validate_attendances": validate_attendances,
-        "validate_attendances_ids": validate_attendances_ids,
-    }
-    return render(request, "tabs/attendance-tab.html", context=context)
-
-
-@login_required
-@hx_request_required
-def allowances_deductions_tab(request, emp_id):
+def allowances_deductions_tab(request, pk):
     """
     Retrieve and render the allowances and deductions applicable to an employee.
 
@@ -505,13 +427,18 @@ def allowances_deductions_tab(request, emp_id):
     condition-based rules. The results are then rendered in the allowance and
     deduction tab template.
     """
-    employee = Employee.objects.get(id=emp_id)
-    active_contracts = employee.contract_set.filter(contract_status="active").first()
+    employee = Employee.objects.get(id=pk)
+    active_contracts = (
+        employee.contract_set.filter(contract_status="active").first()
+        if apps.is_installed("payroll")
+        else None
+    )
     basic_pay = active_contracts.wage if active_contracts else None
     employee_allowances = []
     employee_deductions = []
     if basic_pay:
         # Find the applicable allowances for the employee
+        Allowance = get_solich_model_class(app_label="payroll", model="allowance")
         specific_allowances = Allowance.objects.filter(specific_employees=employee)
         conditional_allowances = Allowance.objects.filter(
             is_condition_based=True
@@ -520,13 +447,13 @@ def allowances_deductions_tab(request, emp_id):
             include_active_employees=True
         ).exclude(exclude_employees=employee)
         allowances = specific_allowances | conditional_allowances | active_employees
-
         for allowance in allowances:
             if allowance.is_condition_based:
                 condition_field = allowance.field
                 condition_operator = allowance.condition
                 condition_value = allowance.value.lower().replace(" ", "_")
                 employee_value = dynamic_attr(employee, condition_field)
+                # employee_value = 0
                 operator_func = operator_mapping.get(condition_operator)
                 if employee_value is not None:
                     condition_value = type(employee_value)(condition_value)
@@ -541,6 +468,7 @@ def allowances_deductions_tab(request, emp_id):
                     employee_allowances.remove(allowance)
 
         # Find the applicable deductions for the employee
+        Deduction = get_solich_model_class(app_label="payroll", model="deduction")
         specific_deductions = Deduction.objects.filter(
             specific_employees=employee, is_pretax=True, is_tax=False
         )
@@ -553,7 +481,7 @@ def allowances_deductions_tab(request, emp_id):
         deductions = (
             specific_deductions | conditional_deduction | active_employee_deduction
         )
-        employee_deductions = list(deductions)
+        employee_deductions = list(set(deductions))
         for deduction in deductions:
             if deduction.is_condition_based:
                 condition_field = deduction.field
@@ -567,7 +495,8 @@ def allowances_deductions_tab(request, emp_id):
                     and not operator_func(
                         employee_value, type(employee_value)(condition_value)
                     )
-                ) or employee_value is None:
+                    or employee_value is None
+                ):
                     employee_deductions.remove(deduction)
     allowance_ids = (
         json.dumps([instance.id for instance in employee_allowances])
@@ -594,7 +523,7 @@ def allowances_deductions_tab(request, emp_id):
 @login_required
 @hx_request_required
 @owner_can_enter("perms.employee.view_employee", Employee)
-def shift_tab(request, emp_id):
+def shift_tab(request, pk):
     """
     This function is used to view shift tab of an employee in employee individual & profile view.
 
@@ -604,16 +533,16 @@ def shift_tab(request, emp_id):
 
     Returns: return shift-tab template
     """
-    employee = Employee.objects.get(id=emp_id)
-    work_type_requests = WorkTypeRequest.objects.filter(employee_id=emp_id)
+    employee = Employee.objects.get(id=pk)
+    work_type_requests = WorkTypeRequest.objects.filter(employee_id=pk)
     work_type_requests_ids = json.dumps(
         [instance.id for instance in work_type_requests]
     )
-    rshift_assign = RotatingShiftAssign.objects.filter(employee_id=emp_id)
+    rshift_assign = RotatingShiftAssign.objects.filter(employee_id=pk)
     rshift_assign_ids = json.dumps([instance.id for instance in rshift_assign])
-    rwork_type_assign = RotatingWorkTypeAssign.objects.filter(employee_id=emp_id)
+    rwork_type_assign = RotatingWorkTypeAssign.objects.filter(employee_id=pk)
     rwork_type_assign_ids = json.dumps([instance.id for instance in rwork_type_assign])
-    shift_requests = ShiftRequest.objects.filter(employee_id=emp_id)
+    shift_requests = ShiftRequest.objects.filter(employee_id=pk)
     shift_requests_ids = json.dumps([instance.id for instance in shift_requests])
 
     context = {
@@ -625,14 +554,14 @@ def shift_tab(request, emp_id):
         "rwork_type_assign_ids": rwork_type_assign_ids,
         "shift_data": shift_requests,
         "shift_requests_ids": shift_requests_ids,
-        "emp_id": emp_id,
+        "emp_id": pk,
         "employee": employee,
     }
     return render(request, "tabs/shift-tab.html", context=context)
 
 
 @login_required
-@manager_can_enter("Solich_documents.view_documentrequests")
+@manager_can_enter("solich_documents.view_documentrequest")
 def document_request_view(request):
     """
     This function is used to view documents requests of employees.
@@ -648,13 +577,12 @@ def document_request_view(request):
     documents = Document.objects.filter(document_request_id__isnull=False)
     documents = filtersubordinates(
         request=request,
-        perm="Solich_documents.view_documentrequests",
+        perm="solich_documents.view_documentrequest",
         queryset=documents,
     )
     documents = group_by_queryset(
         documents, "document_request_id", request.GET.get("page"), "page"
     )
-    # documents = paginator_qry(documents,request.GET.get("page"))
     data_dict = parse_qs(previous_data)
     get_key_instances(Document, data_dict)
     context = {
@@ -669,7 +597,7 @@ def document_request_view(request):
 
 @login_required
 @hx_request_required
-@manager_can_enter("Solich_documents.view_documentrequests")
+@manager_can_enter("solich_documents.view_documentrequest")
 def document_filter_view(request):
     """
     This method is used to filter employee.
@@ -702,7 +630,7 @@ def document_filter_view(request):
 
 @login_required
 @hx_request_required
-@manager_can_enter("Solich_documents.add_documentrequests")
+@manager_can_enter("solich_documents.add_documentrequest")
 def document_request_create(request):
     """
     This function is used to create document requests of an employee in employee requests view.
@@ -713,11 +641,11 @@ def document_request_create(request):
     Returns: return document_request_create_form template
     """
     form = DocumentRequestForm()
-    form = choosesubordinates(request, form, "Solich_documents.add_documentrequest")
+    form = choosesubordinates(request, form, "solich_documents.add_documentrequest")
     if request.method == "POST":
         form = DocumentRequestForm(request.POST)
         form = choosesubordinates(
-            request, form, "Solich_documents.add_documentrequest"
+            request, form, "solich_documents.add_documentrequest"
         )
         if form.is_valid():
             form = form.save()
@@ -735,7 +663,7 @@ def document_request_create(request):
                 redirect=reverse("employee-profile"),
                 icon="chatbox-ellipses",
             )
-            return HttpResponse("<script>window.location.reload();</script>")
+            return SolichRedirect(request)
 
     context = {
         "form": form,
@@ -747,7 +675,7 @@ def document_request_create(request):
 
 @login_required
 @hx_request_required
-@manager_can_enter("Solich_documents.change_documentrequests")
+@manager_can_enter("solich_documents.change_documentrequest")
 def document_request_update(request, id):
     """
     This function is used to update document requests of an employee in employee requests view.
@@ -768,7 +696,7 @@ def document_request_update(request, id):
                 Employee.objects.filter(id__in=form.data.getlist("employee_id"))
             )
             documents.exclude(employee_id__in=doc_obj.employee_id.all()).delete()
-            return HttpResponse("<script>window.location.reload();</script>")
+            return SolichRedirect(request)
 
     context = {
         "form": form,
@@ -781,8 +709,8 @@ def document_request_update(request, id):
 
 @login_required
 @hx_request_required
-@owner_can_enter("Solich_documents.view_document", Employee)
-def document_tab(request, emp_id):
+@owner_can_enter("solich_documents.view_document", Employee)
+def document_tab(request, pk):
     """
     This function is used to view documents tab of an employee in employee individual
     & profile view.
@@ -795,19 +723,19 @@ def document_tab(request, emp_id):
     """
 
     form = DocumentUpdateForm(request.POST, request.FILES)
-    documents = Document.objects.filter(employee_id=emp_id)
+    documents = Document.objects.filter(employee_id=pk)
 
     context = {
         "documents": documents,
         "form": form,
-        "emp_id": emp_id,
+        "emp_id": pk,
     }
     return render(request, "tabs/document_tab.html", context=context)
 
 
 @login_required
 @hx_request_required
-@owner_can_enter("Solich_documents.add_document", Employee)
+@owner_can_enter("solich_documents.add_document", Employee)
 def document_create(request, emp_id):
     """
     This function is used to create documents from employee individual & profile view.
@@ -825,13 +753,31 @@ def document_create(request, emp_id):
         if form.is_valid():
             form.save()
             messages.success(request, _("Document created successfully."))
-            return HttpResponse("<script>window.location.reload();</script>")
+            return SolichRedirect(request)
 
     context = {
         "form": form,
         "emp_id": emp_id,
     }
     return render(request, "tabs/htmx/document_create_form.html", context=context)
+
+
+@hx_request_required
+def get_notify_field(request):
+    expiry_date = request.GET.get("expiry_date")
+    form = DocumentForm()
+    if not expiry_date:
+        form.fields["notify_before"].widget = HiddenInput()
+        form.fields["notify_before"].label = ""
+    notify_field_html = render_to_string(
+        "cbv/document/notify_field.html",
+        {
+            "form": form,
+            "field_name": "notify_before",
+            "field": form.fields["notify_before"],
+        },
+    )
+    return HttpResponse(notify_field_html)
 
 
 @login_required
@@ -849,14 +795,10 @@ def update_document_title(request, id):
     if request.method == "POST":
         document.title = name
         document.save()
-
-        return JsonResponse(
-            {"success": True, "message": "Document title updated successfully"}
-        )
+        messages.success(request, _("Document title updated successfully"))
     else:
-        return JsonResponse(
-            {"success": False, "message": "Invalid request"}, status=400
-        )
+        messages.error(request, _("Invalid request"))
+    return HttpResponse("")
 
 
 @login_required
@@ -872,31 +814,75 @@ def document_delete(request, id):
     cannot be deleted, it handles the exception and informs the user.
     """
     try:
-        document = Document.objects.filter(id=id)
-        # users can delete own documents
-        if not request.user.has_perm("Solich_documents.delete_document"):
-            document = document.filter(employee_id__employee_user_id=request.user)
+        document_qs = Document.objects.filter(id=id)
+
+        if not request.user.has_perm("solich_documents.delete_document"):
+            document_qs = document_qs.filter(
+                employee_id__employee_user_id=request.user
+            ).exclude(document_request_id__isnull=False)
+
+        document = document_qs.first()
+
         if document:
+            document_first = document
             document.delete()
+
             messages.success(
                 request,
-                _(
-                    f"Document request {document.first()} for {document.first().employee_id} deleted successfully"
-                ),
+                _("Document request %(doc)s for %(employee)s deleted successfully")
+                % {
+                    "doc": document_first,
+                    "employee": document_first.employee_id,
+                },
             )
+            referrer = request.META.get("HTTP_REFERER", "")
+            path = urlparse(referrer).path or ""
+
+            if path.startswith("/employee/employee-view/") or path.endswith(
+                "/employee/employee-profile/"
+            ):
+                existing_documents = Document.objects.filter(
+                    employee_id=document_first.employee_id
+                )
+                if not existing_documents:
+                    url = reverse(
+                        "employee-document-tab",
+                        kwargs={"employee_id": document_first.employee_id.id},
+                    )
+
+                    html = format_html(
+                        "<span hx-get='{}?employee_view=true' "
+                        "hx-target='#document_target' "
+                        "hx-trigger='load'></span>",
+                        url,
+                    )
+                    return HttpResponse(html)
+
+            refreshed = htmx_refresh_document_request_container(request)
+            if refreshed is not None:
+                return refreshed
+
+            return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
         else:
             messages.error(request, _("Document not found"))
-
     except ProtectedError:
         messages.error(request, _("You cannot delete this document."))
+    refreshed = htmx_refresh_document_request_container(request)
+    if refreshed is not None:
+        return refreshed
+    return SolichRedirect(request)
 
-    if "HTTP_HX_TARGET" in request.META and request.META.get(
-        "HTTP_HX_TARGET"
-    ).startswith("document"):
-        clear_messages(request)
-        return HttpResponse()
-    else:
-        return HttpResponse("<script>window.location.reload();</script>")
+
+def can_access_document(request, document, perm):
+    """
+    Check if the current user is authorized to access the given document.
+    """
+    employee = request.user.employee_get
+    return (
+        document.employee_id == employee
+        or document.employee_id.get_reporting_manager() == employee
+        or request.user.has_perm(perm)
+    )
 
 
 @login_required
@@ -912,7 +898,19 @@ def file_upload(request, id):
     Returns: return document_form template
     """
 
-    document_item = Document.objects.get(id=id)
+    document_item = Document.find(id)
+    if document_item is None:
+        return SolichRedirect(
+            request, message=_("No Document found matching the query.")
+        )
+
+    if not can_access_document(
+        request, document_item, "solich_documents.change_document"
+    ):
+        return SolichRedirect(
+            request, message=_("You do not have permission to update this document.")
+        )
+
     form = DocumentUpdateForm(instance=document_item)
     if request.method == "POST":
         form = DocumentUpdateForm(request.POST, request.FILES, instance=document_item)
@@ -936,48 +934,10 @@ def file_upload(request, id):
                 )
             except:
                 pass
-            return HttpResponse("<script>window.location.reload();</script>")
+            return SolichRedirect(request)
 
     context = {"form": form, "document": document_item}
     return render(request, "tabs/htmx/document_form.html", context=context)
-
-
-@login_required
-@hx_request_required
-def view_file(request, id):
-    """
-    This function used to view the uploaded document in the modal.
-    Parameters:
-
-    request (HttpRequest): The HTTP request object.
-    id (int): The id of the document.
-
-    Returns: return view_file template
-    """
-
-    document_obj = Document.objects.filter(id=id).first()
-    context = {
-        "document": document_obj,
-    }
-    if document_obj.document:
-        file_path = document_obj.document.path
-        file_extension = os.path.splitext(file_path)[1][
-            1:
-        ].lower()  # Get the lowercase file extension
-
-        content_type = get_content_type(file_extension)
-
-        try:
-            with open(file_path, "rb") as file:
-                file_content = file.read()  # Decode the binary content for display
-        except:
-            file_content = None
-
-        context["file_content"] = file_content
-        context["file_extension"] = file_extension
-        context["content_type"] = content_type
-
-    return render(request, "tabs/htmx/view_file.html", context)
 
 
 def get_content_type(file_extension):
@@ -1004,7 +964,61 @@ def get_content_type(file_extension):
 
 @login_required
 @hx_request_required
-@manager_can_enter("Solich_documents.add_document")
+def view_file(request, id):
+    """
+    This function used to view the uploaded document in the modal.
+    Parameters:
+
+    request (HttpRequest): The HTTP request object.
+    id (int): The id of the document.
+
+    Returns: return view_file template
+    """
+
+    document_obj = Document.objects.filter(id=id).first()
+    if document_obj is None:
+        return SolichRedirect(
+            request, message=_("No Document found matching the query.")
+        )
+
+    if not can_access_document(
+        request, document_obj, "solich_documents.view_document"
+    ):
+        return SolichRedirect(
+            request, message=_("You do not have permission to view this document.")
+        )
+
+    context = {
+        "document": document_obj,
+    }
+
+    if document_obj and document_obj.document:
+        # Use name instead of path, Safe for local + GCS + S3
+        file_name = document_obj.document.name
+        file_extension = os.path.splitext(file_name)[1][1:].lower()
+
+        content_type = get_content_type(file_extension)
+
+        try:
+            with document_obj.document.open("rb") as f:
+                file_content = f.read()
+        except Exception as e:
+            file_content = None
+
+        context.update(
+            {
+                "file_content": file_content,
+                "file_extension": file_extension,
+                "content_type": content_type,
+            }
+        )
+
+    return render(request, "tabs/htmx/view_file.html", context)
+
+
+@login_required
+@hx_request_required
+@manager_can_enter("solich_documents.add_document")
 def document_approve(request, id):
     """
     This function used to view the approve uploaded document.
@@ -1017,6 +1031,7 @@ def document_approve(request, id):
     """
 
     document_obj = get_object_or_404(Document, id=id)
+    refresh_url = request.GET.get("refresh_url") or request.POST.get("refresh_url")
     if document_obj.document:
         document_obj.status = "approved"
         document_obj.save()
@@ -1024,12 +1039,29 @@ def document_approve(request, id):
     else:
         messages.error(request, _("No document uploaded"))
 
-    return HttpResponse("<script>window.location.reload();</script>")
+    refreshed = htmx_refresh_document_request_container(request)
+    if refreshed is not None:
+        return refreshed
+
+    if refresh_url:
+        span = f"""
+        <span
+            hx-trigger="load"
+            hx-get="{refresh_url}"
+            hx-target="#requestDocument{id}"
+            hx-select="#requestDocument{id}"
+            hx-swap="outerHTML"
+            ">
+        </span>
+        """
+        return HttpResponse(span)
+
+    return SolichRedirect(request)
 
 
 @login_required
 @hx_request_required
-@manager_can_enter("Solich_documents.add_document")
+@manager_can_enter("solich_documents.add_document")
 def document_reject(request, id):
     """
     This function used to view the reject uploaded document.
@@ -1051,10 +1083,10 @@ def document_reject(request, id):
                 document_obj.save()
                 messages.error(request, _("Document request rejected"))
 
-                return HttpResponse("<script>window.location.reload();</script>")
+                return SolichRedirect(request)
     else:
         messages.error(request, _("No document uploaded"))
-        return HttpResponse("<script>window.location.reload();</script>")
+        return SolichRedirect(request)
 
     return render(
         request,
@@ -1064,43 +1096,89 @@ def document_reject(request, id):
 
 
 @login_required
-@manager_can_enter("Solich_documents.add_document")
+@manager_can_enter("solich_documents.add_document")
 def document_bulk_approve(request):
     """
-    This function used to view the approve uploaded document.
-    Parameters:
+    This function is used to bulk-approve uploaded documents.
 
-    request (HttpRequest): The HTTP request object.
+    Parameters:
+        request (HttpRequest): The HTTP request object.
 
     Returns:
+        HttpResponse: A 204 No Content response with HX-Refresh header.
     """
-    ids = request.GET.getlist("ids")
-    document_obj = Document.objects.filter(
-        id__in=ids,
-    ).exclude(document="")
-    document_obj.update(status="approved")
-    messages.success(request, _(f"{len(document_obj)} Document request approved"))
+    if request.method == "POST":
+        ids = request.POST.getlist("ids")
 
-    return HttpResponse("success")
+        # Documents with uploaded files
+        approved_docs = Document.objects.filter(id__in=ids).exclude(document="")
+        count_approved = approved_docs.update(status="approved")
+
+        # Documents without uploaded files
+        not_uploaded_count = len(ids) - approved_docs.count()
+
+        if count_approved:
+            messages.success(
+                request, _(f"{count_approved} document request(s) approved")
+            )
+
+        if not_uploaded_count:
+            messages.info(
+                request, _(f"{not_uploaded_count} document(s) skipped (not uploaded)")
+            )
+
+    refreshed = htmx_refresh_document_request_container(request)
+    if refreshed is not None:
+        return refreshed
+    return SolichRedirect(request)
 
 
 @login_required
-@manager_can_enter("Solich_documents.add_document")
+@hx_request_required
+@manager_can_enter("solich_documents.add_document")
 def document_bulk_reject(request):
     """
-    This function used to view the reject uploaded document.
-    Parameters:
+    Handle bulk rejection of documents.
 
-    request (HttpRequest): The HTTP request object.
-
-    Returns:
+    On GET request, display a form to enter the rejection reason for selected documents.
+    On POST request, validate the rejection reason and update the status of documents
+    (excluding those already rejected) to 'rejected' with the provided reason.
     """
-    ids = request.POST.getlist("ids")
-    reason = request.POST.get("reason")
-    document_obj = Document.objects.filter(id__in=ids)
-    document_obj.update(status="rejected", reject_reason=reason)
-    messages.success(request, _("Document request rejected"))
-    return HttpResponse("success")
+    ids = (
+        request.POST.getlist("ids")
+        if request.method == "POST"
+        else request.GET.getlist("ids")
+    )
+    # DocumentRejectForm is a ModelForm but this view never calls form.save()
+    # (the actual update is the manual queryset .update() below) - it's only
+    # used to validate reject_reason. Without an instance, Django validates a
+    # brand new blank Document(), and Document.clean() unconditionally checks
+    # len(self.title) < 3 regardless of the form's fields, raising a
+    # ValueError ("has no field named 'title'") since title isn't one of
+    # them. Binding to any one of the actual target documents gives clean()
+    # a real, already-valid title instead.
+    form = DocumentRejectForm(
+        request.POST or None, instance=Document.objects.filter(id__in=ids).first()
+    )
+
+    if request.method == "POST" and form.is_valid():
+        reject_reason = form.cleaned_data["reject_reason"]
+        updated_count = (
+            Document.objects.filter(id__in=ids)
+            .exclude(status="rejected")
+            .update(status="rejected", reject_reason=reject_reason)
+        )
+        messages.success(
+            request, _("{} Document request rejected").format(updated_count)
+        )
+        refreshed = htmx_refresh_document_request_container(request)
+        if refreshed is not None:
+            return refreshed
+        return SolichRedirect(request)
+
+    return render(
+        request, "documents/document_reject_reason.html", {"ids": ids, "form": form}
+    )
 
 
 @login_required
@@ -1117,7 +1195,7 @@ def employee_profile_bank_details(request):
         bank_info.employee_id = employee
         bank_info.save()
         messages.success(request, _("Bank details updated"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -1139,13 +1217,13 @@ def employee_profile_update(request):
 
 
 @login_required
-@permission_required("delete_group")
+@permission_required("auth.delete_group")
 @require_http_methods(["POST"])
 def employee_user_group_assign_delete(_, obj_id):
     """
     This method is used to delete user group assign
     """
-    user = User.objects.get(id=obj_id)
+    user = SolichUser.objects.get(id=obj_id)
     user.groups.clear()
     return redirect("/employee/employee-user-group-assign-view")
 
@@ -1160,6 +1238,11 @@ def paginator_qry(qryset, page_number):
 
 
 @login_required
+@enter_if_accessible(
+    feature="employee_view",
+    perm="employee.view_employee",
+    method=_check_reporting_manager,
+)
 def employee_view(request):
     """
     This method is used to render template for view all employee
@@ -1168,14 +1251,12 @@ def employee_view(request):
     previous_data = request.GET.urlencode()
     page_number = request.GET.get("page")
     error_message = request.session.pop("error_message", None)
-    queryset = (
-        Employee.objects.filter(is_active=True)
-        if isinstance(request.GET, QueryDict) and not request.GET
-        else Employee.objects.all()
-    )
 
-    filter_obj = EmployeeFilter(request.GET, queryset=queryset)
-    export_form = EmployeeExportExcelForm()
+    queryset = Employee.objects.filter()
+    filter_obj = EmployeeFilter(request.GET, queryset=queryset).qs
+    if request.GET.get("is_active") != "False":
+        filter_obj = filter_obj.filter(is_active=True)
+
     update_fields = BulkUpdateFieldForm()
     data_dict = parse_qs(previous_data)
     get_key_instances(Employee, data_dict)
@@ -1188,22 +1269,22 @@ def employee_view(request):
         request,
         "employee_personal_info/employee_view.html",
         {
-            "data": paginator_qry(filter_obj.qs, page_number),
+            "data": paginator_qry(filter_obj, page_number),
             "pd": previous_data,
-            "f": filter_obj,
-            "export_filter": EmployeeFilter(queryset=filter_obj.qs),
-            "export_form": export_form,
+            "f": EmployeeFilter(),
             "update_fields_form": update_fields,
             "view_type": view_type,
             "filter_dict": data_dict,
             "emp": emp,
             "gp_fields": EmployeeReGroup.fields,
             "error_message": error_message,
+            "can_export_employee": has_export_access(request, Employee),
         },
     )
 
 
 @login_required
+@require_http_methods(["POST"])
 @permission_required("employee.change_employee")
 def view_employee_bulk_update(request):
     if request.method == "POST":
@@ -1284,7 +1365,7 @@ def view_employee_bulk_update(request):
                                         ):
                                             fields.append("job_position_id")
                                             widgets["job_position_id"] = Select(
-                                                attrs={"required": True}
+                                                attrs={"required": False}
                                             )
                                         if (
                                             not "employee_work_info__job_role_id"
@@ -1292,7 +1373,7 @@ def view_employee_bulk_update(request):
                                         ):
                                             fields.append("job_role_id")
                                             widgets["job_role_id"] = Select(
-                                                attrs={"required": True}
+                                                attrs={"required": False}
                                             )
                                         fields.append(parts[1])
                                         widgets[field] = Select(
@@ -1336,7 +1417,14 @@ def view_employee_bulk_update(request):
                             }
                         )
                     for field_name, field in self.fields.items():
-                        field.required = True
+
+                        if field_name in ["job_role_id", "job_position_id"] and (
+                            field_name == "job_role_id"
+                            or field_name == "job_position_id"
+                        ):
+                            field.required = False
+                        else:
+                            field.required = True
 
             class BankInfoBulkUpdateForm(ModelForm):
                 class Meta:
@@ -1417,7 +1505,7 @@ def view_employee_bulk_update(request):
             messages.warning(
                 request, _("There are no employees selected for bulk update.")
             )
-            return redirect(employee_view)
+            return redirect(f"{reverse('employee-view')}?view=list")
 
 
 @login_required
@@ -1435,21 +1523,17 @@ def save_employee_bulk_update(request):
         for id in employee_list:
             try:
                 employee_instance = Employee.objects.get(id=int(id))
-                (
-                    employee_work_info,
-                    created,
-                ) = EmployeeWorkInformation.objects.get_or_create(
-                    employee_id=employee_instance
+                employee_work_info, created = (
+                    EmployeeWorkInformation.objects.get_or_create(
+                        employee_id=employee_instance
+                    )
                 )
-                (
-                    employee_bank,
-                    created,
-                ) = EmployeeBankDetails.objects.get_or_create(
+                employee_bank, created = EmployeeBankDetails.objects.get_or_create(
                     employee_id=employee_instance
                 )
             except (ValueError, OverflowError):
                 employee_list.remove(id)
-                pass
+
         for field in update_fields:
             parts = str(field).split("__")
             if parts[-1]:
@@ -1489,11 +1573,11 @@ def employee_account_block_unblock(request, emp_id):
     employee = get_object_or_404(Employee, id=emp_id)
     if not employee:
         messages.info(request, _("Employee not found"))
-        return redirect(employee_view)
-    user = get_object_or_404(User, id=employee.employee_user_id.id)
+        return redirect(f"{reverse('employee-view')}?view=list")
+    user = get_object_or_404(SolichUser, id=employee.employee_user_id.id)
     if not user:
         messages.info(request, _("Employee not found"))
-        return redirect(employee_view)
+        return redirect(f"{reverse('employee-view')}?view=list")
     if not user.is_superuser:
         user.is_active = not user.is_active
         action_message = _("blocked") if not user.is_active else _("unblocked")
@@ -1537,13 +1621,64 @@ def employee_view_update(request, obj_id, **kwargs):
     """
     This method is used to render update form for employee.
     """
-    user = Employee.objects.filter(employee_user_id=request.user).first()
-    work_info = HistoryTrackingFields.objects.first()
-    work_info_history = False
-    if work_info and work_info.work_info_track == True:
-        work_info_history = True
-
+    container_mode = (
+        request.GET.get("container") == "true"
+        or request.POST.get("container") == "true"
+    )
     employee = Employee.objects.filter(id=obj_id).first()
+    emp = Employee.objects.entire().filter(id=obj_id).first()
+
+    if not employee and not emp:
+        return SolichRedirect(
+            request, message=_("No Employee found matching the query.")
+        )
+
+    selected_company_id = request.session["selected_company"]
+    user = Employee.objects.filter(employee_user_id=request.user).first()
+
+    if not employee and emp and hasattr(emp, "employee_work_info"):
+        if (
+            emp.employee_work_info
+            and emp.employee_work_info.company_id
+            and emp.employee_work_info.company_id_id != selected_company_id
+        ):
+
+            messages.error(
+                request, _("Employee is not working in the selected company.")
+            )
+            return redirect(f"{reverse('employee-view')}?view=list")
+
+    tracking_company = None
+    work_info_source = employee or emp
+    if (
+        work_info_source
+        and hasattr(work_info_source, "employee_work_info")
+        and work_info_source.employee_work_info
+    ):
+        tracking_company = work_info_source.employee_work_info.company_id
+    elif selected_company_id and selected_company_id != "all":
+        tracking_company = Company.objects.filter(id=selected_company_id).first()
+    history_tracking = HistoryTrackingFields.for_company(tracking_company)
+    work_info_history = bool(
+        history_tracking is not None and history_tracking.work_info_track
+    )
+
+    if employee is None:
+        employee = emp
+        cmpny = Company.objects.get(id=selected_company_id)
+
+        work = (
+            EmployeeWorkInformation.objects.entire()
+            .filter(employee_id=employee)
+            .first()
+        )
+
+        if work and selected_company_id != "all":
+            work.company_id = cmpny
+            work.save()
+
+        employee.save()
+
     if (
         user
         and user.reporting_manager.filter(employee_id=employee).exists()
@@ -1559,14 +1694,14 @@ def employee_view_update(request, obj_id, **kwargs):
             instance=EmployeeBankDetails.objects.filter(employee_id=employee).first()
         )
         if request.POST:
-            if request.POST.get("employee_first_name") is not None:
+            if request.POST.get("form") == "personal":
                 form = EmployeeForm(request.POST, instance=employee)
                 if form.is_valid():
                     form.save()
                     messages.success(
                         request, _("Employee personal information updated.")
                     )
-            elif request.POST.get("reporting_manager_id") is not None:
+            elif request.POST.get("form") == "work":
                 instance = EmployeeWorkInformation.objects.filter(
                     employee_id=employee
                 ).first()
@@ -1590,12 +1725,12 @@ def employee_view_update(request, obj_id, **kwargs):
                         icon="briefcase",
                     )
                     messages.success(request, _("Employee work information updated."))
-                work_form = EmployeeWorkInformationForm(
-                    instance=EmployeeWorkInformation.objects.filter(
-                        employee_id=employee
-                    ).first()
-                )
-            elif request.POST.get("any_other_code1"):
+                # work_form = EmployeeWorkInformationForm(
+                #     instance=EmployeeWorkInformation.objects.filter(
+                #         employee_id=employee
+                #     ).first()
+                # )
+            elif request.POST.get("form") == "bank":
                 instance = EmployeeBankDetails.objects.filter(
                     employee_id=employee
                 ).first()
@@ -1607,19 +1742,31 @@ def employee_view_update(request, obj_id, **kwargs):
                     instance.employee_id = employee
                     instance.save()
                     messages.success(request, _("Employee bank details updated."))
-        return render(
+        use_edit_fragment = request.META.get("HTTP_HX_REQUEST") == "true"
+        template_name = (
+            "employee/update_form/form_view_fragment.html"
+            if use_edit_fragment
+            else "employee/update_form/form_view.html"
+        )
+        submitted_form = request.POST.get("form", "") if request.POST else ""
+        active_tab = (
+            submitted_form if submitted_form in ("personal", "work", "bank") else ""
+        )
+        response = render(
             request,
-            "employee/update_form/form_view.html",
+            template_name,
             {
+                "obj_id": obj_id,
                 "form": form,
                 "work_form": work_form,
                 "bank_form": bank_form,
                 "work_info_history": work_info_history,
+                "container_mode": container_mode,
+                "active_tab": active_tab,
             },
         )
-    return HttpResponseRedirect(
-        request.META.get("HTTP_REFERER", "/employee/employee-view")
-    )
+        return response
+    return SolichRedirect(request, fallback_url="/employee/employee-view")
 
 
 @login_required
@@ -1636,7 +1783,7 @@ def update_profile_image(request, obj_id):
         employee.save()
         messages.success(request, _("Profile image updated."))
     except Exception:
-        messages.error(request, _("No image chosen."))
+        messages.error(request, _("Upload a valid image."))
     response = render(
         request,
         "employee/profile/profile_modal.html",
@@ -1652,11 +1799,14 @@ def update_own_profile_image(request):
     """
     This method is used to update own profile image from profile view form
     """
-    employee = request.user.employee_get
-    img = request.FILES.get("employee_profile")
-    employee.employee_profile = img
-    employee.save()
-    messages.success(request, _("Profile image updated."))
+    try:
+        employee = request.user.employee_get
+        img = request.FILES.get("employee_profile")
+        employee.employee_profile = img
+        employee.save()
+        messages.success(request, _("Profile image updated."))
+    except Exception:
+        messages.error(request, _("Upload a valid image."))
     response = render(
         request,
         "employee/profile/profile_modal.html",
@@ -1739,7 +1889,7 @@ def employee_create_update_personal_info(request, obj_id=None):
     This method is used to update employee's personal info.
     """
     employee = Employee.objects.filter(id=obj_id).first()
-    form = EmployeeForm(request.POST, instance=employee)
+    form = EmployeeForm(request.POST, request.FILES, instance=employee)
     if form.is_valid():
         form.save()
         if obj_id is None:
@@ -1747,16 +1897,16 @@ def employee_create_update_personal_info(request, obj_id=None):
             form = EmployeeForm(request.POST, instance=form.instance)
             work_form = EmployeeWorkInformationForm(
                 instance=EmployeeWorkInformation.objects.filter(
-                    employee_id=employee
+                    employee_id=form.instance
                 ).first()
             )
             bank_form = EmployeeBankDetailsForm(
                 instance=EmployeeBankDetails.objects.filter(
-                    employee_id=employee
+                    employee_id=form.instance
                 ).first()
             )
             return redirect(
-                f"employee-view-update/{form.instance.id}/",
+                f"/employee/employee-view-update/{form.instance.id}/",
                 data={"form": form, "work_form": work_form, "bank_form": bank_form},
             )
         return HttpResponse(
@@ -1860,6 +2010,11 @@ def employee_update_bank_details(request, obj_id=None):
 
 @login_required
 @hx_request_required
+@enter_if_accessible(
+    feature="employee_view",
+    perm="employee.view_employee",
+    method=_check_reporting_manager,
+)
 def employee_filter_view(request):
     """
     This method is used to filter employee.
@@ -1867,9 +2022,15 @@ def employee_filter_view(request):
     previous_data = request.GET.urlencode()
     field = request.GET.get("field")
     queryset = Employee.objects.filter()
+    selected_company = request.session.get("selected_company")
     employees = EmployeeFilter(request.GET, queryset=queryset).qs
     if request.GET.get("is_active") != "False":
         employees = employees.filter(is_active=True)
+    if (
+        request.GET.get("employee_work_info__company_id") == None
+        and selected_company != "all"
+    ):
+        employees = employees.filter(employee_work_info__company_id=selected_company)
     page_number = request.GET.get("page")
     view = request.GET.get("view")
     data_dict = parse_qs(previous_data)
@@ -2023,11 +2184,12 @@ def employee_delete(request, obj_id):
     try:
         view = request.POST.get("view")
         employee = Employee.objects.get(id=obj_id)
-        if Contract.objects.filter(employee_id=obj_id).exists():
-            contracts = Contract.objects.filter(employee_id=obj_id)
-            for contract in contracts:
-                if contract.contract_status != "active":
-                    contract.delete()
+        if apps.is_installed("payroll"):
+            if employee.contract_set.all().exists():
+                contracts = employee.contract_set.all()
+                for contract in contracts:
+                    if contract.contract_status != "active":
+                        contract.delete()
         user = employee.employee_user_id
         try:
             user.delete()
@@ -2045,8 +2207,8 @@ def employee_delete(request, obj_id):
         error_message = _("- {}.".format(model_names_str))
         error_message = str(error_message)
         request.session["error_message"] = error_message
-        return redirect(employee_view)
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", f"/view={view}"))
+        return redirect(reverse("employee-view") + "?error_message=true")
+    return SolichRedirect(request, fallback_url=f"/view={view}")
 
 
 @login_required
@@ -2055,28 +2217,34 @@ def employee_bulk_delete(request):
     """
     This method is used to delete set of Employee instances
     """
-    ids = request.POST["ids"]
-    ids = json.loads(ids)
-    for employee_id in ids:
+    ids = json.loads(request.POST.get("ids", "[]"))
+    if not ids:
+        messages.error(request, _("No IDs provided."))
+    deleted_count = 0
+    employees = Employee.objects.filter(id__in=ids).select_related("employee_user_id")
+    for employee in employees:
         try:
-            employee = Employee.objects.get(id=employee_id)
-            if Contract.objects.filter(employee_id=employee_id).exists():
-                contracts = Contract.objects.filter(employee_id=employee_id)
-                for contract in contracts:
-                    if contract.contract_status != "active":
-                        contract.delete()
+            if apps.is_installed("payroll"):
+                if employee.contract_set.all().exists():
+                    contracts = employee.contract_set.all()
+                    for contract in contracts:
+                        if contract.contract_status != "active":
+                            contract.delete()
             user = employee.employee_user_id
             user.delete()
-            messages.success(
-                request, _("%(employee)s deleted.") % {"employee": employee}
-            )
+            deleted_count += 1
         except Employee.DoesNotExist:
             messages.error(request, _("Employee not found."))
         except ProtectedError:
             messages.error(
                 request, _("You cannot delete %(employee)s.") % {"employee": employee}
             )
-
+    if deleted_count > 0:
+        messages.success(
+            request,
+            _("%(deleted_count)s employees deleted.")
+            % {"deleted_count": deleted_count},
+        )
     return JsonResponse({"message": "Success"})
 
 
@@ -2113,7 +2281,11 @@ def employee_bulk_archive(request):
             message = _("archived")
             if is_active:
                 message = _("un-archived")
-            messages.success(request, f"{employee} is {message}")
+            messages.success(
+                request,
+                _("%(employee)s is %(message)s")
+                % {"employee": employee, "message": message},
+            )
         else:
             messages.warning(request, _("Related data found for {}.").format(employee))
     return JsonResponse({"message": "Success"})
@@ -2144,7 +2316,7 @@ def employee_archive(request, obj_id):
                     count = count + 1
             if count == 1:
                 messages.error(request, _("You can't archive the last superuser."))
-                return HttpResponse("<script>$('#filterEmployee').click();</script>")
+                return HttpResponse("<script>$('#applyFilter').click();</script>")
 
         result = employee.get_archive_condition()
         if result:
@@ -2156,9 +2328,9 @@ def employee_archive(request, obj_id):
         messages.success(request, message)
         key = "HTTP_HX_REQUEST"
         if key not in request.META.keys():
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            return SolichRedirect(request)
         else:
-            return HttpResponse("<script>$('#filterEmployee').click();</script>")
+            return HttpResponse("<script>$('#applyFilter').click();</script>")
     else:
         return render(
             request,
@@ -2177,6 +2349,12 @@ def employee_archive(request, obj_id):
 @permission_required("employee.change_employee")
 def replace_employee(request, emp_id):
     employee = Employee.objects.filter(id=emp_id).first()
+    if not employee:
+        return SolichRedirect(
+            request, message=_("No Employee found matching the query.")
+        )
+
+    title = request.GET.get("title")
     related_models = (
         employee.get_archive_condition().get("related_models", "") if employee else None
     )
@@ -2194,9 +2372,13 @@ def replace_employee(request, emp_id):
                         reporting_manager_id=emp_id
                     ).update(reporting_manager_id=replace_emp)
                 elif (
-                    field_name == "recruitment_managers"
+                    apps.is_installed("recruitment")
+                    and field_name == "recruitment_managers"
                     and str(emp_id) != replace_emp_id
                 ):
+                    Recruitment = get_solich_model_class(
+                        app_label="recruitment", model="recruitment"
+                    )
                     recruitment_query = Recruitment.objects.filter(
                         recruitment_managers=emp_id
                     )
@@ -2205,9 +2387,13 @@ def replace_employee(request, emp_id):
                             recruitment.recruitment_managers.remove(emp_id)
                             recruitment.recruitment_managers.add(replace_emp)
                 elif (
-                    field_name == "recruitment_stage_managers"
+                    apps.is_installed("recruitment")
+                    and field_name == "recruitment_stage_managers"
                     and str(emp_id) != replace_emp_id
                 ):
+                    Stage = get_solich_model_class(
+                        app_label="recruitment", model="stage"
+                    )
                     recruitment_stage_query = Stage.objects.filter(
                         stage_managers=emp_id
                     )
@@ -2216,9 +2402,13 @@ def replace_employee(request, emp_id):
                             stage.stage_managers.remove(emp_id)
                             stage.stage_managers.add(replace_emp)
                 elif (
-                    field_name == "onboarding_stage_manager"
+                    apps.is_installed("onboarding")
+                    and field_name == "onboarding_stage_manager"
                     and str(emp_id) != replace_emp_id
                 ):
+                    OnboardingStage = get_solich_model_class(
+                        app_label="onboarding", model="onboardingstage"
+                    )
                     onboarding_stage_query = OnboardingStage.objects.filter(
                         employee_id=emp_id
                     )
@@ -2227,9 +2417,13 @@ def replace_employee(request, emp_id):
                             stage.employee_id.remove(emp_id)
                             stage.employee_id.add(replace_emp)
                 elif (
-                    field_name == "onboarding_task_manager"
+                    apps.is_installed("onboarding")
+                    and field_name == "onboarding_task_manager"
                     and str(emp_id) != replace_emp_id
                 ):
+                    OnboardingTask = get_solich_model_class(
+                        app_label="onboarding", model="onboardingtask"
+                    )
                     onboarding_task_query = OnboardingTask.objects.filter(
                         employee_id=emp_id
                     )
@@ -2240,11 +2434,14 @@ def replace_employee(request, emp_id):
                 else:
                     pass
     related_models = employee.get_archive_condition()
-    if related_models is False:
+    if title == "Change the Designations":
+        messages.success(request, _("Designation changed."))
+        return redirect("/offboarding/offboarding-pipeline")
+    if related_models is False and title != "Change the Designations":
         employee.is_active = False
         employee.save()
         messages.success(request, _("{} archived successfully").format(employee))
-    return redirect(employee_view)
+    return redirect(f"{reverse('employee-view')}?view=list")
 
 
 @login_required
@@ -2255,6 +2452,16 @@ def get_manager_in(request):
     """
     employee_id = request.GET.get("employee_id")
     employee = Employee.objects.filter(id=employee_id).first()
+    if not employee:
+        return SolichRedirect(
+            request, message=_("No Employee found matching the query.")
+        )
+
+    offboarding = request.GET.get("offboarding")
+    if offboarding:
+        title = _("Change the Designations")
+    else:
+        title = _("Can't Archive")
     employee.is_active = not employee.is_active
     employee.employee_user_id.is_active = not employee.is_active
     save = True
@@ -2268,11 +2475,7 @@ def get_manager_in(request):
     if save:
         employee.save()
         messages.success(request, message)
-        key = "HTTP_HX_REQUEST"
-        if key not in request.META.keys():
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
-        else:
-            return HttpResponse("<script>window.location.reload()</script>")
+        return SolichRedirect(request)
     else:
         return render(
             request,
@@ -2282,19 +2485,24 @@ def get_manager_in(request):
                 "related_models": result.get("related_models"),
                 "related_model_fields": result.get("related_model_fields"),
                 "employee_choices": result.get("employee_choices"),
-                "title": _("Can't Archive"),
+                "title": title,
             },
         )
 
 
 @login_required
-@manager_can_enter("employee.view_employee")
+@hx_request_required
+@enter_if_accessible(
+    feature="employee_view",
+    perm="employee.view_employee",
+    method=_check_reporting_manager,
+)
 def employee_search(request):
     """
     This method is used to search employee
     """
-    search = request.GET["search"]
-    view = request.GET["view"]
+    search = request.GET.get("search")
+    view = request.GET.get("view")
     previous_data = request.GET.urlencode()
     employees = EmployeeFilter(request.GET).qs
     if search == "":
@@ -2482,7 +2690,7 @@ def employee_import(request):
                 phone = employee_dict["phone"]
                 email = employee_dict["email"]
                 employee_full_name = employee_dict["employee_full_name"]
-                existing_user = User.objects.filter(username=email).first()
+                existing_user = SolichUser.objects.filter(username=email).first()
                 if existing_user is None:
                     employee_first_name = employee_full_name
                     employee_last_name = ""
@@ -2492,7 +2700,7 @@ def employee_import(request):
                             employee_last_name,
                         ) = employee_full_name.split(" ", 1)
 
-                    user = User.objects.create_user(
+                    user = SolichUser.objects.create_user(
                         username=email,
                         email=email,
                         password=str(phone).strip(),
@@ -2524,20 +2732,36 @@ def employee_import(request):
 
 
 @login_required
-@permission_required("employee.add_employee")
-def employee_export(_):
+def employee_export(request):
     """
-    This method is used to export employee data to xlsx
+    This method is used to export employee data to xlsx. If the caller
+    selected specific employees in the list view (instance_ids), only those
+    are exported; otherwise every employee is exported, same as before.
     """
+    if not has_export_access(request, Employee):
+        return SolichRedirect(
+            request, message=_("You dont have access to export this data")
+        )
+
     # Get the list of field names for your model
     field_names = [f.name for f in Employee._meta.get_fields() if not f.auto_created]
     field_names.remove("employee_user_id")
     field_names.remove("employee_profile")
     field_names.remove("additional_info")
+    field_names.remove("is_from_onboarding")
+    field_names.remove("is_directly_converted")
     field_names.remove("is_active")
 
+    employees = Employee.objects.all()
+    instance_ids = request.GET.get("instance_ids")
+    if instance_ids:
+        with contextlib.suppress(ValueError, SyntaxError):
+            instance_ids = ast.literal_eval(instance_ids)
+            if instance_ids:
+                employees = employees.filter(pk__in=instance_ids)
+
     # Get the existing employee data and convert it to a DataFrame
-    employee_data = Employee.objects.values_list(*field_names)
+    employee_data = employees.values_list(*field_names)
     data_frame = pd.DataFrame(list(employee_data), columns=field_names)
 
     # Export the DataFrame to an Excel file
@@ -2557,361 +2781,151 @@ def convert_nan(field, dicts):
     try:
         float(field_value)
         return None
-    except ValueError:
+    except (ValueError, TypeError):
         return field_value
 
 
 @login_required
 @permission_required("employee.add_employee")
-def work_info_import(request):
+def work_info_import_file(request):
     """
-    This method is used to import Employee instances and creates related objects
+    This method is used to return the excel file of import Employee instances
     """
     data_frame = pd.DataFrame(
         columns=[
-            "Badge id",
+            "Badge ID",
             "First Name",
             "Last Name",
-            "Phone",
             "Email",
+            "Phone",
             "Gender",
             "Department",
             "Job Position",
             "Job Role",
-            "Work Type",
             "Shift",
-            "Employee Type",
+            "Work Type",
             "Reporting Manager",
-            "Company",
+            "Employee Type",
             "Location",
-            "Date joining",
-            "Contract End Date",
+            "Date Joining",
             "Basic Salary",
             "Salary Hour",
+            "Contract End Date",
+            "Company",
         ]
     )
-    error_data = {
-        "Badge id": [],
-        "First Name": [],
-        "Last Name": [],
-        "Phone": [],
-        "Email": [],
-        "Gender": [],
-        "Department": [],
-        "Job Position": [],
-        "Job Role": [],
-        "Work Type": [],
-        "Shift": [],
-        "Employee Type": [],
-        "Reporting Manager": [],
-        "Company": [],
-        "Location": [],
-        "Date joining": [],
-        "Contract End Date": [],
-        "Basic Salary": [],
-        "Salary Hour": [],
-        "Email Error": [],
-        "First Name error": [],
-        "Phone error": [],
-        "Joining Date Error": [],
-        "Contract Error": [],
-        "Badge ID Error": [],
-        "Basic Salary Error": [],
-        "Salary Hour Error": [],
-        "User ID Error": [],
-    }
 
-    # Export the DataFrame to an Excel file
     response = HttpResponse(content_type="application/ms-excel")
     response["Content-Disposition"] = 'attachment; filename="work_info_template.xlsx"'
     data_frame.to_excel(response, index=False)
-    create_work_info = False
-    if request.POST.get("create_work_info") == "true":
-        create_work_info = True
+    return response
 
-    if request.method == "POST" and request.FILES.get("file") is not None:
-        file = request.FILES["file"]
-        data_frame = pd.read_excel(file)
-        work_info_dicts = data_frame.to_dict("records")
-        error_lists = []
-        success_lists = []
-        total_count = 0
-        error_occured = False
-        for work_info in work_info_dicts:
-            error = False
-            try:
-                email = work_info["Email"]
-                phone = work_info["Phone"]
-                first_name = convert_nan("First Name", work_info)
-                last_name = convert_nan("Last Name", work_info)
-                badge_id = work_info["Badge id"]
-                department = convert_nan("Department", work_info)
-                job_position = convert_nan("Job Position", work_info)
-                job_role = convert_nan("Job Role", work_info)
-                work_type = convert_nan("Work Type", work_info)
-                employee_type = convert_nan("Employee Type", work_info)
-                reporting_manager = convert_nan("Reporting Manager", work_info)
-                company = convert_nan("Company", work_info)
-                location = convert_nan("Location", work_info)
-                shift = convert_nan("Shift", work_info)
-                date_joining = work_info["Date joining"]
-                contract_end_date = work_info["Contract End Date"]
-                basic_salary = convert_nan("Basic Salary", work_info)
-                salary_hour = convert_nan("Salary Hour", work_info)
-                gender = work_info.get("Gender")
 
-                pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+@login_required
+@hx_request_required
+@permission_required("employee.add_employee")
+def work_info_import(request):
+    if request.method == "GET":
+        return render(request, "employee/employee_import.html")
 
-                if pd.isna(email) or not re.match(pattern, email):
-                    work_info["Email Error"] = f"Invalid Email address"
-                    error = True
-
-                # try:
-                #     pd.to_numeric(phone)
-                # except:
-                #     work_info["Phone Error"] = "Phone number must be a number"
-                #     error = True
-
-                try:
-                    pd.to_numeric(basic_salary)
-                except ValueError:
-                    work_info["Basic Salary Error"] = f"Basic Salary must be a number"
-                    error = True
-
-                try:
-                    pd.to_numeric(salary_hour)
-                except ValueError:
-                    work_info["Salary Hour Error"] = f"Salary Hour must be a number"
-                    error = True
-
-                if pd.isna(first_name):
-                    work_info["First Name error"] = f"First Name can't be empty"
-                    error = True
-
-                if pd.isna(phone):
-                    work_info["Phone error"] = f"Phone Number can't be empty"
-                    error = True
-
-                try:
-                    pd.to_datetime(date_joining).date()
-                except:
-                    work_info["Joining Date Error"] = (
-                        f"Invalid Date format. Please use the format YYYY-MM-DD"
-                    )
-                    error = True
-
-                try:
-                    pd.to_datetime(contract_end_date).date()
-                except:
-                    work_info["Contract Error"] = (
-                        f"Invalid Date format. Please use the format YYYY-MM-DD"
-                    )
-                    error = True
-
-                if Employee.objects.filter(badge_id=badge_id).exists():
-                    work_info["Badge ID Error"] = (
-                        f"An Employee with the badge ID already exists"
-                    )
-                    error = True
-
-                user = User.objects.filter(username=email).first()
-                if user:
-                    work_info["User ID Error"] = (
-                        f"User with the email ID already exists"
-                    )
-                    error = True
-
-                if error:
-                    error_lists.append(work_info)
-                else:
-                    success_lists.append(work_info)
-
-            except Exception as e:
-                error_occured = True
-                logger.error(e)
-
-        if create_work_info or not error_lists:
-            try:
-                for work_info in success_lists:
-                    email = work_info["Email"]
-                    phone = work_info["Phone"]
-                    first_name = convert_nan("First Name", work_info)
-                    last_name = convert_nan("Last Name", work_info)
-                    badge_id = work_info["Badge id"]
-                    department = convert_nan("Department", work_info)
-                    job_position = convert_nan("Job Position", work_info)
-                    job_role = convert_nan("Job Role", work_info)
-                    work_type = convert_nan("Work Type", work_info)
-                    employee_type = convert_nan("Employee Type", work_info)
-                    reporting_manager = convert_nan("Reporting Manager", work_info)
-                    company = convert_nan("Company", work_info)
-                    location = convert_nan("Location", work_info)
-                    shift = convert_nan("Shift", work_info)
-                    date_joining = work_info["Date joining"]
-                    contract_end_date = work_info["Contract End Date"]
-                    basic_salary = convert_nan("Basic Salary", work_info)
-                    salary_hour = convert_nan("Salary Hour", work_info)
-                    gender = work_info.get("Gender")
-
-                    if User.objects.filter(username=email).first():
-                        continue
-
-                    user = User.objects.create_user(
-                        username=email,
-                        email=email,
-                        password=str(phone).strip(),
-                        is_superuser=False,
-                    )
-
-                    employee_obj = Employee()
-                    employee_obj.employee_user_id = user
-                    employee_obj.badge_id = badge_id
-                    employee_obj.employee_first_name = first_name
-                    employee_obj.employee_last_name = last_name
-                    employee_obj.email = email
-                    employee_obj.phone = phone
-                    employee_obj.gender = gender.lower()
-                    employee_obj.save()
-
-                    department_obj = Department.objects.filter(
-                        department=department
-                    ).first()
-                    if department_obj is None and department is not None:
-                        department_obj = Department()
-                        department_obj.department = department
-                        department_obj.save()
-
-                    job_position_obj = JobPosition.objects.filter(
-                        department_id=department_obj, job_position=job_position
-                    ).first()
-                    if job_position_obj is None and job_position is not None:
-                        job_position_obj = JobPosition()
-                        job_position_obj.department_id = department_obj
-                        job_position_obj.job_position = job_position
-                        job_position_obj.save()
-
-                    job_role_obj = JobRole.objects.filter(
-                        job_role=job_role, job_position_id=job_position_obj
-                    ).first()
-                    if job_role_obj is None and job_role is not None:
-                        job_role_obj = JobRole()
-                        job_role_obj.job_position_id = job_position_obj
-                        job_role_obj.job_role = job_role
-                        job_role_obj.save()
-
-                    work_type_obj = WorkType.objects.filter(work_type=work_type).first()
-                    if work_type_obj is None and work_type is not None:
-                        work_type_obj = WorkType()
-                        work_type_obj.work_type = work_type
-
-                    shift_obj = EmployeeShift.objects.filter(
-                        employee_shift=shift
-                    ).first()
-                    if shift_obj is None and shift is not None:
-                        shift_obj = EmployeeShift()
-                        shift_obj.employee_shift = shift
-                        shift_obj.save()
-
-                    employee_type_obj = EmployeeType.objects.filter(
-                        employee_type=employee_type
-                    ).first()
-                    if employee_type_obj is None and employee_type is not None:
-                        employee_type_obj = EmployeeType()
-                        employee_type_obj.employee_type = employee_type
-                        employee_type_obj.save()
-
-                    manager_fname, manager_lname = "", ""
-                    if isinstance(reporting_manager, str) and " " in reporting_manager:
-                        manager_fname, manager_lname = reporting_manager.split(" ", 1)
-                    reporting_manager_obj = Employee.objects.filter(
-                        employee_first_name=manager_fname,
-                        employee_last_name=manager_lname,
-                    ).first()
-                    company_obj = Company.objects.filter(company=company).first()
-                    employee_work_info = EmployeeWorkInformation.objects.filter(
-                        employee_id=employee_obj
-                    ).first()
-                    if employee_work_info is None:
-                        employee_work_info = EmployeeWorkInformation()
-                    employee_work_info.employee_id = employee_obj
-                    employee_work_info.email = email
-                    employee_work_info.department_id = department_obj
-                    employee_work_info.job_position_id = job_position_obj
-                    employee_work_info.job_role_id = job_role_obj
-                    employee_work_info.employee_type_id = employee_type_obj
-                    employee_work_info.reporting_manager_id = reporting_manager_obj
-                    employee_work_info.company_id = company_obj
-                    employee_work_info.shift_id = shift_obj
-                    employee_work_info.location = location
-                    employee_work_info.date_joining = (
-                        date_joining
-                        if not pd.isnull(date_joining)
-                        else datetime.today()
-                    )
-                    employee_work_info.contract_end_date = (
-                        contract_end_date if not pd.isnull(contract_end_date) else None
-                    )
-                    employee_work_info.basic_salary = (
-                        basic_salary if type(basic_salary) is int else 0
-                    )
-                    employee_work_info.salary_hour = (
-                        salary_hour if type(salary_hour) is int else 0
-                    )
-                    employee_work_info.save()
-
-                    total_count += 1
-
-            except Exception as e:
-                error_occured = True
-                logger.error(e)
-
-        if error_occured:
-            messages.error(request, "something went wrong....")
-            data_frame = pd.DataFrame(
-                ["The provided titles don't match the default titles."],
-                columns=["Title Error"],
+    if request.method == "POST":
+        file = request.FILES.get("file")
+        if not file:
+            error_message = _("No file uploaded.")
+            return render(
+                request,
+                "employee/employee_import.html",
+                {"error_message": error_message},
             )
 
-            error_count = len(error_lists)
-            # Create an HTTP response object with the Excel file
-            response = HttpResponse(content_type="application/ms-excel")
-            response["Content-Disposition"] = 'attachment; filename="ImportError.xlsx"'
-            data_frame.to_excel(response, index=False)
-            response["X-Error-Count"] = error_count
-            return response
+        file_extension = file.name.split(".")[-1].lower()
 
-        if error_lists:
-            for item in error_lists:
-                for key, value in error_data.items():
-                    if key in item:
-                        value.append(item[key])
-                    else:
-                        value.append(None)
+        try:
+            if file_extension == "csv":
+                data_frame = pd.read_csv(file)
+            elif file_extension in ["xls", "xlsx"]:
+                data_frame = pd.read_excel(file)
+            else:
 
-            keys_to_remove = [
-                key
-                for key, value in error_data.items()
-                if all(v is None for v in value)
-            ]
+                error_message = _(
+                    "Unsupported file format. Please upload a CSV or Excel file."
+                )
+                return render(
+                    request,
+                    "employee/employee_import.html",
+                    {"error_message": error_message},
+                )
 
-            for key in keys_to_remove:
-                del error_data[key]
-            data_frame = pd.DataFrame(error_data, columns=error_data.keys())
-            error_count = len(error_lists)
-            # Create an HTTP response object with the Excel file
-            response = HttpResponse(content_type="application/ms-excel")
-            response["Content-Disposition"] = 'attachment; filename="ImportError.xlsx"'
-            data_frame.to_excel(response, index=False)
-            response["X-Error-Count"] = error_count
-            return response
-        return JsonResponse(
-            {
-                "Success": "Employees Imported Succefully",
-                "success_count": total_count,
+            cleaned_data_frame = data_frame.astype(object).replace({np.nan: None})
+            valid, error_message = valid_import_file_headers(data_frame)
+            if not valid:
+                return render(
+                    request,
+                    "employee/employee_import.html",
+                    {"error_message": error_message},
+                )
+            success_list, error_list, created_count = process_employee_records(
+                cleaned_data_frame
+            )
+            if success_list:
+                try:
+                    users = bulk_create_user_import(success_list)
+                    employees = bulk_create_employee_import(success_list)
+                    bulk_create_department_import(success_list)
+                    bulk_create_job_position_import(success_list)
+                    bulk_create_job_role_import(success_list)
+                    bulk_create_work_types(success_list)
+                    bulk_create_shifts(success_list)
+                    bulk_create_employee_types(success_list)
+                    bulk_create_work_info_import(success_list)
+                    thread = threading.Thread(
+                        target=set_initial_password, args=(employees,)
+                    )
+                    thread.start()
+
+                except Exception as e:
+                    messages.error(request, _("Error Occured {}").format(e))
+                    logger.error(e)
+
+            path_info = (
+                generate_error_report(
+                    error_list, error_data_template, "EmployeesImportError.xlsx"
+                )
+                if error_list
+                else None
+            )
+
+            context = {
+                "created_count": created_count,
+                "total_count": created_count + len(error_list),
+                "error_count": len(error_list),
+                "model": _("Employees"),
+                "path_info": path_info,
             }
-        )
-
-    return response
+            messages.success(
+                request,
+                _("%(created_count)s employees created.")
+                % {"created_count": created_count},
+            )
+            result = render_to_string("import_popup.html", context)
+            result += """
+                        <script>
+                            $('#objectCreateModalTarget').css('max-width', '410px');
+                        </script>
+                    """
+            return HttpResponse(result)
+        except Exception as e:
+            messages.error(
+                request,
+                _(
+                    "Failed to read file. Please ensure it is a valid CSV or Excel file. : {}"
+                ).format(e),
+            )
+            logger.error(f"File import error: {e}")
+            error_message = f"File import error: {e}"
+    return render(
+        request, "employee/employee_import.html", {"error_message": error_message}
+    )
 
 
 @login_required
@@ -2920,9 +2934,30 @@ def work_info_export(request):
     """
     This method is used to export employee data to xlsx
     """
+    if not has_export_access(request, Employee):
+        return SolichRedirect(
+            request, message=_("You dont have access to export this data")
+        )
+
+    if request.META.get("HTTP_HX_REQUEST"):
+        context = {
+            "export_filter": EmployeeFilter(),
+            "export_form": EmployeeExportExcelForm(),
+        }
+        return render(request, "employee_export_filter.html", context)
+
     employees_data = {}
     selected_columns = []
     form = EmployeeExportExcelForm()
+    field_overrides = {
+        "employee_work_info__department_id": "employee_work_info__department_id__department",
+        "employee_work_info__job_position_id": "employee_work_info__job_position_id__job_position",
+        "employee_work_info__job_role_id": "employee_work_info__job_role_id__job_role",
+        "employee_work_info__shift_id": "employee_work_info__shift_id__employee_shift",
+        "employee_work_info__work_type_id": "employee_work_info__work_type_id__work_type",
+        "employee_work_info__reporting_manager_id": "employee_work_info__reporting_manager_id__get_full_name",
+        "employee_work_info__employee_type_id": "employee_work_info__employee_type_id__employee_type",
+    }
     employees = EmployeeFilter(request.GET).qs
     employees = filtersubordinatesemployeemodel(
         request, employees, "employee.view_employee"
@@ -2930,72 +2965,63 @@ def work_info_export(request):
     selected_fields = request.GET.getlist("selected_fields")
     if not selected_fields:
         selected_fields = form.fields["selected_fields"].initial
-        ids = request.GET.get("ids")
-        id_list = json.loads(ids)
+        id_list = json.loads(request.GET.get("ids", "[]"))
         employees = Employee.objects.filter(id__in=id_list)
-    for field in excel_columns:
-        value = field[0]
-        key = field[1]
+
+    prefetch_fields = list(set(f.split("__")[0] for f in selected_fields if "__" in f))
+    if prefetch_fields:
+        employees = employees.select_related(*prefetch_fields)
+
+    for value, key in excel_columns:
         if value in selected_fields:
             selected_columns.append((value, key))
-    for column_value, column_name in selected_columns:
-        nested_attributes = column_value.split("__")
-        employees_data[column_name] = []
-        for employee in employees:
+
+    date_format = "YYYY-MM-DD"
+    user = request.user
+    emp = getattr(user, "employee_get", None)
+    if emp:
+        info = EmployeeWorkInformation.objects.filter(employee_id=emp).first()
+        if info:
+            company = Company.objects.filter(company=info.company_id).first()
+            if company and company.date_format:
+                date_format = company.date_format
+
+    employees_data = {column_name: [] for _, column_name in selected_columns}
+    for employee in employees:
+        for column_value, column_name in selected_columns:
+            if column_value in field_overrides:
+                column_value = field_overrides[column_value]
+
+            nested_attrs = column_value.split("__")
             value = employee
-            for attr in nested_attributes:
+            for attr in nested_attrs:
                 value = getattr(value, attr, None)
                 if value is None:
                     break
+
+            # Call the value if it's employee_work_info__reporting_manager_id__get_full_name
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    value = ""
+
             data = str(value) if value is not None else ""
 
-            if type(value) == date:
-                user = request.user
-                emp = user.employee_get
-
-                # Taking the company_name of the user
-                info = EmployeeWorkInformation.objects.filter(employee_id=emp)
-                if info.exists():
-                    for i in info:
-                        employee_company = i.company_id
-                    company_name = Company.objects.filter(company=employee_company)
-                    emp_company = company_name.first()
-
-                    # Access the date_format attribute directly
-                    date_format = (
-                        emp_company.date_format if emp_company else "MMM. D, YYYY"
+            if isinstance(value, date):
+                try:
+                    data = value.strftime(
+                        settings.SOLICH_DATE_FORMATS.get(date_format, "%Y-%m-%d")
                     )
-                else:
-                    date_format = "MMM. D, YYYY"
-                # Define date formats
-                date_formats = {
-                    "DD-MM-YYYY": "%d-%m-%Y",
-                    "DD.MM.YYYY": "%d.%m.%Y",
-                    "DD/MM/YYYY": "%d/%m/%Y",
-                    "MM/DD/YYYY": "%m/%d/%Y",
-                    "YYYY-MM-DD": "%Y-%m-%d",
-                    "YYYY/MM/DD": "%Y/%m/%d",
-                    "MMMM D, YYYY": "%B %d, %Y",
-                    "DD MMMM, YYYY": "%d %B, %Y",
-                    "MMM. D, YYYY": "%b. %d, %Y",
-                    "D MMM. YYYY": "%d %b. %Y",
-                    "dddd, MMMM D, YYYY": "%A, %B %d, %Y",
-                }
-
-                # Convert the string to a datetime.date object
-                start_date = datetime.strptime(str(value), "%Y-%m-%d").date()
-
-                # Print the formatted date for each format
-                for format_name, format_string in date_formats.items():
-                    if format_name == date_format:
-                        data = start_date.strftime(format_string)
+                except Exception:
+                    data = str(value)
 
             if data == "True":
                 data = _("Yes")
             elif data == "False":
                 data = _("No")
-            employees_data[column_name].append(data)
 
+            employees_data[column_name].append(data)
     data_frame = pd.DataFrame(data=employees_data)
     response = HttpResponse(content_type="application/ms-excel")
     response["Content-Disposition"] = 'attachment; filename="employee_export.xlsx"'
@@ -3023,44 +3049,44 @@ def birthday():
 
 
 @login_required
-def get_employees_birthday(_):
+@hx_request_required
+@enter_if_accessible(feature="birthday_view", perm="employee.view_employee")
+def get_employees_birthday(request):
     """
-    This method is used to render all upcoming birthday employee details to fill the dashboard.
+    Render all upcoming birthday employee details for the dashboard.
     """
     employees = birthday()
-    birthdays = []
-    for emp in employees:
-        name = f"{emp.employee_first_name} {emp.employee_last_name}"
-        dob = emp.dob.strftime("%d %b %Y")
-        days_till_birthday = emp.days_until_birthday
-        if days_till_birthday == 0:
-            days_till_birthday = "Today"
-        elif days_till_birthday == 1:
-            days_till_birthday = "Tomorrow"
-        else:
-            days_till_birthday = f"In {days_till_birthday} Days"
-        try:
-            path = emp.employee_profile.url
-        except:
-            path = f"https://ui-avatars.com/api/?\
-                name={emp.employee_first_name}+{emp.employee_last_name}&background=random"
-        birthdays.append(
-            {
-                "profile": path,
-                "name": name,
-                "dob": dob,
-                "daysUntilBirthday": days_till_birthday,
-                "department": (
-                    emp.get_department().department if emp.get_department() else ""
-                ),
-                "job_position": (
-                    emp.get_job_position().job_position
-                    if emp.get_job_position()
-                    else ""
-                ),
-            }
-        )
-    return JsonResponse({"birthdays": birthdays})
+    default_avatar_url = "https://ui-avatars.com/api/?background=random&name="
+    birthdays = [
+        {
+            "profile": (
+                emp.get_avatar()
+                if hasattr(emp, "get_avatar")
+                else f"{default_avatar_url}{emp.employee_first_name}+{emp.employee_last_name}"
+            ),
+            "name": f"{emp.employee_first_name} {emp.employee_last_name}",
+            "dob": emp.dob.strftime("%d %b"),
+            "daysUntilBirthday": (
+                _("Today")
+                if emp.days_until_birthday == 0
+                else (
+                    _("Tomorrow")
+                    if emp.days_until_birthday == 1
+                    else f"In {emp.days_until_birthday} Days"
+                )
+            ),
+            "department": (
+                emp.get_department().department if emp.get_department() else ""
+            ),
+            "job_position": (
+                emp.get_job_position().job_position if emp.get_job_position() else ""
+            ),
+        }
+        for emp in employees
+    ]
+    return render(
+        request, "dashboard/birthdays_container.html", {"birthdays": birthdays}
+    )
 
 
 @login_required
@@ -3092,6 +3118,57 @@ def dashboard(request):
             "inactive_ratio": inactive_ratio,
         },
     )
+
+
+@login_required
+@hx_request_required
+def total_employees_count(request):
+    employees = Employee.objects.all().count()
+    return HttpResponse(employees)
+
+
+@login_required
+@hx_request_required
+def joining_today_count(request):
+    newbies_today = 0
+    if apps.is_installed("recruitment"):
+        Candidate = get_solich_model_class(app_label="recruitment", model="candidate")
+        newbies_today = Candidate.objects.filter(
+            joining_date__range=[date.today(), date.today() + timedelta(days=1)],
+            is_active=True,
+        ).count()
+    return HttpResponse(newbies_today)
+
+
+@login_required
+@hx_request_required
+def joining_week_count(request):
+    newbies_week = 0
+    if apps.is_installed("recruitment"):
+        Candidate = get_solich_model_class(app_label="recruitment", model="candidate")
+        newbies_week = Candidate.objects.filter(
+            joining_date__range=[
+                date.today() - timedelta(days=date.today().weekday()),
+                date.today() + timedelta(days=6 - date.today().weekday()),
+            ],
+            is_active=True,
+            hired=True,
+        ).count()
+    return HttpResponse(newbies_week)
+
+
+@login_required
+@hx_request_required
+def leave_today_count(request):
+    leave_today = 0
+    if apps.is_installed("leave"):
+        LeaveRequest = get_solich_model_class(app_label="leave", model="leaverequest")
+        leave_today = LeaveRequest.objects.filter(
+            Q(start_date__lte=date.today(), end_date__gte=date.today()),
+            status="approved",
+            is_active=True,
+        ).count()
+    return HttpResponse(leave_today)
 
 
 @login_required
@@ -3175,61 +3252,16 @@ def dashboard_employee_department(request):
 
 
 @login_required
-def dashboard_employee_tiles(request):
-    """
-    This method returns json response.
-    """
-    data = {}
-    # active employees count
-    data["total_employees"] = Employee.objects.filter(is_active=True).count()
-    # filtering newbies
-    data["newbies_today"] = Candidate.objects.filter(
-        joining_date__range=[date.today(), date.today() + timedelta(days=1)],
-        is_active=True,
-    ).count()
-    try:
-        data[
-            "newbies_today_percentage"
-        ] = f"""{
-        (EmployeeWorkInformation.objects.filter(
-            date_joining__range=[date.today(), date.today() + timedelta(days=1)]
-            ).count() / Employee.objects.filter(
-                employee_work_info__isnull=False).count()
-                ) * 100:.2f}%"""
-    except Exception:
-        data["newbies_today_percentage"] = 0
-    # filtering newbies on this week
-
-    data["newbies_week"] = Candidate.objects.filter(
-        joining_date__range=[
-            date.today() - timedelta(days=date.today().weekday()),
-            date.today() + timedelta(days=6 - date.today().weekday()),
-        ],
-        is_active=True,
-        hired=True,
-    ).count()
-    try:
-        data[
-            "newbies_week_percentage"
-        ] = f"""{(
-            EmployeeWorkInformation.objects.filter(
-            date_joining__range=[date.today() - timedelta(days=7), date.today()]
-            ).count() / Employee.objects.filter(
-            employee_work_info__isnull=False
-            ).count()
-            ) * 100:.2f}%"""
-
-    except Exception:
-        data["newbies_week_percentage"] = 0
-    return JsonResponse(data)
-
-
-@login_required
 def widget_filter(request):
     """
     This method is used to return all the ids of the employees
     """
-    ids = EmployeeFilter(request.GET).qs.values_list("id", flat=True)
+    cleaned_get = request.GET.copy()
+    for key in list(cleaned_get.keys()):
+        # Remove keys with only empty string values
+        if all(not v.strip() for v in cleaned_get.getlist(key)):
+            del cleaned_get[key]
+    ids = EmployeeFilter(data=cleaned_get).qs.values_list("id", flat=True)
     return JsonResponse({"ids": list(ids)})
 
 
@@ -3263,7 +3295,6 @@ def employee_select_filter(request):
             request.GET, queryset=Employee.objects.filter()
         )
 
-        # Get the filtered queryset
         filtered_employees = filtersubordinatesemployeemodel(
             request=request, queryset=employee_filter.qs, perm="employee.view_employee"
         )
@@ -3273,12 +3304,14 @@ def employee_select_filter(request):
         context = {"employee_ids": employee_ids, "total_count": total_count}
 
         return JsonResponse(context)
+    else:
+        return JsonResponse({"error": _("Invalid page number")}, status=400)
 
 
 @login_required
 @hx_request_required
 @manager_can_enter(perm="employee.view_employeenote")
-def note_tab(request, emp_id):
+def note_tab(request, pk):
     """
     This function is used to view note tab of an employee in employee individual
     & profile view.
@@ -3290,13 +3323,46 @@ def note_tab(request, emp_id):
     Returns: return note-tab template
 
     """
-    employee_obj = Employee.objects.get(id=emp_id)
-    notes = EmployeeNote.objects.filter(employee_id=emp_id).order_by("-id")
+    employee_obj = Employee.objects.get(id=pk)
+    notes = EmployeeNote.objects.filter(employee_id=pk).order_by("-id")
+    notes = paginator_qry(notes, request.GET.get("page"))
 
     return render(
         request,
-        "tabs/note_tab.html",
+        "tabs/main_note_tab.html",
         {"employee": employee_obj, "notes": notes},
+    )
+
+
+@login_required
+def history_tab(request, pk):
+    """
+    Activity-history tab for employee profile / individual view.
+    Renders the shared activity-history feed from work-information tracking.
+    """
+    employee_obj = Employee.objects.get(id=pk)
+    return render(
+        request,
+        "tabs/history.html",
+        {"employee": employee_obj},
+    )
+
+
+@login_required
+@hx_request_required
+def employee_history_sidebar(request, pk):
+    """
+    Same activity-history feed as the profile page's History tab, wrapped
+    with the #historySidebar's own header chrome (close chevron + title) --
+    for opening it directly from the employee list's History column, the
+    same way SolichModel-based lists open their auto-added History column
+    (see generic/history_col.html / solich_history_view.html).
+    """
+    employee_obj = Employee.objects.get(id=pk)
+    return render(
+        request,
+        "employee/history_sidebar.html",
+        {"employee": employee_obj},
     )
 
 
@@ -3305,7 +3371,8 @@ def note_tab(request, emp_id):
 @manager_can_enter(perm="employee.add_employeenote")
 def add_note(request, emp_id=None):
     """
-    This method renders template component to add candidate remark
+    Handles the addition of a note to a specific employee, including file attachments.
+    Saves the note and redirects to the employee's note tab upon successful submission.
     """
 
     form = EmployeeNoteForm(initial={"employee_id": emp_id})
@@ -3323,7 +3390,6 @@ def add_note(request, emp_id=None):
             note.save()
             note.note_files.set(attachment_ids)
             messages.success(request, _("Note added successfully.."))
-            response = render(request, "tabs/add_note.html", {"form": form})
             return redirect(f"/employee/note-tab/{emp_id}")
 
     employee_obj = Employee.objects.get(id=emp_id)
@@ -3346,7 +3412,11 @@ def employee_note_update(request, note_id):
         id : stage note instance id
     """
 
-    note = EmployeeNote.objects.get(id=note_id)
+    note = EmployeeNote.find(note_id)
+    if not note:
+        return SolichRedirect(
+            request, message=_("No Employee Note found matching the query.")
+        )
 
     form = EmployeeNoteForm(instance=note)
     if request.POST:
@@ -3359,9 +3429,7 @@ def employee_note_update(request, note_id):
                 "tabs/update_note.html",
                 {"form": form},
             )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(
         request,
         "tabs/update_note.html",
@@ -3380,18 +3448,21 @@ def employee_note_delete(request, note_id):
         id : stage note instance id
     """
 
-    note = EmployeeNote.objects.get(id=note_id)
+    note = EmployeeNote.find(note_id)
+    if not note:
+        return SolichRedirect(
+            request, message=_("No Employee Note found matching the query.")
+        )
+
+    emp_id = note.employee_id.id
     note.delete()
-    message = _("Note deleted successfully...")
-    return HttpResponse(
-        f"<div class='oh-wrapper'> <div class='oh-alert-container'>\
-            <div class='oh-alert oh-alert--animated oh-alert--success'>\
-                {message}</div></div></div>"
-    )
+    messages.success(request, _("Note deleted successfully."))
+    return redirect(f"/employee/note-tab/{emp_id}")
 
 
 @login_required
 @hx_request_required
+@manager_can_enter(perm="employee.add_notefiles")
 def add_more_employee_files(request, note_id):
     """
     This method is used to Add more files to the Employee note.
@@ -3400,18 +3471,30 @@ def add_more_employee_files(request, note_id):
     """
     note = EmployeeNote.objects.get(id=note_id)
     employee_id = note.employee_id.id
+
     if request.method == "POST":
         files = request.FILES.getlist("files")
-        files_ids = []
-        for file in files:
-            instance = NoteFiles.objects.create(files=file)
-            files_ids.append(instance.id)
 
+        for file in files:
+            ext = os.path.splitext(file.name)[1].lower()
+
+            # Block dangerous file types
+            if ext in BLOCKED_EXTENSIONS:
+                messages.error(
+                    request,
+                    _("File type %(ext)s is not allowed for security reasons.")
+                    % {"ext": ext},
+                )
+                continue  # skip this file
+
+            instance = NoteFiles.objects.create(files=file)
             note.note_files.add(instance.id)
     return redirect(f"/employee/note-tab/{employee_id}")
 
 
 @login_required
+@hx_request_required
+@manager_can_enter(perm="employee.delete_notefiles")
 def delete_employee_note_file(request, note_file_id):
     """
     This method is used to delete the stage note file
@@ -3419,18 +3502,14 @@ def delete_employee_note_file(request, note_file_id):
         id : stage file instance id
     """
     file = NoteFiles.objects.get(id=note_file_id)
-    notes = file.employeenote_set.all()
-    if not request.user.has_perm("employee.delete_notefile"):
-        file.employeenote_set.filter(employee_id__employee_user_id=request.user)
-    employee_id = notes.first().employee_id.id
     file.delete()
-    return redirect(f"/employee/note-tab/{employee_id}")
+    return HttpResponse()
 
 
 @login_required
 @hx_request_required
 @owner_can_enter("employee.view_bonuspoint", Employee)
-def bonus_points_tab(request, emp_id):
+def bonus_points_tab(request, pk):
     """
     This function is used to view Bonus Points tab of an employee in employee individual
     & profile view.
@@ -3442,43 +3521,58 @@ def bonus_points_tab(request, emp_id):
     Returns: return bonus_points template
 
     """
-    employee_obj = Employee.objects.get(id=emp_id)
-    points = BonusPoint.objects.get(employee_id=emp_id)
-    requested_bonus_points = Reimbursement.objects.filter(
-        employee_id=emp_id, type="bonus_encashment", status="requested"
-    )
-    trackings = points.tracking()
-    activity_list = []
-    for history in trackings:
-        activity_list.append(
-            {
-                "type": history["type"],
-                "date": history["pair"][0].history_date,
-                "points": history["pair"][0].points - history["pair"][1].points,
-                "user": getattr(
-                    User.objects.filter(id=history["pair"][0].history_user_id).first(),
-                    "employee_get",
-                    None,
-                ),
-                "reason": history["pair"][0].reason,
-            }
-        )
-    for requested in requested_bonus_points:
-        activity_list.append(
-            {
-                "type": "requested",
-                "date": requested.created_at,
-                "points": requested.bonus_to_encash,
-                "user": employee_obj.employee_user_id,
-                "reason": "Redeemed points",
-            }
-        )
-    activity_list = sorted(activity_list, key=lambda x: x["date"], reverse=True)
-    context = {
-        "employee": employee_obj,
-        "points": points,
-        "activity_list": activity_list,
-    }
+    employee_obj = Employee.objects.get(id=pk)
+    try:
+        points = BonusPoint.objects.get(employee_id=pk)
+        if apps.is_installed("payroll"):
+            Reimbursement = get_solich_model_class(
+                app_label="payroll", model="reimbursement"
+            )
+            requested_bonus_points = Reimbursement.objects.filter(
+                employee_id=pk, type="bonus_encashment", status="requested"
+            )
+        else:
+            requested_bonus_points = QuerySet().none()
+        trackings = points.tracking()
+        activity_list = []
+        for history in trackings:
+            activity_list.append(
+                {
+                    "type": history["type"],
+                    "date": history["pair"][0].history_date,
+                    "points": history["pair"][0].points - history["pair"][1].points,
+                    "user": getattr(
+                        SolichUser.objects.filter(
+                            id=history["pair"][0].history_user_id
+                        ).first(),
+                        "employee_get",
+                        None,
+                    ),
+                    "reason": history["pair"][0].reason,
+                }
+            )
+        for requested in requested_bonus_points:
+            activity_list.append(
+                {
+                    "type": "requested",
+                    "date": requested.created_at,
+                    "points": requested.bonus_to_encash,
+                    "user": employee_obj.employee_user_id,
+                    "reason": "Redeemed points",
+                }
+            )
+        activity_list = sorted(activity_list, key=lambda x: x["date"], reverse=True)
+        context = {
+            "employee": employee_obj,
+            "points": points,
+            "activity_list": activity_list,
+        }
+    except ObjectDoesNotExist:
+        context = {
+            "employee": employee_obj,
+            "points": None,
+            "activity_list": [],
+        }
     return render(
         request,
         "tabs/bonus_points.html",
@@ -3499,7 +3593,12 @@ def add_bonus_points(request, emp_id):
     Returns: returns add_points form
     """
 
-    bonus_point = BonusPoint.objects.get(employee_id=emp_id)
+    bonus_point = BonusPoint.find(emp_id)
+    if not bonus_point:
+        return SolichRedirect(
+            request, message=_("No Bonus Point found matching the query.")
+        )
+
     form = BonusPointAddForm()
     if request.method == "POST":
         form = BonusPointAddForm(
@@ -3517,7 +3616,7 @@ def add_bonus_points(request, emp_id):
                     form.cleaned_data["points"]
                 ),
             )
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            return SolichRedirect(request)
 
     return render(
         request,
@@ -3541,37 +3640,58 @@ def redeem_points(request, emp_id):
 
     Returns: returns redeem_points_form form
     """
-    user = Employee.objects.get(id=emp_id)
-    form = BonusPointRedeemForm()
-    form.instance.employee_id = user
-    amount_for_bonus_point = (
-        EncashmentGeneralSettings.objects.first().bonus_amount
-        if EncashmentGeneralSettings.objects.first()
-        else 1
-    )
+    try:
+        employee = Employee.objects.get(id=emp_id)
+    except Employee.DoesNotExist:
+        return SolichRedirect(
+            request, message=_("No Employee found matching the query.")
+        )
+
+    avialable_points = 0
+    if BonusPoint.objects.filter(employee_id=employee).exists():
+        avialable_points = (
+            BonusPoint.objects.filter(employee_id=employee).first().points
+        )
+    form = BonusPointRedeemForm(initial={"points": avialable_points})
+    form.instance.employee_id = employee
+
+    amount_for_bonus_point = 0
+    if apps.is_installed("payroll"):
+        EncashmentGeneralSettings = get_solich_model_class(
+            app_label="payroll", model="encashmentgeneralsettings"
+        )
+        amount_for_bonus_point = (
+            EncashmentGeneralSettings.objects.first().bonus_amount
+            if EncashmentGeneralSettings.objects.first()
+            else 1
+        )
     if request.method == "POST":
         form = BonusPointRedeemForm(request.POST)
-        form.instance.employee_id = user
+        form.instance.employee_id = employee
         if form.is_valid():
             form.save(commit=False)
             points = form.cleaned_data["points"]
             amount = amount_for_bonus_point * points
-            Reimbursement.objects.create(
-                title=f"Bonus point Redeem for {user}",
-                type="bonus_encashment",
-                employee_id=user,
-                bonus_to_encash=points,
-                amount=amount,
-                description=f"{user} want to redeem {points} points",
-                allowance_on=date.today(),
-            )
-            return HttpResponse("<script>window.location.reload();</script>")
+            if apps.is_installed("payroll"):
+                Reimbursement = get_solich_model_class(
+                    app_label="payroll", model="reimbursement"
+                )
+                Reimbursement.objects.create(
+                    title=f"Bonus point Redeem for {employee}",
+                    type="bonus_encashment",
+                    employee_id=employee,
+                    bonus_to_encash=points,
+                    amount=amount,
+                    description=f"{employee} want to redeem {points} points",
+                    allowance_on=date.today(),
+                )
+            return SolichRedirect(request)
     return render(
         request,
         "tabs/forms/redeem_points_form.html",
         {
             "form": form,
-            "employee": user,
+            "employee": employee,
         },
     )
 
@@ -3581,9 +3701,21 @@ def organisation_chart(request):
     """
     This method is used to view oganisation chart
     """
-    reporting_managers = Employee.objects.filter(
-        reporting_manager__isnull=False
-    ).distinct()
+    selected_company = request.session.get("selected_company")
+    if (
+        request.GET.get("employee_work_info__company_id") == None
+        and selected_company != "all"
+    ):
+        reporting_managers = Employee.objects.filter(
+            is_active=True,
+            reporting_manager__isnull=False,
+            employee_work_info__company_id=selected_company,
+        ).distinct()
+    else:
+        reporting_managers = Employee.objects.filter(
+            is_active=True,
+            reporting_manager__isnull=False,
+        ).distinct()
 
     # Iterate through the queryset and add reporting manager id and name to the dictionary
     result_dict = {item.id: item.get_full_name() for item in reporting_managers}
@@ -3601,7 +3733,7 @@ def organisation_chart(request):
             entered_req_managers.append(manager)
         # filter the subordinates
         subordinates = Employee.objects.filter(
-            employee_work_info__reporting_manager_id=manager
+            is_active=True, employee_work_info__reporting_manager_id=manager
         ).exclude(id=manager.id)
 
         # itrating through subordinates
@@ -3615,7 +3747,7 @@ def organisation_chart(request):
                     {
                         "name": employee.get_full_name(),
                         "title": getattr(
-                            employee.get_job_position(), "job_position", "Not set"
+                            employee.get_job_position(), "job_position", _("Not set")
                         ),
                         "children": create_hierarchy(employee),
                     }
@@ -3627,7 +3759,7 @@ def organisation_chart(request):
                     {
                         "name": employee.get_full_name(),
                         "title": getattr(
-                            employee.get_job_position(), "job_position", "Not set"
+                            employee.get_job_position(), "job_position", _("Not set")
                         ),
                         "className": "middle-level",
                         "children": create_hierarchy(employee),
@@ -3635,15 +3767,35 @@ def organisation_chart(request):
                 )
         return nodes
 
+    selected_company = request.session.get("selected_company")
+    if (
+        request.GET.get("employee_work_info__company_id") == None
+        and selected_company != "all"
+    ):
+        reporting_managers = Employee.objects.filter(
+            is_active=True,
+            reporting_manager__isnull=False,
+            employee_work_info__company_id=selected_company,
+        ).distinct()
+    else:
+        reporting_managers = Employee.objects.filter(
+            is_active=True, reporting_manager__isnull=False
+        ).distinct()
+
     manager = request.user.employee_get
-    new_dict = {manager.id: _("My view"), **result_dict}
+
+    if len(reporting_managers) == 0:
+        new_dict = {}
+    else:
+        new_dict = {reporting_managers[0].id: _("My view"), **result_dict}
     # POST method is used to change the reporting manager
     if request.method == "POST":
-        manager_id = int(request.POST.get("manager_id"))
-        manager = Employee.objects.get(id=manager_id)
+        if request.POST.get("manager_id"):
+            manager_id = int(request.POST.get("manager_id"))
+            manager = Employee.objects.get(id=manager_id)
         node = {
             "name": manager.get_full_name(),
-            "title": getattr(manager.get_job_position(), "job_position", "Not set"),
+            "title": getattr(manager.get_job_position(), "job_position", _("Not set")),
             "children": create_hierarchy(manager),
         }
         context = {"act_datasource": node}
@@ -3651,7 +3803,7 @@ def organisation_chart(request):
 
     node = {
         "name": manager.get_full_name(),
-        "title": getattr(manager.get_job_position(), "job_position", "Not set"),
+        "title": getattr(manager.get_job_position(), "job_position", _("Not set")),
         "children": create_hierarchy(manager),
     }
 
@@ -3664,52 +3816,78 @@ def organisation_chart(request):
 
 
 @login_required
+@permission_required("payroll.add_encashmentgeneralsettings")
 def encashment_condition_create(request):
     """
     Handle the creation and updating of encashment general settings.
-
-    This view function retrieves the first instance of EncashmentGeneralSettings
-    and initializes a form with it. If the request method is POST, it attempts
-    to update the instance with the submitted data. If the form is valid, the
-    settings are saved and a success message is displayed. The user is then
-    redirected to the referring page or the root URL. If the request method is
-    GET, it renders the encashment settings form.
     """
-    from payroll.forms.forms import EncashmentGeneralSettingsForm
+    if apps.is_installed("payroll"):
+        from payroll.forms.forms import EncashmentGeneralSettingsForm
 
-    instance = EncashmentGeneralSettings.objects.first()
-    encashment_form = EncashmentGeneralSettingsForm(instance=instance)
-    if request.method == "POST":
-        encashment_form = EncashmentGeneralSettingsForm(request.POST, instance=instance)
-        if encashment_form.is_valid():
-            encashment_form.save()
-            messages.success(request, _("Settings updated."))
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+        EncashmentGeneralSettings = get_solich_model_class(
+            app_label="payroll", model="encashmentgeneralsettings"
+        )
+        instance = (
+            EncashmentGeneralSettings.objects.first()
+            if apps.is_installed("payroll")
+            else QuerySet().none()
+        )
 
-    return render(
-        request,
-        "settings/encashment_settings.html",
-        {
-            "encashment_form": encashment_form,
-        },
-    )
+        if request.method == "POST":
+            encashment_form = EncashmentGeneralSettingsForm(
+                request.POST, instance=instance
+            )
+            if encashment_form.is_valid():
+                encashment_form.save()
+                messages.success(request, _("Settings updated."))
+                if request.headers.get("HX-Request"):
+                    return HttpResponse("")
+                return SolichRedirect(request)
+        else:
+            encashment_form = EncashmentGeneralSettingsForm(instance=instance)
+
+        return render(
+            request,
+            "settings/encashment_settings.html",
+            {"encashment_form": encashment_form},
+        )
+
+    messages.warning(request, _("Payroll app not installed"))
+    if request.headers.get("HX-Request"):
+        return HttpResponse("", status=400)
+    return SolichRedirect(request)
 
 
 @login_required
 @permission_required("employee.add_employeegeneralsetting")
 def initial_prefix(request):
     """
-    This method is used to set initial prefix
+    This method is used to set the initial prefix using a form.
     """
-    instance = EmployeeGeneralSetting.objects.first()
-    instance = instance if instance else EmployeeGeneralSetting()
-    instance.badge_id_prefix = request.POST["initial_prefix"]
-    instance.save()
-    messages.success(request, "Initial prefix update")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    instance = EmployeeGeneralSetting.objects.first()  # Get the first instance or None
+    if not instance:
+        instance = EmployeeGeneralSetting()  # Create a new instance if none exists
+
+    if request.method == "POST":
+        form = EmployeeGeneralSettingPrefixForm(request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            messages.success(request, _("Initial prefix updated successfully."))
+            if request.headers.get("HX-Request"):
+                return HttpResponse("")
+            return SolichRedirect(request)
+        else:
+            messages.error(request, _("There was an error updating the prefix."))
+    else:
+        form = EmployeeGeneralSettingPrefixForm(instance=instance)
+
+    if request.headers.get("HX-Request"):
+        return HttpResponse("", status=400)
+    return SolichRedirect(request)
 
 
 @login_required
+@hx_request_required
 @manager_can_enter("employee.view_employee")
 def first_last_badge(request):
     """
@@ -3727,22 +3905,76 @@ def first_last_badge(request):
 @login_required
 @hx_request_required
 @manager_can_enter("employee.view_employee")
-def employee_get_mail_log(request):
+def employee_get_mail_log(request, pk):
     """
     This method is used to track mails sent along with the status
     """
-    employee_id = request.GET["emp_id"]
-    employee = Employee.objects.get(id=employee_id)
+    employee = Employee.objects.get(id=pk)
     tracked_mails = EmailLog.objects.filter(to__icontains=employee.email)
-    if employee.employee_work_info and employee.employee_work_info.email:
-        tracked_mails = tracked_mails | EmailLog.objects.filter(
-            to__icontains=employee.employee_work_info.email
+    try:
+        if employee.employee_work_info and employee.employee_work_info.email:
+            tracked_mails = tracked_mails | EmailLog.objects.filter(
+                to__icontains=employee.employee_work_info.email
+            )
+        tracked_mails = tracked_mails.order_by("-created_at")
+
+        return render(request, "tabs/mail_log.html", {"tracked_mails": tracked_mails})
+    except ObjectDoesNotExist:
+        return render(request, "tabs/mail_log.html", {"tracked_mails": []})
+
+
+@login_required
+def get_job_positions(request):
+    department_id = request.GET.get("department_id")
+    job_positions = (
+        JobPosition.objects.filter(department_id=department_id).values_list(
+            "id", "job_position"
         )
-    tracked_mails = tracked_mails.order_by("-created_at")
+        if department_id
+        else []
+    )
+    job_id = (
+        request.GET.get("job_id") or job_positions.first()[0] if job_positions else None
+    )
 
-    return render(request, "tabs/mail_log.html", {"tracked_mails": tracked_mails})
+    job_roles = (
+        JobRole.objects.filter(job_position_id=job_id).values_list("id", "job_role")
+        if job_id
+        else []
+    )
+    return JsonResponse(
+        {"job_positions": dict(job_positions), "job_roles": dict(job_roles)}
+    )
 
 
+@login_required
+@hx_request_required
+def get_job_positions_hx(request):
+    department_id = request.GET.get("department_id")
+    job_position_id = request.GET.get("job_position_id")
+    form = EmployeeWorkInformationUpdateForm()
+    if department_id:
+        job_positions = JobPosition.objects.filter(department_id=department_id)
+        form.fields["job_position_id"].queryset = job_positions
+        if job_position_id:
+            form.fields["job_position_id"].initial = job_position_id
+        else:
+            form.fields["job_position_id"].initial = (
+                form.fields["job_position_id"].queryset.first().id
+            )
+
+    job_position_field_html = render_to_string(
+        "cbv/dashboard/job_position_field.html",
+        {
+            "form": form,
+            "field_name": "job_position_id",
+            "field": form.fields["job_position_id"],
+        },
+    )
+    return HttpResponse(job_position_field_html)
+
+
+@login_required
 def get_job_roles(request):
     """
     Retrieve job roles associated with a specific job position.
@@ -3751,9 +3983,147 @@ def get_job_roles(request):
     JobRole model for job roles that match the provided job_position_id, and
     returns the results as a JSON response.
     """
-    job_id = request.GET.get("job_id")
-    job_roles = JobRole.objects.filter(job_position_id=job_id).values_list(
-        "id", "job_role"
-    )
-    return JsonResponse({"job_roles": dict(job_roles)})
 
+    job_position_id = request.GET.get("job_position_id")
+    job_position = JobPosition.objects.filter(id=job_position_id).first()
+    department = job_position.department_id if job_position else None
+    job_roles = (
+        JobRole.objects.filter(job_position_id=job_position_id).values_list(
+            "id", "job_role"
+        )
+        if job_position
+        else []
+    )
+    all_departments = Department.objects.values_list("id", "department")
+    return JsonResponse(
+        {
+            "department_id": department.id if department else None,
+            "department_name": department.department if department else None,
+            "job_roles": dict(job_roles),
+            "departments": dict(all_departments),
+        }
+    )
+
+
+@login_required
+def get_position_department(request):
+    """
+    Retrieve job position and department associated with a specific job roles.
+
+    This view function extracts the job_id from the GET request, queries the
+    JobRole model for job roles that match the provided job_position_id, and
+    returns the results as a JSON response.
+    """
+
+    job_role_id = request.GET.get("job_role_id")
+    job_role = JobRole.objects.filter(id=job_role_id).first()
+    job_position = job_role.job_position_id if job_role else None
+    department = job_role.job_position_id.department_id if job_role else None
+
+    all_departments = Department.objects.values_list("id", "department")
+    all_job_position = (
+        JobPosition.objects.filter(department_id=department.id).values_list(
+            "id", "job_position"
+        )
+        if department
+        else []
+    )
+    return JsonResponse(
+        {
+            "job_position_id": job_position.id if job_position else None,
+            "job_position_name": job_position.job_position if job_position else None,
+            "job_positions": dict(all_job_position),
+            "departments": dict(all_departments),
+            "department_id": department.id if department else None,
+            "department_name": department.department if department else None,
+        }
+    )
+
+
+@login_required
+@hx_request_required
+def get_job_roles_hx(request):
+    """
+    Retrieve job roles associated with a specific job position.
+
+    This view function extracts the job_id from the GET request, queries the
+    JobRole model for job roles that match the provided job_position_id, and
+    returns the results as a JSON response.
+    """
+    job_position_id = request.GET.get("job_position_id")
+    job_role_id = request.GET.get("job_role_id")
+    form = EmployeeWorkInformationUpdateForm()
+    if job_position_id:
+        job_role = JobRole.objects.filter(job_position_id=job_position_id)
+        form.fields["job_role_id"].queryset = job_role
+        if job_role_id:
+            form.fields["job_role_id"].initial = job_role_id
+    job_role_field_html = render_to_string(
+        "cbv/dashboard/job_role_field.html",
+        {
+            "form": form,
+            "field_name": "job_role_id",
+            "field": form.fields["job_role_id"],
+        },
+    )
+    return HttpResponse(job_role_field_html)
+
+
+@login_required
+@permission_required("employee.view_employeetag")
+def employee_tag_view(request):
+    """
+    This method is used to Employee tags
+    """
+    employeetags = EmployeeTag.objects.all()
+    return render(
+        request,
+        "base/tags/employee_tags.html",
+        {"employeetags": employeetags},
+    )
+
+
+@login_required
+@hx_request_required
+@permission_required("employee.add_employeetag")
+def employee_tag_create(request):
+    """
+    This method renders form and template to create Ticket type
+    """
+    form = EmployeeTagForm()
+    if request.method == "POST":
+        form = EmployeeTagForm(request.POST)
+        if form.is_valid():
+            form.save()
+            form = EmployeeTagForm()
+            messages.success(request, _("Tag has been created successfully!"))
+    return render(
+        request,
+        "base/employee_tag/employee_tag_form.html",
+        {
+            "form": form,
+        },
+    )
+
+
+@login_required
+@hx_request_required
+@permission_required("employee.add_employeetag")
+def employee_tag_update(request, tag_id):
+    """
+    This method renders form and template to create Ticket type
+    """
+    tag = EmployeeTag.objects.get(id=tag_id)
+    form = EmployeeTagForm(instance=tag)
+    if request.method == "POST":
+        form = EmployeeTagForm(request.POST, instance=tag)
+        if form.is_valid():
+            form.save()
+            form = EmployeeTagForm()
+            messages.success(request, _("Tag has been updated successfully!"))
+            return SolichRedirect(request)
+    return render(
+        request,
+        "base/employee_tag/employee_tag_form.html",
+        {"form": form, "tag_id": tag_id},
+    )

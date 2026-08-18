@@ -10,12 +10,18 @@ from datetime import timedelta
 from urllib.parse import parse_qs
 
 from django.contrib import messages
-from django.contrib.auth.models import User
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
-from base.methods import filtersubordinates, get_key_instances
+from base.methods import (
+    closest_numbers,
+    eval_validate,
+    filtersubordinates,
+    get_key_instances,
+    paginator_qry,
+)
 from base.views import paginator_qry
 from employee.filters import DisciplinaryActionFilter, PolicyFilter
 from employee.forms import DisciplinaryActionForm, PolicyForm
@@ -27,6 +33,8 @@ from employee.models import (
     PolicyMultipleFile,
 )
 from solich.decorators import hx_request_required, login_required, permission_required
+from solich.http.response import SolichRedirect
+from solich_auth.models import SolichUser
 from notifications.signals import notify
 
 
@@ -46,6 +54,38 @@ def view_policies(request):
 
 
 @login_required
+def policies_discipline_view(request):
+    """
+    Policies & Discipline landing page with tabbed disciplinary/policy sections.
+    """
+    return render(request, "policies/policies_discipline.html")
+
+
+@login_required
+def policies_discipline_disciplinary_tab(request):
+    """
+    HTMX tab body for disciplinary actions under policies & discipline.
+    """
+    return render(request, "policies/policies_discipline_disciplinary_tab.html")
+
+
+@login_required
+def policies_discipline_policies_tab(request):
+    """
+    HTMX tab body for policies under policies & discipline.
+    """
+    return render(request, "policies/policies_discipline_policies_tab.html")
+
+
+@login_required
+def policies_discipline_action_type_tab(request):
+    """
+    HTMX tab body for disciplinary action types under policies & discipline.
+    """
+    return render(request, "policies/policies_discipline_action_type_tab.html")
+
+
+@login_required
 @hx_request_required
 @permission_required("employee.add_policy")
 def create_policy(request):
@@ -54,15 +94,16 @@ def create_policy(request):
     """
     instance_id = request.GET.get("instance_id")
     instance = None
-    if isinstance(eval(str(instance_id)), int):
+    if isinstance(eval_validate(str(instance_id)), int):
         instance = Policy.objects.filter(id=instance_id).first()
     form = PolicyForm(instance=instance)
     if request.method == "POST":
         form = PolicyForm(request.POST, request.FILES, instance=instance)
         if form.is_valid():
             form.save()
-            messages.success(request, "Policy saved")
-            return HttpResponse("<script>window.location.reload()</script>")
+            messages.success(request, _("Policy saved"))
+            form = PolicyForm()
+            # return HttpResponse("<script>window.location.reload()</script>")
     return render(request, "policies/form.html", {"form": form})
 
 
@@ -114,41 +155,61 @@ def delete_policies(request):
         if count == 0:
             messages.error(request, _("Policies Not Found"))
         else:
-            messages.success(request, "Policies deleted")
+            messages.success(request, _("Policies deleted"))
     except ValueError:
         messages.error(request, _("Policies Not Found"))
+    if request.META.get("HTTP_HX_REQUEST"):
+        policies_qs = Policy.objects.all()
+        if not request.user.has_perm("employee.view_policy"):
+            policies_qs = policies_qs.filter(is_visible_to_all=True)
+        return render(
+            request,
+            "policies/records.html",
+            {
+                "policies": paginator_qry(policies_qs, request.GET.get("page")),
+                "pd": request.GET.urlencode(),
+            },
+        )
     return redirect(view_policies)
 
 
 @login_required
-@permission_required("employee.change_policy")
+@permission_required("employee.add_policymultiplefile")
 def add_attachment(request):
     """
     This method is used to add attachment to policy
     """
+    policy = Policy.find(request.GET.get("policy_id"))
+    if not policy:
+        return SolichRedirect(
+            request, message=_("No Policy found matching the query.")
+        )
+
     files = request.FILES.getlist("files")
-    policy_id = request.GET["policy_id"]
     attachments = []
     for file in files:
         attachment = PolicyMultipleFile()
         attachment.attachment = file
         attachment.save()
         attachments.append(attachment)
-    policy = Policy.objects.get(id=policy_id)
     policy.attachments.add(*attachments)
-    messages.success(request, "Attachments added")
+    messages.success(request, _("Attachments added"))
     return render(request, "policies/attachments.html", {"policy": policy})
 
 
 @login_required
-@permission_required("employee.delete_policy")
+@permission_required("employee.delete_policymultiplefile")
 def remove_attachment(request):
     """
     This method is used to remove the attachments
     """
+    policy = Policy.find(request.GET.get("policy_id"))
+    if not policy:
+        return SolichRedirect(
+            request, message=_("No Policy found matching the query.")
+        )
+
     ids = request.GET.getlist("ids")
-    policy_id = request.GET["policy_id"]
-    policy = Policy.objects.get(id=policy_id)
     PolicyMultipleFile.objects.filter(id__in=ids).delete()
     return render(request, "policies/attachments.html", {"policy": policy})
 
@@ -158,8 +219,12 @@ def get_attachments(request):
     """
     This method is used to view all the attachments inside the policy
     """
-    policy = request.GET["policy_id"]
-    policy = Policy.objects.get(id=policy)
+    policy = Policy.find(request.GET.get("policy_id"))
+    if not policy:
+        return SolichRedirect(
+            request, message=_("No Policy found matching the query.")
+        )
+
     return render(request, "policies/attachments.html", {"policy": policy})
 
 
@@ -169,12 +234,16 @@ def disciplinary_actions(request):
     This method is used to view all Disciplinaryaction
     """
     employee = Employee.objects.filter(employee_user_id=request.user).first()
-    dis_actions = filtersubordinates(
-        request, DisciplinaryAction.objects.all(), "base.add_disciplinaryaction"
-    ).distinct()
-    dis_actions = (
-        dis_actions | DisciplinaryAction.objects.filter(employee_id=employee).distinct()
-    )
+    if request.user.has_perm("employee.view_disciplinaryaction"):
+        dis_actions = DisciplinaryAction.objects.all()
+    else:
+        dis_actions = filtersubordinates(
+            request, DisciplinaryAction.objects.all(), "base.add_disciplinaryaction"
+        ).distinct()
+        dis_actions = (
+            dis_actions
+            | DisciplinaryAction.objects.filter(employee_id=employee).distinct()
+        )
 
     form = DisciplinaryActionFilter(request.GET, queryset=dis_actions)
     page_number = request.GET.get("page")
@@ -224,19 +293,6 @@ def get_action_type_delete(action_id):
     return action.action_type
 
 
-def employee_account_block_unblock(emp_id, result):
-
-    employee = get_object_or_404(Employee, id=emp_id)
-    if not employee:
-        return redirect(disciplinary_actions)
-    user = get_object_or_404(User, id=employee.employee_user_id.id)
-    if not user:
-        return redirect(disciplinary_actions)
-    user.is_active = result
-    user.save()
-    return HttpResponse("<script>window.location.reload()</script>")
-
-
 @login_required
 @hx_request_required
 @permission_required("employee.add_disciplinaryaction")
@@ -276,7 +332,7 @@ def create_actions(request):
             )
         dis = DisciplinaryAction.objects.all()
         if len(dis) == 1:
-            return HttpResponse("<script>window.location.reload()</script>")
+            return SolichRedirect(request)
 
     return render(
         request, "disciplinary_actions/form.html", {"form": form, "dynamic": dynamic}
@@ -332,7 +388,7 @@ def remove_employee_disciplinary_action(request, action_id, emp_id):
 
     if action_type == "dismissal" or action_type == "suspension":
         emp = get_object_or_404(Employee, id=emp_id)
-        user = get_object_or_404(User, id=emp.employee_user_id.id)
+        user = get_object_or_404(SolichUser, id=emp.employee_user_id.id)
         if user.is_active:
             pass
         else:
@@ -352,7 +408,7 @@ def remove_employee_disciplinary_action(request, action_id, emp_id):
     messages.success(
         request, _("Employee removed from disciplinary action successfully.")
     )
-    return redirect(f"/employee/disciplinary-filter-view?click_id={dis_action.id}")
+    return redirect(f"/employee/disciplinary-actions-list?click_id={dis_action.id}")
 
 
 @login_required
@@ -362,6 +418,9 @@ def delete_actions(request, action_id):
     """
     This method is used to delete Disciplinary action
     """
+    request_copy = request.GET.copy()
+    request_copy.pop("instances_ids", None)
+    previous_data = request_copy.urlencode()
 
     dis = DisciplinaryAction.objects.get(id=action_id)
 
@@ -371,7 +430,7 @@ def delete_actions(request, action_id):
 
         if action_type == "dismissal" or action_type == "suspension":
             employee = get_object_or_404(Employee, id=dis_emp.id)
-            user = get_object_or_404(User, id=employee.employee_user_id.id)
+            user = get_object_or_404(SolichUser, id=employee.employee_user_id.id)
             if user.is_active:
                 pass
             else:
@@ -385,9 +444,22 @@ def delete_actions(request, action_id):
     messages.success(request, _("Disciplinary action deleted."))
     dis_actions = DisciplinaryAction.objects.all()
 
+    hx_target = request.META.get("HTTP_HX_TARGET")
+    if hx_target and hx_target == "genericModalBody":
+        instances_ids = request.GET.get("instances_ids")
+        instances_list = json.loads(instances_ids)
+        if action_id in instances_list:
+            instances_list.remove(action_id)
+            previous_instance, next_instance = closest_numbers(
+                json.loads(instances_ids), action_id
+            )
+        return redirect(
+            f"/employee/disciplinary-actions-detail-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
+        )
+
     if dis_actions.exists():
-        return redirect(disciplinary_filter_view)
-    return HttpResponse("<script>window.location.reload()</script>")
+        return redirect(reverse("disciplinary-actions-list"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -395,9 +467,8 @@ def action_type_details(request):
     """
     This method is used to get the action type by the selection of title in the form.
     """
-    action_id = request.POST["action_type"]
-    action = Actiontype.objects.get(id=action_id)
-    action_type = action.action_type
+    action = Actiontype.find(request.POST.get("action_type"))
+    action_type = action.action_type if action else ""
     return JsonResponse({"action_type": action_type})
 
 
@@ -406,7 +477,7 @@ def action_type_name(request):
     """
     This method is used to get the action type name by the selection of type in the form.
     """
-    action_type = request.POST["action_type"]
+    action_type = request.POST.get("action_type")
     return JsonResponse({"action_type": action_type})
 
 
@@ -438,6 +509,7 @@ def disciplinary_filter_view(request):
 
 
 @login_required
+@hx_request_required
 def search_disciplinary(request):
     """
     This method is used to search in Disciplinary Actions
@@ -451,4 +523,3 @@ def search_disciplinary(request):
             "pd": request.GET.urlencode(),
         },
     )
-

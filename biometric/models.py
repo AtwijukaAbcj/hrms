@@ -1,3 +1,4 @@
+# pylint: disable=too-few-public-methods
 """
 This module contains Django models for managing biometric devices
 and employee attendance within a company.
@@ -9,11 +10,14 @@ import requests
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator
 from django.db import models
+from django.urls import reverse, reverse_lazy
 from django.utils.translation import gettext_lazy as _
 
+from base.solich_company_manager import SolichCompanyManager
 from base.models import Company
 from employee.models import Employee
 from solich.models import SolichModel
+from solich_views.cbv_methods import render_template
 
 
 def validate_schedule_time_format(value):
@@ -46,29 +50,52 @@ class BiometricDevices(SolichModel):
     """
 
     BIO_DEVICE_TYPE = [
-        ("zk", _("ZKTeco Biometric")),
+        ("zk", _("ZKTeco / eSSL Biometric")),
         ("anviz", _("Anviz Biometric")),
         ("cosec", _("Matrix COSEC Biometric")),
+        ("dahua", _("Dahua Biometric")),
+        ("etimeoffice", _("e-Time Office")),
+    ]
+    BIO_DEVICE_DIRECTION = [
+        ("in", _("In Device")),
+        ("out", _("Out Device")),
+        ("alternate", _("Alternate In/Out Device")),
+        ("system", _("System Direction(In/Out) Device")),
     ]
     id = models.UUIDField(default=uuid.uuid4, primary_key=True, editable=False)
-    name = models.CharField(max_length=100)
+    name = models.CharField(max_length=100, verbose_name=_("Name"))
     machine_type = models.CharField(
-        max_length=18,
-        choices=BIO_DEVICE_TYPE,
-        null=True,
+        max_length=18, choices=BIO_DEVICE_TYPE, null=True, verbose_name=_("Device Type")
     )
-    machine_ip = models.CharField(max_length=15, null=True, blank=True, default="")
-    port = models.IntegerField(null=True, blank=True)
-    cosec_username = models.CharField(max_length=100, null=True, blank=True, default="")
-    cosec_password = models.CharField(max_length=100, null=True, blank=True)
-    anviz_request_id = models.CharField(max_length=200, null=True, blank=True)
-    api_url = models.CharField(max_length=200, null=True, blank=True)
-    api_key = models.CharField(max_length=100, null=True, blank=True)
-    api_secret = models.CharField(max_length=100, null=True, blank=True)
+    machine_ip = models.CharField(
+        max_length=150, null=True, blank=True, default="", verbose_name=_("Machine IP")
+    )
+    port = models.IntegerField(null=True, blank=True, verbose_name=_("Port No"))
+    zk_password = models.CharField(
+        max_length=100, null=True, blank=True, default="0", verbose_name=_("Password")
+    )
+    bio_username = models.CharField(
+        max_length=100, null=True, blank=True, default="", verbose_name=_("Username")
+    )
+    bio_password = models.CharField(
+        max_length=100, null=True, blank=True, verbose_name=_("Password")
+    )
+    anviz_request_id = models.CharField(
+        max_length=200, null=True, blank=True, verbose_name=_("Request ID")
+    )
+    api_url = models.CharField(
+        max_length=200, null=True, blank=True, verbose_name=_("API Url")
+    )
+    api_key = models.CharField(
+        max_length=100, null=True, blank=True, verbose_name=_("API Key")
+    )
+    api_secret = models.CharField(
+        max_length=100, null=True, blank=True, verbose_name=_("API Secret")
+    )
     api_token = models.CharField(max_length=500, null=True, blank=True)
     api_expires = models.CharField(max_length=100, null=True, blank=True)
-    is_live = models.BooleanField(default=False)
-    is_scheduler = models.BooleanField(default=False)
+    is_live = models.BooleanField(default=False, verbose_name=_("Is Live"))
+    is_scheduler = models.BooleanField(default=False, verbose_name=_("Is Scheduled"))
     scheduler_duration = models.CharField(
         null=True,
         default="00:00",
@@ -77,72 +104,178 @@ class BiometricDevices(SolichModel):
     )
     last_fetch_date = models.DateField(null=True, blank=True)
     last_fetch_time = models.TimeField(null=True, blank=True)
+    device_direction = models.CharField(
+        max_length=50,
+        choices=BIO_DEVICE_DIRECTION,
+        default="system",
+        verbose_name=_("Device Direction"),
+    )
     company_id = models.ForeignKey(
-        Company, null=True, editable=False, on_delete=models.PROTECT
+        Company,
+        null=True,
+        editable=True,
+        on_delete=models.PROTECT,
+        verbose_name=_("Company"),
     )
 
-    objects = models.Manager()
+    objects = SolichCompanyManager()
 
     def __str__(self):
         return f"{self.name} - {self.machine_type}"
 
+    def get_card_details(self):
+        """
+        return card details based on machine type
+        """
+
+        if self.machine_type in ["zk", "cosec"]:
+            return (
+                f"{_('Machine IP')} : {self.machine_ip}<br>{_('Port No')} : {self.port}"
+            )
+        elif self.machine_type == "anviz":
+            return f"{_('API Url')} : {self.api_url}"
+        else:
+            return ""
+
+    def render_live_capture_html(self):
+        """
+        live capture button
+        """
+        html = render_template(
+            "biometric/live_capture.html",
+            {
+                "device": self,
+            },
+        )
+        return html
+
+    def render_actions_html(self):
+        """
+        actions buttons
+        """
+        html = render_template(
+            "biometric/actions_html.html",
+            {
+                "device": self,
+            },
+        )
+
+        return html
+
+    def card_action(self):
+        """
+        render card data
+        """
+        return render_template(
+            path="cbv/biometric_card_action.html",
+            context={"device": self},
+        )
+
+    def archive_status(self):
+        """
+        archive status
+        """
+        if self.is_active:
+            return _("Archive")
+        else:
+            return _("Un-Archive")
+
+    def get_update_url(self):
+        """
+        This method to get update url
+        """
+        url = reverse_lazy("biometric-device-edit", kwargs={"pk": self.pk})
+        return url
+
+    def get_archive_url(self):
+        """
+        This method to get archive url
+        """
+        url = reverse_lazy("biometric-device-archive", kwargs={"device_id": self.pk})
+        return url
+
+    def get_fetch_url(self):
+        """
+        This method to get Fetch Logs url
+        """
+        url = reverse_lazy("biometric-device-fetch-logs", kwargs={"device_id": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        This method to get delete url
+        """
+        url = reverse_lazy("biometric-device-delete", kwargs={"device_id": self.pk})
+        return url
+
+    def get_machine_type(self):
+        """
+        return machine type from choices
+        """
+
+        return dict(self.BIO_DEVICE_TYPE).get(self.machine_type)
+
+    def get_avatar(self):
+        """
+        Method will retun the api to the avatar or path to the profile image
+        """
+        url = f"https://ui-avatars.com/api/?name={self.name}&background=random"
+        return url
+
     def clean(self, *args, **kwargs):
         super().clean(*args, **kwargs)
-        if self.machine_type in ("zk", "cosec"):
+        required_fields = {}
+
+        if self.machine_type in ("zk", "cosec", "dahua"):
             if not self.machine_ip:
-                raise ValidationError(
-                    {
-                        "machine_ip": _(
-                            "The Machine IP is required for ZKTeco Biometric\
-                            & Matrix COSEC Biometric"
-                        )
-                    }
+                required_fields["machine_ip"] = _(
+                    "The Machine IP is required for the selected biometric device."
                 )
             if not self.port:
-                raise ValidationError(
-                    {"port": _("The Port No is required for ZKTeco Biometric")}
+                required_fields["port"] = _(
+                    "The Port Number is required for the selected biometric device."
                 )
-        if self.machine_type == "cosec":
-            if not self.cosec_username:
-                raise ValidationError(
-                    {
-                        "cosec_username": _(
-                            "The username is required for Matrix COSEC Biometric"
-                        )
-                    }
+
+        if self.machine_type == "zk":
+            if not self.zk_password:
+                required_fields["zk_password"] = _(
+                    "The password is required for ZKTeco Biometric Device."
                 )
-            if not self.cosec_password:
-                raise ValidationError(
-                    {
-                        "cosec_username": _(
-                            "The password is required for Matrix COSEC Biometric"
-                        )
-                    }
+            else:
+                try:
+                    int(self.zk_password)
+                except ValueError:
+                    required_fields["zk_password"] = _(
+                        "The password must be an integer (numeric) value for\
+                            ZKTeco Biometric Device."
+                    )
+
+        if self.machine_type in ("cosec", "dahua"):
+            if not self.bio_username:
+                required_fields["bio_username"] = _(
+                    "The Username is required for the selected biometric device."
                 )
+            if not self.bio_password:
+                required_fields["bio_password"] = _(
+                    "The Password is required for the selected biometric device."
+                )
+
         if self.machine_type == "anviz":
             if not self.anviz_request_id:
-                raise ValidationError(
-                    {
-                        "anviz_request_id": _(
-                            "The Request ID required for the Anviz Biometric Device."
-                        )
-                    }
+                required_fields["anviz_request_id"] = _(
+                    "The Request ID is required for the Anviz Biometric Device."
                 )
             if not self.api_url:
-                raise ValidationError(
-                    {"api_url": _("The API Url required for Anviz Biometric Device")}
+                required_fields["api_url"] = _(
+                    "The API URL is required for Anviz Biometric Device."
                 )
             if not self.api_key:
-                raise ValidationError(
-                    {"api_key": _("The API Key required for Anviz Biometric Device")}
+                required_fields["api_key"] = _(
+                    "The API Key is required for Anviz Biometric Device."
                 )
             if not self.api_secret:
-                raise ValidationError(
-                    {
-                        "api_secret": _(
-                            "The API Secret is required for Anviz Biometric Device"
-                        )
-                    }
+                required_fields["api_secret"] = _(
+                    "The API Secret is required for Anviz Biometric Device."
                 )
             if self.anviz_request_id and self.api_key and self.api_secret:
                 payload = {
@@ -195,6 +328,8 @@ class BiometricDevices(SolichModel):
                             )
                         }
                     ) from exc
+        if required_fields:
+            raise ValidationError(required_fields)
 
     class Meta:
         """
@@ -220,15 +355,18 @@ class BiometricEmployees(models.Model):
     ref_user_id = models.IntegerField(
         null=True, blank=True, validators=[MaxValueValidator(99999999)]
     )
-    user_id = models.CharField(max_length=100)
-    employee_id = models.ForeignKey(Employee, on_delete=models.DO_NOTHING)
+    user_id = models.CharField(max_length=100, verbose_name=_("User ID"))
+    dahua_card_no = models.CharField(max_length=100, null=True, blank=True)
+    employee_id = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, verbose_name=_("Employee")
+    )
     device_id = models.ForeignKey(
         BiometricDevices, on_delete=models.CASCADE, null=True, blank=True
     )
     objects = models.Manager()
 
     def __str__(self):
-        return f"{self.employee_id} - {self.user_id}"
+        return f"{self.employee_id} - {self.user_id} - {self.device_id}"
 
     class Meta:
         """
@@ -257,6 +395,9 @@ class COSECAttendanceArguments(models.Model):
     )
     objects = models.Manager()
 
+    class Meta:
+        verbose_name = _("COSEC Attendance Arguments")
+        verbose_name_plural = _("COSEC Attendance Arguments")
+
     def __str__(self):
         return f"{self.device_id} - {self.last_fetch_roll_ovr_count} - {self.last_fetch_seq_number}"
-

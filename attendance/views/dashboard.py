@@ -4,11 +4,10 @@ dashboard.py
 This module is used to register endpoints for dashboard-related requests
 """
 
-import calendar
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
-from django.db.models import Q, Sum
+from django.apps import apps
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils.translation import gettext_lazy as _
@@ -18,19 +17,24 @@ from attendance.filters import (
     AttendanceOverTimeFilter,
     LateComeEarlyOutFilter,
 )
+from attendance.methods.utils import (
+    get_month_start_end_dates,
+    get_week_start_end_dates,
+    pending_hour_data,
+    worked_hour_data,
+)
 from attendance.models import (
     Attendance,
     AttendanceLateComeEarlyOut,
-    AttendanceOverTime,
     AttendanceValidationCondition,
 )
 from attendance.views.views import strtime_seconds
-from base.methods import filtersubordinates
-from base.models import Department, EmployeeShiftSchedule
+from base.methods import filtersubordinates, paginator_qry
+from base.models import Department
 from employee.models import Employee
-from employee.not_in_out_dashboard import paginator_qry
+from solich import settings
 from solich.decorators import hx_request_required, login_required
-from leave.models import LeaveRequest
+from solich.methods import get_solich_model_class
 
 
 def find_on_time(request, today, week_day, department=None):
@@ -56,7 +60,11 @@ def find_expected_attendances(week_day):
     This method is used to find count of expected attendances for the week day
     """
     employees = Employee.objects.filter(is_active=True)
-    on_leave = LeaveRequest.objects.filter(status="Approved")
+    if apps.is_installed("leave"):
+        LeaveRequest = get_solich_model_class(app_label="leave", model="leaverequest")
+        on_leave = LeaveRequest.objects.filter(status="Approved")
+    else:
+        on_leave = []
     expected_attendances = len(employees) - len(on_leave)
     return expected_attendances
 
@@ -66,12 +74,6 @@ def dashboard(request):
     """
     This method is used to render individual dashboard for attendance module
     """
-    page_number = request.GET.get("page")
-    previous_data = request.GET.urlencode()
-    employees = Employee.objects.filter(
-        is_active=True,
-    ).filter(~Q(employee_work_info__shift_id=None))
-    total_employees = len(employees)
 
     today = datetime.today()
     week_day = today.strftime("%A").lower()
@@ -92,10 +94,61 @@ def dashboard(request):
         marked_attendances_ratio = (
             f"{(marked_attendances / expected_attendances) * 100:.2f}"
         )
+
+    return render(
+        request,
+        "attendance/dashboard/dashboard.html",
+        {
+            "on_time": on_time,
+            "on_time_ratio": on_time_ratio,
+            "late_come": late_come_obj,
+            "late_come_ratio": late_come_ratio,
+            "expected_attendances": expected_attendances,
+            "marked_attendances": marked_attendances,
+            "marked_attendances_ratio": marked_attendances_ratio,
+        },
+    )
+
+
+@login_required
+@hx_request_required
+def on_break_employees(request):
+    """
+    Fetches and displays employees who left early (early outs) for the current day.
+
+    This view retrieves all records from the `AttendanceLateComeEarlyOut` model
+    where the type is "early_out" and the associated attendance date matches the current date.
+    The results are passed to the template `on_break_employees.html` for rendering
+    """
+    today = datetime.today()
     early_outs = AttendanceLateComeEarlyOut.objects.filter(
         type="early_out", attendance_id__attendance_date=today
     )
+    context = {
+        "on_break": early_outs,
+    }
+    return render(request, "attendance/dashboard/on_break_employees.html", context)
 
+
+@login_required
+@hx_request_required
+def dashboard_approve_overtimes(request):
+    """
+    Displays and validates employee overtime records for the dashboard.
+
+    This view retrieves a paginated list of employee attendance records with
+    overtime that meets or exceeds a specified minimum threshold, which is defined
+    in the `AttendanceValidationCondition` model. Only records that are validated
+    but not yet approved are included, and the results are filtered based on the
+    user's subordinate permissions.
+    """
+    main_dashboard = None
+    referer = request.META.get("HTTP_REFERER", "/")
+    referer = "/" + "/".join(referer.split("/")[3:])
+    if referer == "/":
+        main_dashboard = True
+
+    page_number = request.GET.get("page")
     condition = AttendanceValidationCondition.objects.first()
     min_ot = strtime_seconds("00:00")
     if condition is not None and condition.minimum_overtime_to_approve is not None:
@@ -112,6 +165,33 @@ def dashboard(request):
         queryset=ot_attendances,
     )
 
+    id_list = [ot.id for ot in ot_attendances]
+    ot_attendances_ids = json.dumps(list(id_list))
+    ot_attendances = paginator_qry(ot_attendances, page_number)
+    context = {
+        "overtime_attendances": ot_attendances,
+        "ot_attendances_ids": ot_attendances_ids,
+        "main_dashboard": main_dashboard,
+    }
+    return render(request, "attendance/dashboard/overtime_table.html", context)
+
+
+@login_required
+@hx_request_required
+def dashboard_validate_attendances(request):
+    """
+    Displays and validates employee attendance records for the dashboard.
+
+    This view retrieves a paginated list of attendance records that have not yet
+    been validated. Only records belonging to active employees and accessible
+    subordinates, as determined by the user's permissions, are included in the results.
+    """
+    main_dashboard = None
+    referer = request.META.get("HTTP_REFERER", "/")
+    referer = "/" + "/".join(referer.split("/")[3:])
+    if referer == "/":
+        main_dashboard = True
+    page_number = request.GET.get("page")
     validate_attendances = Attendance.objects.filter(
         attendance_validated=False, employee_id__is_active=True
     )
@@ -121,52 +201,16 @@ def dashboard(request):
         perm="attendance.change_overtime",
         queryset=validate_attendances,
     )
-    validate_attendances = paginator_qry(validate_attendances, page_number)
-    id_list = [ot.id for ot in ot_attendances]
+
     validate_id_list = [val.id for val in validate_attendances]
-    ot_attendances_ids = json.dumps(list(id_list))
     validate_attendances_ids = json.dumps(list(validate_id_list))
-    return render(
-        request,
-        "attendance/dashboard/dashboard.html",
-        {
-            "total_employees": total_employees,
-            "on_time": on_time,
-            "on_time_ratio": on_time_ratio,
-            "late_come": late_come_obj,
-            "late_come_ratio": late_come_ratio,
-            "expected_attendances": expected_attendances,
-            "marked_attendances": marked_attendances,
-            "marked_attendances_ratio": marked_attendances_ratio,
-            "on_break": early_outs,
-            "overtime_attendances": ot_attendances,
-            "validate_attendances": validate_attendances,
-            "pd": previous_data,
-            "ot_attendances_ids": ot_attendances_ids,
-            "validate_attendances_ids": validate_attendances_ids,
-        },
-    )
 
-
-@login_required
-@hx_request_required
-def validated_attendances_table(request):
-    page_number = request.GET.get("page")
-    previous_data = request.GET.urlencode()
-    validate_attendances = Attendance.objects.filter(
-        attendance_validated=False, employee_id__is_active=True
-    )
-    validate_attendances = filtersubordinates(
-        request=request,
-        perm="attendance.change_attendance",
-        queryset=validate_attendances,
-    )
-
+    validate_attendances = paginator_qry(validate_attendances, page_number)
     context = {
-        "validate_attendances": paginator_qry(validate_attendances, page_number),
-        "pd": previous_data,
+        "validate_attendances": validate_attendances,
+        "validate_attendances_ids": validate_attendances_ids,
+        "main_dashboard": main_dashboard,
     }
-
     return render(request, "attendance/dashboard/to_validate_table.html", context)
 
 
@@ -232,38 +276,6 @@ def find_early_out(start_date, end_date=None, department=None):
     return early_out_obj
 
 
-def get_week_start_end_dates(week):
-    """
-    This method is use to return the start and end date of the week
-    """
-    # Parse the ISO week date
-    year, week_number = map(int, week.split("-W"))
-
-    # Get the date of the first day of the week
-    start_date = datetime.strptime(f"{year}-W{week_number}-1", "%Y-W%W-%w").date()
-
-    # Calculate the end date by adding 6 days to the start date
-    end_date = start_date + timedelta(days=6)
-
-    return start_date, end_date
-
-
-def get_month_start_end_dates(year_month):
-    """
-    This method is use to return the start and end date of the month
-    """
-    # split year and month separately
-    year, month = map(int, year_month.split("-"))
-    # Get the first day of the month
-    start_date = datetime(year, month, 1).date()
-
-    # Get the last day of the month
-    _, last_day = calendar.monthrange(year, month)
-    end_date = datetime(year, month, last_day).date()
-
-    return start_date, end_date
-
-
 def generate_data_set(request, start_date, type, end_date, dept):
     """
     This method is used to generate all the dashboard data
@@ -319,10 +331,15 @@ def dashboard_attendance(request):
     Returns:
         JsonResponse: returns data set as json
     """
+    if not (
+        request.user.is_superuser or request.user.has_perm("attendance.view_attendance")
+    ):
+        return JsonResponse({"no_permission": True})
+
     labels = [
         _("On Time"),
-        _("Late Come"),
-        _("Early Out"),
+        _("Late Arrival"),
+        _("Early Departure"),
     ]
     # initializing values
     data_set = []
@@ -342,47 +359,12 @@ def dashboard_attendance(request):
     departments = Department.objects.all()
     for dept in departments:
         data_set.append(generate_data_set(request, start_date, type, end_date, dept))
-    message = _("No data Found...")
+    message = _("No records available at the moment.")
     data_set = list(filter(None, data_set))
     return JsonResponse({"dataSet": data_set, "labels": labels, "message": message})
 
 
-def worked_hour_data(labels, records):
-    """
-    To find all the worked hours
-    """
-    data = {
-        "label": "Worked Hours",
-        "backgroundColor": "rgba(75, 192, 192, 0.6)",
-    }
-    dept_records = []
-    for dept in labels:
-        total_sum = records.filter(
-            employee_id__employee_work_info__department_id__department=dept
-        ).aggregate(total_sum=Sum("hour_account_second"))["total_sum"]
-        dept_records.append(total_sum / 3600 if total_sum else 0)
-    data["data"] = dept_records
-    return data
-
-
-def pending_hour_data(labels, records):
-    """
-    To find all the pending hours
-    """
-    data = {
-        "label": "Pending Hours",
-        "backgroundColor": "rgba(255, 99, 132, 0.6)",
-    }
-    dept_records = []
-    for dept in labels:
-        total_sum = records.filter(
-            employee_id__employee_work_info__department_id__department=dept
-        ).aggregate(total_sum=Sum("hour_pending_second"))["total_sum"]
-        dept_records.append(total_sum / 3600 if total_sum else 0)
-    data["data"] = dept_records
-    return data
-
-
+@login_required
 def pending_hours(request):
     """
     pending hours chart dashboard view
@@ -402,6 +384,11 @@ def pending_hours(request):
 
 @login_required
 def department_overtime_chart(request):
+    if not (
+        request.user.is_superuser or request.user.has_perm("attendance.view_attendance")
+    ):
+        return JsonResponse({"no_permission": True})
+
     start_date = request.GET.get("date") if request.GET.get("date") else date.today()
     chart_type = request.GET.get("type") if request.GET.get("type") else "day"
     end_date = (
@@ -437,9 +424,14 @@ def department_overtime_chart(request):
     department_total = []
 
     for attendance in attendances:
-        departments.append(
-            attendance.employee_id.employee_work_info.department_id.department
-        )
+        if (
+            attendance.employee_id
+            and attendance.employee_id.employee_work_info
+            and attendance.employee_id.employee_work_info.department_id
+        ):
+            departments.append(
+                attendance.employee_id.employee_work_info.department_id.department
+            )
     departments = list(set(departments))
 
     for depart in departments:
@@ -472,8 +464,7 @@ def department_overtime_chart(request):
         "labels": departments,
         "department_total": department_total,
         "message": _("No validated Overtimes were found"),
-        "emptyImageSrc": "/static/images/ui/overtime-icon.png",
+        "emptyImageSrc": f"/{settings.STATIC_URL}images/ui/overtime-icon.png",
     }
 
     return JsonResponse(response)
-

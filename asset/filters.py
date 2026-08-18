@@ -6,14 +6,17 @@ import uuid
 
 import django_filters
 from django import forms
+from django.db.models import Q
+from django.utils.translation import gettext_lazy as _
 from django_filters import FilterSet
 
 from base.methods import reload_queryset
+from solich.filters import SolichFilterSet
 
-from .models import Asset, AssetAssignment, AssetCategory, AssetRequest
+from .models import Asset, AssetAssignment, AssetCategory, AssetLot, AssetRequest
 
 
-class CustomFilterSet(FilterSet):
+class CustomFilterSet(SolichFilterSet):
     """
     Custom FilterSet class that applies specific CSS classes to filter
     widgets.
@@ -82,7 +85,7 @@ class AssetExportFilter(CustomFilterSet):
         fields = "__all__"
 
     def __init__(self, *args, **kwargs):
-        super(AssetExportFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.form.fields["asset_purchase_date"].widget.attrs.update({"type": "date"})
 
 
@@ -90,6 +93,9 @@ class AssetFilter(CustomFilterSet):
     """
     Custom filter set for Asset instances.
     """
+
+    search = django_filters.CharFilter(method="search_method")
+    category = django_filters.CharFilter(field_name="asset_category_id")
 
     class Meta:
         """
@@ -103,9 +109,18 @@ class AssetFilter(CustomFilterSet):
         fields = "__all__"
 
     def __init__(self, *args, **kwargs):
-        super(AssetFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         for visible in self.form.visible_fields():
             visible.field.widget.attrs["id"] = str(uuid.uuid4())
+
+    def search_method(self, queryset, _, value):
+        """
+        Search method
+        """
+        return (
+            queryset.filter(asset_name__icontains=value)
+            | queryset.filter(asset_category_id__asset_category_name__icontains=value)
+        ).distinct()
 
 
 class CustomAssetFilter(CustomFilterSet):
@@ -132,7 +147,7 @@ class CustomAssetFilter(CustomFilterSet):
         ]
 
     def __init__(self, *args, **kwargs):
-        super(CustomAssetFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         for visible in self.form.visible_fields():
             visible.field.widget.attrs["id"] = str(uuid.uuid4())
 
@@ -174,7 +189,7 @@ class AssetRequestFilter(CustomFilterSet):
         fields = "__all__"
 
     def __init__(self, *args, **kwargs):
-        super(AssetRequestFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         for visible in self.form.visible_fields():
             visible.field.widget.attrs["id"] = str(uuid.uuid4())
 
@@ -188,7 +203,7 @@ class AssetAllocationFilter(CustomFilterSet):
 
     def search_method(self, queryset, _, value: str):
         """
-        This method is used to search employees
+        This method is used to search employees and assets
         """
         values = value.split(" ")
         empty = queryset.model.objects.none()
@@ -199,6 +214,10 @@ class AssetAllocationFilter(CustomFilterSet):
                 )
                 | queryset.filter(
                     assigned_to_employee_id__employee_last_name__icontains=split
+                )
+                | queryset.filter(asset_id__asset_name__icontains=split)
+                | queryset.filter(
+                    asset_id__asset_category_id__asset_category_name__icontains=split
                 )
             )
         return empty.distinct()
@@ -217,7 +236,7 @@ class AssetAllocationFilter(CustomFilterSet):
         fields = "__all__"
 
     def __init__(self, *args, **kwargs):
-        super(AssetAllocationFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         for visible in self.form.visible_fields():
             visible.field.widget.attrs["id"] = str(uuid.uuid4())
 
@@ -227,23 +246,44 @@ class AssetCategoryFilter(CustomFilterSet):
     Custom filter set for AssetCategory instances.
     """
 
+    search = django_filters.CharFilter(method="search_method")
+
     class Meta:
-        """
-        Specifies the model and fields to be used for filtering AssetCategory instances.
-
-        Attributes:
-            model (class): The model class AssetCategory to be filtered.
-            fields (str): A special value "__all__" to include all fields
-                          of the model in the filter.
-        """
-
         model = AssetCategory
         fields = "__all__"
 
     def __init__(self, *args, **kwargs):
-        super(AssetCategoryFilter, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         for visible in self.form.visible_fields():
             visible.field.widget.attrs["id"] = str(uuid.uuid4())
+
+    def search_method(self, queryset, name, value):
+        """
+        Search method to filter by asset category name or related asset name.
+        """
+        if not value:
+            return queryset  # Return unfiltered queryset if no search term is provided
+
+        return queryset.filter(
+            Q(asset_category_name__icontains=value)
+            | Q(asset__asset_name__icontains=value)
+        ).distinct()
+
+    def filter_queryset(self, queryset):
+        """
+        Filters queryset and applies AssetFilter if necessary.
+        """
+        # Get the base filtered queryset
+        queryset = super().filter_queryset(queryset)
+
+        # Filter by assets if asset data is present in the GET request
+        if self.data and "asset__pk" in self.data:
+            assets = AssetFilter(data=self.data).qs
+            queryset = queryset.filter(
+                asset__pk__in=assets.values_list("pk", flat=True)
+            )
+
+        return queryset.distinct()
 
 
 class AssetRequestReGroup:
@@ -340,3 +380,69 @@ class AssetHistoryReGroup:
         ("return_date", "Return Date"),
     ]
 
+
+class AssetRenewalFilter(SolichFilterSet):
+    """
+    Filter set for the Asset Renewal page — expiring/expired active assignments.
+    Filters operate on AssetAssignment with traversal into the related Asset.
+    """
+
+    search = django_filters.CharFilter(
+        field_name="asset_id__asset_name",
+        lookup_expr="icontains",
+        label=_("Asset Name"),
+    )
+    asset_category_id = django_filters.ModelChoiceFilter(
+        field_name="asset_id__asset_category_id",
+        queryset=AssetCategory.objects.all(),
+        label=_("Category"),
+    )
+    expiry_date_gte = django_filters.DateFilter(
+        field_name="asset_id__expiry_date",
+        lookup_expr="gte",
+        label=_("Expiry Date From"),
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    expiry_date_lte = django_filters.DateFilter(
+        field_name="asset_id__expiry_date",
+        lookup_expr="lte",
+        label=_("Expiry Date To"),
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    assigned_date_gte = django_filters.DateFilter(
+        field_name="assigned_date",
+        lookup_expr="gte",
+        label=_("Assigned Date From"),
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    assigned_date_lte = django_filters.DateFilter(
+        field_name="assigned_date",
+        lookup_expr="lte",
+        label=_("Assigned Date To"),
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    asset_status = django_filters.ChoiceFilter(
+        field_name="asset_id__asset_status",
+        choices=[
+            ("Available", "Available"),
+            ("In use", "In use"),
+            ("Not-Available", "Not-Available"),
+        ],
+        label=_("Asset Status"),
+        empty_label=_("All"),
+    )
+
+    class Meta:
+        model = AssetAssignment
+        fields = "__all__"
+
+
+class AssetBatchNoFilter(FilterSet):
+
+    search = django_filters.CharFilter(field_name="lot_number", lookup_expr="icontains")
+
+    class Meta:
+        model = AssetLot
+        fields = [
+            "lot_number",
+        ]

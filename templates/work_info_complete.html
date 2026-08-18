@@ -13,18 +13,31 @@
       <tbody>
         {% for employee_info in employees_with_pending %}
         <tr>
-          <td>
-            <a href="{% url 'employee-view-update' employee_info.employee.employee_id.id %}">
-              {{ employee_info.employee.employee_id }}</a>
-          </td>
-          <td style="position: relative;">
-            <a href="{% url 'employee-view-update' employee_info.employee.employee_id.id %}">
-              <div class="progress">
-                <div class="progress-bar" role="progressbar" style="width: {{ employee_info.completed_field_count }}%;"></div>
-              </div>
-              <div class="progress-text">{{ employee_info.completed_field_count }}% {% trans "Completed" %}</div>
-            </a>
-          </td>
+          {% if perms.employee.change_employee %}
+            <td>
+              <a href="{% url 'employee-view-update' employee_info.employee.employee_id.id %}">
+                {{ employee_info.employee.employee_id }}</a>
+            </td>
+            <td style="position: relative;">
+              <a href="{% url 'employee-view-update' employee_info.employee.employee_id.id %}">
+                <div class="progress">
+                  <div class="progress-bar" role="progressbar" style="width: {{ employee_info.completed_field_count }}%;"></div>
+                </div>
+                <div class="progress-text">{{ employee_info.completed_field_count }}% {% trans "Completed" %}</div>
+              </a>
+            </td>
+          {% else %}
+            <td>
+                {{ employee_info.employee.employee_id }}</a>
+            </td>
+            <td style="position: relative;">
+                <div class="progress">
+                  <div class="progress-bar" role="progressbar" style="width: {{ employee_info.completed_field_count }}%;"></div>
+                </div>
+                <div class="progress-text">{{ employee_info.completed_field_count }}% {% trans "Completed" %}</div>
+              </a>
+            </td>
+          {% endif %}
         </tr>
         {% endfor %}
       </tbody>
@@ -40,13 +53,13 @@
         hx-target="#pending"
         hx-get='{% url "emp-workinfo-complete" %}?page={{ employees_with_pending.previous_page_number }}'
         hx-trigger="click delay:0.3s"
-        title="Previous Page"
+        title="{% trans 'Previous Page' %}"
     >
         <ion-icon
             name="caret-back-outline"
             role="img"
             class="md hydrated"
-            aria-label="caret back outline"
+            aria-label="{% trans 'caret back outline' %}"
         ></ion-icon>
     </span>
     {% endif %}
@@ -58,13 +71,13 @@
         hx-target="#pending"
         hx-get='{% url "emp-workinfo-complete" %}?page={{ employees_with_pending.next_page_number }}'
         hx-trigger="click delay:0.3s"
-        title="Next Page"
+        title="{% trans 'Next Page' %}"
     >
         <ion-icon
             name="caret-forward-outline"
             role="img"
             class="md hydrated"
-            aria-label="caret back outline"
+            aria-label="{% trans 'caret back outline' %}"
         ></ion-icon>
     </span>
     {% endif %}

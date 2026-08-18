@@ -5,25 +5,32 @@ This page is used to register filter for employee models
 
 """
 
-import datetime
-import uuid
-
 import django
 import django_filters
 from django import forms
-from django.contrib.auth.models import Group, Permission
+from django.contrib.auth.models import Permission
+from django.db.models import Q
 from django.utils.translation import gettext as _
-from django_filters import CharFilter, DateFilter
+from django_filters import CharFilter
 
-from attendance.models import Attendance
-from base.methods import reload_queryset
-from base.models import WorkType
-from employee.models import DisciplinaryAction, Employee, Policy
-from solich.filters import FilterSet, filter_by_name
-from solich_documents.models import Document
+# from attendance.models import Attendance
+from accessibility.methods import check_is_accessible
+from base.methods import filtersubordinatesemployeemodel
+from employee.models import (
+    Actiontype,
+    DisciplinaryAction,
+    Employee,
+    EmployeeTag,
+    EmployeeWorkInformation,
+    Policy,
+)
+from solich.filters import FilterSet, SolichFilterSet, filter_by_name
+from solich.solich_middlewares import _thread_locals
+from solich_documents.models import Document, DocumentRequest
+from solich_views.templatetags.generic_template_filters import getattribute
 
 
-class EmployeeFilter(FilterSet):
+class EmployeeFilter(SolichFilterSet):
     """
     Filter set class for Candidate model
 
@@ -32,6 +39,7 @@ class EmployeeFilter(FilterSet):
     """
 
     search = django_filters.CharFilter(method="filter_by_name")
+    search_field = django_filters.CharFilter(method="search_in")
     selected_search_field = django_filters.ChoiceFilter(
         label="Search Field",
         choices=[
@@ -58,6 +66,11 @@ class EmployeeFilter(FilterSet):
         lookup_expr="icontains",
     )
 
+    employee_user_id__user_permissions = django_filters.ModelMultipleChoiceFilter(
+        queryset=Permission.objects.select_related("content_type").all(),
+        label=_("Permissions"),
+    )
+
     is_active = django_filters.ChoiceFilter(
         field_name="is_active",
         label="Is Active",
@@ -65,10 +78,38 @@ class EmployeeFilter(FilterSet):
             (True, "Yes"),
             (False, "No"),
         ],
+        initial=True,
     )
-    working_today = django_filters.BooleanFilter(
-        label="Working", method="get_working_today"
+
+    is_from_onboarding = django_filters.ChoiceFilter(
+        field_name="is_from_onboarding",
+        label="Is From Onboarding",
+        choices=[
+            (True, "Yes"),
+            (False, "No"),
+        ],
     )
+    is_directly_converted = django_filters.ChoiceFilter(
+        field_name="is_directly_converted",
+        label="Is Directly Converted",
+        choices=[
+            (True, "Yes"),
+            (False, "No"),
+        ],
+    )
+    probation_from = django_filters.DateFilter(
+        field_name="candidate_get__probation_end",
+        lookup_expr="gte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    probation_till = django_filters.DateFilter(
+        field_name="candidate_get__probation_end",
+        lookup_expr="lte",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    # working_today = django_filters.BooleanFilter(
+    #     label="Working", method="get_working_today"
+    # )
 
     not_in_yet = django_filters.DateFilter(
         method="not_in_yet_func",
@@ -108,6 +149,16 @@ class EmployeeFilter(FilterSet):
             "employee_user_id__user_permissions",
         ]
 
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__(*args, **kwargs)
+    #     custom_field = django_filters.BooleanFilter(
+    #         label="Working", method=get_working_today
+    #     )
+    #     self.filters["working_today"] = custom_field
+    #     self.form.fields["working_today"] = custom_field.field
+    #     self.form.fields["working_today"].label = "Working"
+    #     self.Meta.fields.append("working_today")
+
     def not_in_yet_func(self, queryset, _, value):
         """
         The method to filter out the not check-in yet employees
@@ -143,10 +194,22 @@ class EmployeeFilter(FilterSet):
 
     def filter_queryset(self, queryset):
         """
-        Override the default filtering behavior to handle None option.
+        Override the default filtering behavior to handle None option and filter queryset for reporting manager.
         """
         from django.db.models import Q
 
+        # Handle default accessibility and filter based on reporting manager
+        request = getattr(_thread_locals, "request", None)
+        if request:
+            employee = getattr(request.user, "employee_get", None)
+            cache_key = request.session.session_key + "accessibility_filter"
+            accessible = check_is_accessible("employee_view", cache_key, employee)
+            if not accessible and employee.reporting_manager.exists():
+                queryset = filtersubordinatesemployeemodel(
+                    request=request, queryset=queryset, perm="employee.view_employee"
+                )
+
+        # Handle 'not_set' values in the cleaned data
         data = self.form.cleaned_data
         not_set_dict = {}
         for key, value in data.items():
@@ -165,111 +228,21 @@ class EmployeeFilter(FilterSet):
             return queryset.filter(q_objects)
         return super().filter_queryset(queryset)
 
-        # Continue with the default behavior for other filters
-
-    def get_working_today(self, queryset, _, value):
-        today = datetime.datetime.now().date()
-        yesterday = today - datetime.timedelta(days=1)
-
-        working_employees = Attendance.objects.filter(
-            attendance_date__gte=yesterday,
-            attendance_date__lte=today,
-            attendance_clock_out_date__isnull=True,
-        ).values_list("employee_id", flat=True)
-        if value:
-            queryset = queryset.filter(id__in=working_employees)
-        else:
-            queryset = queryset.exclude(id__in=working_employees)
-        return queryset
-
-    def filter_by_name(self, queryset, _, value):
+    def filter_by_name(self, queryset, name, value):
         """
-        Filter queryset by first name or last name.
+        Employee search method
         """
-        filter_method = {
-            "department": "employee_work_info__department_id__department__icontains",
-            "job_position": "employee_work_info__job_position_id__job_position__icontains",
-            "job_role": "employee_work_info__job_role_id__job_role__icontains",
-            "shift": "employee_work_info__shift_id__employee_shift__icontains",
-            "work_type": "employee_work_info__work_type_id__work_type__icontains",
-            "company": "employee_work_info__company_id__company__icontains",
-        }
-        search_field = self.data.get("search_field")
-        # Split the search value into first name and last name
-        if not search_field:
-            parts = value.split()
-            first_name = parts[0]
-            last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-            # Filter the queryset by first name and last name
-            if first_name and last_name:
-                queryset = queryset.filter(
-                    employee_first_name__icontains=first_name,
-                    employee_last_name__icontains=last_name,
-                )
-            elif first_name:
-                queryset = queryset.filter(employee_first_name__icontains=first_name)
-            elif last_name:
-                queryset = queryset.filter(employee_last_name__icontains=last_name)
-        else:
-            if search_field == "reporting_manager":
-                parts = value.split()
-                first_name = parts[0]
-                last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-                if first_name and last_name:
-                    queryset = queryset.filter(
-                        employee_work_info__reporting_manager_id__employee_first_name__icontains=first_name,
-                        employee_work_info__reporting_manager_id__employee_last_name__icontains=last_name,
-                    )
-                elif first_name:
-                    queryset = queryset.filter(
-                        employee_work_info__reporting_manager_id__employee_first_name__icontains=first_name
-                    )
-                elif last_name:
-                    queryset = queryset.filter(
-                        employee_work_info__reporting_manager_id__employee_last_name__icontains=last_name
-                    )
-            else:
-                filter = filter_method.get(search_field)
-                queryset = queryset.filter(**{filter: value})
+        value = value.lower()
 
-        return queryset
+        if self.data.get("search_field"):
+            return queryset
 
-    def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
-        super().__init__(data=data, queryset=queryset, request=request, prefix=prefix)
-        self.form.fields["is_active"].initial = True
-        self.form.fields["email"].widget.attrs["autocomplete"] = "email"
-        self.form.fields["phone"].widget.attrs["autocomplete"] = "phone"
-        self.form.fields["country"].widget.attrs["autocomplete"] = "country"
-        for field in self.form.fields.keys():
-            self.form.fields[field].widget.attrs["id"] = f"{uuid.uuid4()}"
-        self.model_choice_filters = [
-            filter
-            for filter in self.filters.values()
-            if isinstance(filter, django_filters.ModelMultipleChoiceFilter)
-        ]
-        for model_choice_filter in self.model_choice_filters:
-            queryset = (
-                model_choice_filter.queryset.filter(is_active=True)
-                if model_choice_filter.queryset.model == Employee
-                else model_choice_filter.queryset
-            )
-            choices = [
-                ("not_set", _("Not Set")),
-            ]
-            choices.extend([(obj.id, str(obj)) for obj in queryset])
+        def _icontains(instance):
+            result = str(getattribute(instance, "get_full_name")).lower()
+            return instance.pk if value in result else None
 
-            self.form.fields[model_choice_filter.field_name] = (
-                forms.MultipleChoiceField(
-                    choices=choices,
-                    required=False,
-                    widget=forms.SelectMultiple(
-                        attrs={
-                            "class": "oh-select oh-select-2 select2-hidden-accessible",
-                            "id": uuid.uuid4(),
-                        }
-                    ),
-                )
-            )
+        ids = list(filter(None, map(_icontains, queryset)))
+        return queryset.filter(id__in=ids)
 
 
 class EmployeeReGroup:
@@ -306,7 +279,11 @@ class DocumentRequestFilter(FilterSet):
     Custom filter for Document Requests.
     """
 
-    search = CharFilter(field_name="title", lookup_expr="icontains")
+    # Document.title is a near-constant string set once per document request
+    # (e.g. "Upload Passport" for every employee in that group), so matching
+    # against it can never narrow a group down to one employee. Search by the
+    # employee's name/badge instead, like every other request list in the app.
+    search = CharFilter(method=filter_by_name)
 
     class Meta:
         """
@@ -331,6 +308,35 @@ class DocumentRequestFilter(FilterSet):
             "employee_id__employee_work_info__company_id",
             "employee_id__employee_work_info__shift_id",
         ]
+
+
+class DocumentPipelineFilter(SolichFilterSet):
+    """
+    Filter set class for TaxBracket model.
+    """
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = DocumentRequest
+        fields = "__all__"
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search
+
+        Matches either the request type's own title (e.g. "Passport") or the
+        name/badge of an employee assigned to it, so searching for a person
+        surfaces every document-type group they have a pending request in -
+        matching the same "search" convention used across the rest of the app.
+        """
+        value = " ".join(value.split())
+        return queryset.filter(
+            Q(title__icontains=value)
+            | Q(employee_id__employee_first_name__icontains=value)
+            | Q(employee_id__employee_last_name__icontains=value)
+            | Q(employee_id__badge_id__icontains=value)
+        ).distinct()
 
 
 class DisciplinaryActionFilter(FilterSet):
@@ -360,3 +366,43 @@ class DisciplinaryActionFilter(FilterSet):
             "employee_id__employee_work_info__shift_id",
         ]
 
+
+class ActionTypeFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(method="search_method")
+
+    class Meta:
+        model = Actiontype
+        fields = ["title", "action_type"]
+
+    def search_method(self, queryset, _, value):
+        """
+        This method is used to search
+        """
+
+        return (
+            (queryset.filter(title__icontains=value))
+            | queryset.filter(action_type__icontains=value)
+        ).distinct()
+
+
+class EmployeeTagFilter(FilterSet):
+
+    search = django_filters.CharFilter(field_name="title", lookup_expr="icontains")
+
+    class Meta:
+        model = EmployeeTag
+        fields = [
+            "title",
+        ]
+
+
+class EmployeeWorkInformationFilter(SolichFilterSet):
+
+    search = django_filters.CharFilter(
+        field_name="employee_id__employee_first_name", lookup_expr="icontains"
+    )
+
+    class Meta:
+        model = EmployeeWorkInformation
+        fields = ["employee_id"]

@@ -1,6 +1,13 @@
 {% load i18n %}
+{% if messages %}
+    <script>
+        setTimeout(function () {
+            $("#assignLeaveCloseButton").click();
+        }, 1000);
+        reloadMessage();
+    </script>
+{% endif %}
 {% if form.errors %}
-<!-- form errors  -->
     <div class="oh-wrapper">
         <div class="oh-alert-container">
             {% for error in form.non_field_errors %}
@@ -9,14 +16,25 @@
         </div>
     </div>
 {% endif %}
-<form hx-post="{% url 'assign-one' id %}">
-    <div class="oh-modal__dialog-body pb-2">
+<div class="oh-modal__dialog-header">
+    <span class="oh-modal__dialog-title">{% trans "Assign Leave" %}</span>
+    <button
+        class="oh-modal_close--custom"
+        onclick="$(this).closest('.oh-modal--show').removeClass('oh-modal--show')"
+        aria-label="{% trans 'Close' %}"
+        id="assignLeaveCloseButton"
+    >
+        <ion-icon name="close-outline"></ion-icon>
+    </button>
+</div>
+<div class="oh-modal__dialog-body">
+    <form hx-post="{% url 'assign-one' id %}" hx-target="#objectCreateModalTarget" class="oh-profile-section pt-1">
         <label class="oh-label d-block">{% trans "Employees" %}</label>
-        {{form.employee_id}} {{form.employee_id.errors}}
-    </div>
-    <div class="oh-modal__dialog-footer">
-        <button type="submit" class="oh-btn oh-btn--secondary w-100">
-          {% trans "Apply" %}
-        </button>
-    </div>
-</form>
+        {{ form.employee_id }} {{ form.employee_id.errors }}
+        <div class="oh-modal__dialog-footer p-0">
+            <button type="submit" class="oh-btn oh-btn--secondary w-100">
+                {% trans "Apply" %}
+            </button>
+        </div>
+    </form>
+</div>

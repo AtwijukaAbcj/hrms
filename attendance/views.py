@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta
 from django.contrib import messages
 from django.core.paginator import Paginator
 from django.db.models import Q
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
@@ -40,6 +40,15 @@ from attendance.forms import (
     AttendanceUpdateForm,
     AttendanceValidationConditionForm,
 )
+from attendance.methods.utils import (
+    activity_datetime,
+    employee_exists,
+    format_time,
+    is_reportingmanger,
+    overtime_calculation,
+    shift_schedule_today,
+    strtime_seconds,
+)
 from attendance.models import (
     Attendance,
     AttendanceActivity,
@@ -56,59 +65,10 @@ from solich.decorators import (
     manager_can_enter,
     permission_required,
 )
+from solich.http.response import SolichRedirect
 from notifications.signals import notify
 
 # Create your views here.
-
-
-def intersection_list(list1, list2):
-    """
-    This method is used to intersect two list
-    """
-    return [value for value in list1 if value in list2]
-
-
-def format_time(seconds):
-    """
-    this method is used to formate seconds to H:M and return it
-    args:
-        seconds : seconds
-    """
-
-    hour = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = int((seconds % 3600) % 60)
-    return f"{hour:02d}:{minutes:02d}"
-
-
-def strtime_seconds(time):
-    """
-    this method is used reconvert time in H:M formate string back to seconds and return it
-    args:
-        time : time in H:M format
-    """
-
-    ftr = [3600, 60, 1]
-    return sum(a * b for a, b in zip(ftr, map(int, time.split(":"))))
-
-
-def is_reportingmanger(request, instance):
-    """
-    if the instance have employee id field then you can use this method to know the
-    request user employee is the reporting manager of the instance
-    args :
-        request : request
-        instance : an object or instance of any model contain employee_id foreign key field
-    """
-
-    manager = request.user.employee_get
-    try:
-        employee_workinfo_manager = (
-            instance.employee_id.employee_work_info.reporting_manager_id
-        )
-    except Exception:
-        return HttpResponse("This Employee Dont Have any work information")
-    return manager == employee_workinfo_manager
 
 
 def late_come_create(attendance):
@@ -222,12 +182,7 @@ def attendance_create(request):
         if form.is_valid():
             form.save()
             messages.success(request, _("Attendance added."))
-            response = render(
-                request, "attendance/attendance/form.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "attendance/attendance/form.html", {"form": form})
 
 
@@ -368,12 +323,7 @@ def attendance_update(request, obj_id):
         if form.is_valid():
             form.save()
             messages.success(request, _("Attendance Updated."))
-            response = render(
-                request, "attendance/attendance/update_form.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(
         request,
         "attendance/attendance/update_form.html",
@@ -415,7 +365,7 @@ def attendance_delete(request, obj_id):
         except Exception as error:
             messages.error(request, error)
             messages.error(request, _("You cannot delete this attendance"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @require_http_methods(["POST"])
@@ -534,12 +484,7 @@ def attendance_overtime_create(request):
         if form.is_valid():
             form.save()
             messages.success(request, _("Attendance account added."))
-            response = render(
-                request, "attendance/attendance_account/form.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "attendance/attendance_account/form.html", {"form": form})
 
 
@@ -620,21 +565,14 @@ def attendance_overtime_update(request, obj_id):
         if form.is_valid():
             form.save()
             messages.success(request, _("Attendance account updated successfully."))
-            response = render(
-                request,
-                "attendance/attendance_account/update_form.html",
-                {"form": form},
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(
         request, "attendance/attendance_account/update_form.html", {"form": form}
     )
 
 
 @login_required
-@permission_required("attendance.delete_AttendanceOverTime")
+@permission_required("attendance.delete_attendanceovertime")
 @require_http_methods(["POST"])
 def attendance_overtime_delete(request, obj_id):
     """
@@ -648,7 +586,7 @@ def attendance_overtime_delete(request, obj_id):
     except Exception as e:
         messages.error(request, e)
         messages.error(request, _("You cannot delete this attendance OT"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -720,54 +658,6 @@ def attendance_activity_delete(request, obj_id):
         messages.error(request, e)
         messages.error(request, _("You cannot delete this activity"))
     return redirect("/attendance/attendance-activity-view")
-
-
-def employee_exists(request):
-    """
-    This method return the employee instance and work info if not exists return None instead
-    """
-    employee, employee_work_info = None, None
-    try:
-        employee = request.user.employee_get
-        employee_work_info = employee.employee_work_info
-    finally:
-        return (employee, employee_work_info)
-
-
-def shift_schedule_today(day, shift):
-    """
-    This function is used to find shift schedules for the day,
-    it will returns min hour,start time seconds  end time seconds
-    args:
-        shift   : shift instance
-        day     : shift day object
-    """
-    schedule_today = day.day_schedule.filter(shift_id=shift)
-    start_time_sec, end_time_sec, minimum_hour = 0, 0, "00:00"
-    if schedule_today.exists():
-        schedule_today = schedule_today[0]
-        minimum_hour = schedule_today.minimum_working_hour
-        start_time_sec = strtime_seconds(schedule_today.start_time.strftime("%H:%M"))
-        end_time_sec = strtime_seconds(schedule_today.end_time.strftime("%H:%M"))
-    return (minimum_hour, start_time_sec, end_time_sec)
-
-
-def overtime_calculation(attendance):
-    """
-    This method is used to calculate overtime of the attendance, it will
-    return difference between attendance worked hour and minimum hour if
-    and only worked hour greater than minimum hour, else return 00:00
-    args:
-        attendance : attendance instance
-    """
-
-    minimum_hour = attendance.minimum_hour
-    at_work = attendance.attendance_worked_hour
-    at_work_sec = strtime_seconds(at_work)
-    minimum_hour_sec = strtime_seconds(minimum_hour)
-    if at_work_sec > minimum_hour_sec:
-        return format_time((at_work_sec - minimum_hour_sec))
-    return "00:00"
 
 
 def clock_in_attendance_and_activity(
@@ -854,7 +744,7 @@ def clock_in(request):
         if start_time_sec > end_time_sec:
             # night shift
             # ------------------
-            # Night shift in HRMS consider a 24 hours from noon to next day noon,
+            # Night shift in Solich consider a 24 hours from noon to next day noon,
             # the shift day taken today if the attendance clocked in after 12 O clock.
 
             if mid_day_sec > now_sec:
@@ -895,30 +785,6 @@ def clock_in(request):
         )
     return HttpResponse(
         "You Don't have work information filled or your employee detail neither entered "
-    )
-
-
-def activity_datetime(attendance_activity):
-    """
-    This method is used to convert clock-in and clock-out of activity as datetime object
-    args:
-        attendance_activity : attendance activity instance
-    """
-
-    # in
-    in_year = attendance_activity.clock_in_date.year
-    in_month = attendance_activity.clock_in_date.month
-    in_day = attendance_activity.clock_in_date.day
-    in_hour = attendance_activity.clock_in.hour
-    in_minute = attendance_activity.clock_in.minute
-    # out
-    out_year = attendance_activity.clock_out_date.year
-    out_month = attendance_activity.clock_out_date.month
-    out_day = attendance_activity.clock_out_date.day
-    out_hour = attendance_activity.clock_out.hour
-    out_minute = attendance_activity.clock_out.minute
-    return datetime(in_year, in_month, in_day, in_hour, in_minute), datetime(
-        out_year, out_month, out_day, out_hour, out_minute
     )
 
 
@@ -1203,7 +1069,7 @@ def validate_this_attendance(request, obj_id):
             redirect=reverse("view-my-attendance"),
             icon="checkmark",
         )
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+        return SolichRedirect(request)
     return HttpResponse("You Dont Have Permission")
 
 
@@ -1236,7 +1102,7 @@ def revalidate_this_attendance(request, obj_id):
                 redirect=reverse("view-my-attendance"),
                 icon="refresh",
             )
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+        return SolichRedirect(request)
     return HttpResponse("You Cannot Request for others attendance")
 
 
@@ -1263,7 +1129,7 @@ def approve_overtime(request, obj_id):
             redirect=reverse("attendance-overtime-view"),
             icon="checkmark",
         )
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -1448,7 +1314,7 @@ def dashboard_attendance(request):
     """
     labels = [
         _("On Time"),
-        _("Late Come"),
+        _("Late Arrival"),
         _("On Break"),
     ]
     data_set = []
@@ -1456,4 +1322,3 @@ def dashboard_attendance(request):
     for dept in departments:
         data_set.append(generate_data_set(request, dept))
     return JsonResponse({"dataSet": data_set, "labels": labels})
-

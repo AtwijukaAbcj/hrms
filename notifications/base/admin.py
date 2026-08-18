@@ -14,4 +14,3 @@ class AbstractNotificationAdmin(admin.ModelAdmin):
     def get_queryset(self, request):
         qs = super(AbstractNotificationAdmin, self).get_queryset(request)
         return qs.prefetch_related("actor")
-

@@ -136,6 +136,12 @@ class COSECBiometric:
         such as timeouts, access errors, unsupported content types, and valid responses.
         """
         try:
+            # Some Device API uses HTTPDigestAuth for authentication
+            # response = requests.get(
+            # url + "&format=xml",
+            # timeout=self.__timeout,
+            # auth=HTTPDigestAuth(self.__username, self.__password)
+            # )
             response = requests.get(
                 url + "&format=xml", headers=self.__header, timeout=self.__timeout
             )
@@ -736,4 +742,3 @@ class COSECBiometric:
             f"&seq-number={seq_num}&no-of-events={no_of_events}"
         )
         return self.__send_request(url)
-

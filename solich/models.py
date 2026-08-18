@@ -1,13 +1,102 @@
+"""
+models.py
+=========
+
+This module defines the abstract base model `SolichModel` for the Solich HRMS project.
+The `SolichModel` provides common fields and functionalities for other models within
+the application, such as tracking creation and modification timestamps and user
+information, audit logging, and active/inactive status management.
+"""
+
+import html
+import re
+from uuid import uuid4
+
 from auditlog.models import AuditlogHistoryField
-from auditlog.registry import auditlog
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.db import models
-from django.utils.translation import gettext as _
+from django.db.models.fields.files import FieldFile
+from django.urls import reverse
+from django.utils.text import slugify
+from django.utils.translation import gettext_lazy as _
 
-from .solich_middlewares import _thread_locals
+from solich.solich_middlewares import _thread_locals
+from solich.inherit.model_inherit import EXTENSION_REGISTRY, SolichModelBase
+from solich_auth.models import SolichUser
+from solich_views.cbv_methods import render_template
 
 
-class SolichModel(models.Model):
+@property
+def url(self: FieldFile):
+    """
+    Custom url attribute/property
+    """
+    try:
+        self._require_file()
+    except Exception as e:
+        return reverse("404")
+    return self.storage.url(self.name)
+
+
+setattr(FieldFile, "url", url)
+
+
+def has_xss(value: str) -> bool:
+    """Detect common XSS attempts (scripts, event handlers, js URLs, active content)."""
+    if not isinstance(value, str):
+        return False
+
+    # Decode HTML entities so obfuscated payloads (e.g. "jav&#x61;script:")
+    # are matched after the browser would have decoded them. Decode twice to
+    # catch double-encoded variants (e.g. "&amp;#x61;").
+    decoded = html.unescape(html.unescape(value))
+
+    xss_patterns = [
+        r"<\s*script.*?>.*?<\s*/\s*script\s*>",  # <script> ... </script>
+        r"javascript\s*:",  # javascript: pseudo-protocol
+        r"on\w+\s*=",  # inline event handlers (onclick, onload, etc.)
+        r"<\s*(embed|object|iframe|svg|math|link|meta).*?>",  # dangerous active content
+        r"on\w+\s*=\s*['\"]?\s*(eval|setTimeout|setInterval|new\s+Function|XMLHttpRequest|fetch|\$\s*\()[^>]*",  # JS API abuse
+    ]
+
+    combined = re.compile("|".join(xss_patterns), re.IGNORECASE | re.DOTALL)
+    return bool(combined.search(value) or combined.search(decoded))
+
+
+def upload_path(instance, filename):
+    """
+    Generates a unique file path for uploads in the format:
+    app_label/model_name/field_name/originalfilename-uuid.ext
+    """
+    ext = filename.split(".")[-1]
+    base_name = ".".join(filename.split(".")[:-1]) or "file"
+    unique_name = f"{slugify(base_name)}-{uuid4().hex[:8]}.{ext}"
+
+    # Try to find which field is uploading this file
+    field_name = next(
+        (
+            k
+            for k, v in instance.__dict__.items()
+            if hasattr(v, "name") and v.name == filename
+        ),
+        None,
+    )
+
+    app_label = instance._meta.app_label
+    model_name = instance._meta.model_name
+
+    if field_name:
+        return f"{app_label}/{model_name}/{field_name}/{unique_name}"
+    return f"{app_label}/{model_name}/{unique_name}"
+
+
+class SolichModel(models.Model, metaclass=SolichModelBase):
+    """
+    An abstract base model that includes common fields and functionalities
+    for models within the Solich application.
+    """
+
     created_at = models.DateTimeField(
         auto_now_add=True,
         null=True,
@@ -15,7 +104,7 @@ class SolichModel(models.Model):
         verbose_name=_("Created At"),
     )
     created_by = models.ForeignKey(
-        User,
+        SolichUser,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -24,7 +113,7 @@ class SolichModel(models.Model):
     )
 
     modified_by = models.ForeignKey(
-        User,
+        SolichUser,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -32,24 +121,40 @@ class SolichModel(models.Model):
         verbose_name=_("Modified By"),
         related_name="%(class)s_modified_by",
     )
-    Solich_history = AuditlogHistoryField()
+    solich_history = AuditlogHistoryField()
+    objects = models.Manager()
     is_active = models.BooleanField(default=True, verbose_name=_("Is Active"))
 
+    @property
+    def get_created_at_date(self):
+        """
+        get_created_at_date
+        """
+        return self.created_at.date()
+
     class Meta:
+        """
+        Meta class for SolichModel
+        """
+
         abstract = True
 
     def save(self, *args, **kwargs):
+        """
+        Override the save method to automatically set the created_by and
+        modified_by fields based on the current request user.
+        """
+        # self.full_clean()
+
         request = getattr(_thread_locals, "request", None)
-        # also here will have scheduled activities
-        # at the time there will no change to the modified user,
-        # its remains same as previous
+
         if request:
             user = request.user
 
             if (
                 hasattr(self, "created_by")
                 and hasattr(self._meta.get_field("created_by"), "related_model")
-                and self._meta.get_field("created_by").related_model == User
+                and self._meta.get_field("created_by").related_model == SolichUser
             ):
                 if request and not self.pk:
                     if user.is_authenticated:
@@ -60,21 +165,89 @@ class SolichModel(models.Model):
 
         super(SolichModel, self).save(*args, **kwargs)
 
+    def clean_fields(self, exclude=None):
+        errors = {}
+
+        # Get the list of fields to exclude from validation
+        total_exclude = set(exclude or []).union(getattr(self, "xss_exempt_fields", []))
+
+        for field in self._meta.get_fields():
+            if (
+                isinstance(field, (models.CharField, models.TextField))
+                and field.name not in total_exclude
+            ):
+                value = getattr(self, field.name, None)
+                if value and has_xss(value):
+                    errors[field.name] = ValidationError(
+                        _("Potential XSS content detected.")
+                    )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def get_verbose_name(self):
+        return self._meta.verbose_name
+
+    def get_verbose_name_plural(self):
+        return self._meta.verbose_name_plural
+
+    def get_model_history(self):
+        """
+        returns the history button column
+        """
+
+        return render_template(
+            path="generic/history_col.html",
+            context={"instance": self},
+        )
+
+    def get_history_url(self):
+        """
+        URL for opening this instance's history sidebar
+        """
+        return (
+            reverse("generic-history", kwargs={"pk": self.pk})
+            + f"?model={self._meta.app_label}.{self._meta.model_name}"
+        )
+
     @classmethod
     def find(cls, object_id):
+        """
+        Find an object of this class by its ID.
+        """
         try:
-            object = cls.objects.filter(id=object_id).first()
-            return object
-        except:
+            obj = cls.objects.filter(id=object_id).first()
+            return obj
+        except Exception as e:
+            # Log the exception if needed
             return None
 
     @classmethod
     def activate_deactivate(cls, object_id):
-        object = cls.find(object_id)
-        if object:
-            object.is_active = not object.is_active
-            object.save()
+        """
+        Toggle the is_active status of an object of this class.
+        """
+        obj = cls.find(object_id)
+        if obj:
+            obj.is_active = not obj.is_active
+            obj.save()
+
+    @classmethod
+    def get_verbose_name_related_field(cls, field_path):
+        """
+        Traverse related fields to get verbose_name using Django's _meta API.
+        Example: "employee_id__employee_work_info__reporting_manager_id"
+        """
+        parts = field_path.split("__")
+        instance_model = cls
+
+        for part in parts[:-1]:
+            field = instance_model._meta.get_field(part)
+            instance_model = field.remote_field.model
+
+        final_field = instance_model()._meta.get_field(parts[-1])
+        return final_field.verbose_name
 
 
-auditlog.register(SolichModel, serialize_data=True)
-
+class NoPermissionModel:
+    _no_permission_model = True

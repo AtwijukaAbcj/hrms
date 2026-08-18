@@ -13,13 +13,14 @@ provide the main entry points for interacting with the application's functionali
 
 import contextlib
 import json
+import logging
 
 from django.contrib import messages
 from django.contrib.auth.models import Permission
 from django.core import serializers
 from django.core.mail import send_mail
 from django.core.paginator import Paginator
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
@@ -30,6 +31,7 @@ from base.methods import sortby
 from employee.models import Employee
 from solich import settings
 from solich.decorators import hx_request_required, login_required, permission_required
+from solich.http import SolichRedirect
 from notifications.signals import notify
 from recruitment.decorators import manager_can_enter, recruitment_manager_can_enter
 from recruitment.filters import CandidateFilter, RecruitmentFilter, StageFilter
@@ -45,6 +47,8 @@ from recruitment.forms import (
 )
 from recruitment.methods import recruitment_manages
 from recruitment.models import Candidate, Recruitment, Stage, StageNote
+
+logger = logging.getLogger(__name__)
 
 
 def is_stagemanager(request, stage_id=False):
@@ -144,9 +148,7 @@ def recruitment(request):
             response = render(
                 request, "recruitment/recruitment_form.html", {"form": form}
             )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "recruitment/recruitment_form.html", {"form": form})
 
 
@@ -309,7 +311,7 @@ def recruitment_delete(request, rec_id):
         messages.error(request, error)
         messages.error(request, _("You cannot delete this recruitment"))
     recruitment_obj = Recruitment.objects.all()
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -329,7 +331,7 @@ def recruitment_pipeline(request):
     if request.method == "POST":
         if request.POST.get(
             "recruitment_managers"
-        ) is not None and request.user.has_perm("add_recruitment"):
+        ) is not None and request.user.has_perm("recruitment.add_recruitment"):
             recruitment_form = RecruitmentDropDownForm(request.POST)
             if recruitment_form.is_valid():
                 recruitment_obj = recruitment_form.save()
@@ -354,9 +356,9 @@ def recruitment_pipeline(request):
                         redirect=reverse("pipeline"),
                     )
 
-                return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+                return SolichRedirect(request)
         elif request.FILES.get("resume") is not None:
-            if request.user.has_perm("add_candidate") or is_stagemanager(
+            if request.user.has_perm("recruitment.add_candidate") or is_stagemanager(
                 request,
             ):
                 candidate_form = CandidateDropDownForm(request.POST, request.FILES)
@@ -381,8 +383,10 @@ def recruitment_pipeline(request):
                         )
 
                     messages.success(request, _("Candidate added."))
-                    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
-        elif request.POST.get("stage_managers") and request.user.has_perm("add_stage"):
+                    return SolichRedirect(request)
+        elif request.POST.get("stage_managers") and request.user.has_perm(
+            "recruitment.add_stage"
+        ):
             stage_form = StageDropDownForm(request.POST)
             if stage_form.is_valid():
                 if recruitment_manages(
@@ -408,7 +412,7 @@ def recruitment_pipeline(request):
                             redirect=reverse("pipeline"),
                         )
 
-                    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+                    return SolichRedirect(request)
                 messages.info(request, _("You dont have access"))
     return render(
         request,
@@ -473,7 +477,7 @@ def stage_update_pipeline(request, stage_id):
                     redirect=reverse("pipeline"),
                 )
 
-            return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+            return SolichRedirect(request)
 
     return render(request, "pipeline/form/stage_update.html", {"form": form})
 
@@ -510,12 +514,7 @@ def recruitment_update_pipeline(request, rec_id):
                     redirect=reverse("pipeline"),
                 )
 
-            response = render(
-                request, "pipeline/form/recruitment_update.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "pipeline/form/recruitment_update.html", {"form": form})
 
 
@@ -528,7 +527,7 @@ def recruitment_delete_pipeline(request, rec_id):
     Args:
         id: recruitment instance id
     Returns:
-        HttpResponseRedirect: Used to refresh the page
+        SolichRedirect: Used to refresh the page
     """
     recruitment_obj = Recruitment.objects.get(id=rec_id)
     try:
@@ -537,7 +536,7 @@ def recruitment_delete_pipeline(request, rec_id):
     except Exception as error:
         messages.error(request, error)
         messages.error(request, _("Recruitment already in use."))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -620,12 +619,7 @@ def add_note(request, cand_id=None):
             note.updated_by = request.user.employee_get
             note.save()
             messages.success(request, _("Note added successfully.."))
-            response = render(
-                request, "pipeline/pipeline_components/add_note.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(
         request,
         "pipeline/pipeline_components/add_note.html",
@@ -665,12 +659,7 @@ def note_update(request, note_id):
         if form.is_valid():
             form.save()
             messages.success(request, _("Note updated successfully..."))
-            response = render(
-                request, "pipeline/pipeline_components/update_note.html", {"form": form}
-            )
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(
         request, "pipeline/pipeline_components/update_note.html", {"form": form}
     )
@@ -771,10 +760,7 @@ def stage(request):
                     redirect=reverse("pipeline"),
                 )
 
-            response = render(request, "stage/stage_form.html", {"form": form})
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return SolichRedirect(request)
     return render(request, "stage/stage_form.html", {"form": form})
 
 
@@ -906,7 +892,7 @@ def stage_delete(request, stage_id):
             manager.employee_user_id.user_permissions.remove(view_recruitment.id)
         initial_stage_manager = all_this_manger.filter(stage_type="initial")
         if len(initial_stage_manager) == 1:
-            add_candidate = Permission.objects.get(codename="add_candidate")
+            add_candidate = Permission.objects.get(codename="recruitment.add_candidate")
             change_candidate = Permission.objects.get(codename="change_candidate")
             manager.employee_user_id.user_permissions.remove(add_candidate.id)
             manager.employee_user_id.user_permissions.remove(change_candidate.id)
@@ -917,7 +903,7 @@ def stage_delete(request, stage_id):
     except Exception as error:
         messages.error(request, error)
         messages.error(request, _("You cannot delete this stage"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -1134,7 +1120,7 @@ def candidate_delete(request, cand_id):
     except Exception as error:
         messages.error(request, error)
         messages.error(request, _("You cannot delete this candidate"))
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -1146,7 +1132,7 @@ def candidate_archive(request, cand_id):
     candidate_obj = Candidate.objects.get(id=cand_id)
     candidate_obj.is_active = not candidate_obj.is_active
     candidate_obj.save()
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return SolichRedirect(request)
 
 
 @login_required
@@ -1192,7 +1178,11 @@ def candidate_bulk_archive(request):
         candidate_obj = Candidate.objects.get(id=cand_id)
         candidate_obj.is_active = is_active
         candidate_obj.save()
-        messages.success(request, f"{candidate_obj} is {message}")
+        messages.success(
+            request,
+            _("%(candidate_obj)s is %(message)s")
+            % {"candidate_obj": candidate_obj, "message": message},
+        )
     return JsonResponse({"message": "Success"})
 
 
@@ -1224,8 +1214,8 @@ def application_form(request):
             candidate_obj = form.save(commit=False)
             recruitment_obj = candidate_obj.recruitment_id
             stages = recruitment_obj.stage_set.all()
-            if stages.filter(stage_type="initial").exists():
-                candidate_obj.stage_id = stages.filter(stage_type="initial").first()
+            if stages.filter(stage_type="applied").exists():
+                candidate_obj.stage_id = stages.filter(stage_type="applied").first()
             else:
                 candidate_obj.stage_id = stages.order_by("sequence").first()
             candidate_obj.save()
@@ -1261,12 +1251,15 @@ def send_acknowledgement(request):
         subject = request.POST.get("subject")
         bdy = request.POST.get("body")
         email_backend = ConfiguredEmailBackend()
+        display_email_name = email_backend.dynamic_from_email_with_display_name
+        if request:
+            try:
+                display_email_name = f"{request.user.employee_get.get_full_name()} <{request.user.employee_get.email}>"
+            except:
+                logger.error(Exception)
+
         res = send_mail(
-            subject,
-            bdy,
-            email_backend.dynamic_from_email_with_display_name,
-            [send_to],
-            fail_silently=False,
+            subject, bdy, display_email_name, [send_to], fail_silently=False
         )
         if res == 1:
             return HttpResponse(
@@ -1390,4 +1383,3 @@ def stage_sequence_update(request):
         stage.sequence = seq
         stage.save()
     return JsonResponse({"type": "success", "message": "Stage sequence updated"})
-

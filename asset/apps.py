@@ -4,6 +4,7 @@ Description: Configuration for the 'asset' app.
 """
 
 from django.apps import AppConfig
+from django.conf import settings
 
 
 class AssetConfig(AppConfig):
@@ -19,3 +20,14 @@ class AssetConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "asset"
 
+    def ready(self):
+        from django.urls import include, path
+
+        from solich.urls import urlpatterns
+
+        settings.APPS.append("asset")
+        urlpatterns.append(
+            path("asset/", include("asset.urls")),
+        )
+        settings.APP_URLS.append("asset.urls")
+        super().ready()

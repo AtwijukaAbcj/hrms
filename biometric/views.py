@@ -7,24 +7,30 @@ registered on biometric devices.
 """
 
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from threading import Event, Thread
 from urllib.parse import parse_qs, unquote
 
 import pytz
-import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+from django.conf import settings
 from django.contrib import messages
+from django.db.models import Q
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
+from django.template.loader import render_to_string
+from django.utils import timezone as django_timezone
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from zk import ZK
+from zk import exception as zk_exception
 
+from attendance.methods.utils import Request
+from attendance.models import AttendanceActivity
 from attendance.views.clock_in_out import clock_in, clock_out
 from base.methods import get_key_instances, get_pagination
 from employee.models import Employee, EmployeeWorkInformation
-from solich import settings
 from solich.decorators import (
     hx_request_required,
     install_required,
@@ -32,17 +38,26 @@ from solich.decorators import (
     permission_required,
 )
 from solich.filters import SolichPaginator
+from solich.http.response import SolichRedirect
+from solich.settings import TIME_ZONE
 
+from .anviz import CrossChexCloudAPI
 from .cosec import COSECBiometric
+from .dahua import DahuaAPI
+from .etimeoffice import ETimeOfficeAPI
 from .filters import BiometricDeviceFilter
 from .forms import (
     BiometricDeviceForm,
     BiometricDeviceSchedulerForm,
     CosecUserAddForm,
     COSECUserForm,
+    DahuaUserForm,
     EmployeeBiometricAddForm,
+    MapBioUsers,
 )
 from .models import BiometricDevices, BiometricEmployees, COSECAttendanceArguments
+
+logger = logging.getLogger(__name__)
 
 
 def str_time_seconds(time):
@@ -104,50 +119,6 @@ def biometric_set_time(conn):
     conn.set_time(new_time)
 
 
-class META:
-    """
-    Provides access to HTTP metadata keys.
-    """
-
-    @classmethod
-    def keys(cls):
-        """
-        Retrieve the list of available HTTP metadata keys.
-
-        Returns:
-            list: A list of HTTP metadata keys.
-        """
-        return ["HTTP_HX_REQUEST"]
-
-
-class Request:
-    """
-    Represents a request for clock-in or clock-out.
-
-    Attributes:
-    - user: The user associated with the request.
-    - date: The date of the request.
-    - time: The time of the request.
-    - path: The path associated with the request (default: "/").
-    - session: The session data associated with the request (default: {"title": None}).
-    """
-
-    def __init__(
-        self,
-        user,
-        date,
-        time,
-        datetime,
-    ) -> None:
-        self.user = user
-        self.path = "/"
-        self.session = {"title": None}
-        self.date = date
-        self.time = time
-        self.datetime = datetime
-        self.META = META()
-
-
 class ZKBioAttendance(Thread):
     """
     Represents a thread for capturing live attendance data from a ZKTeco biometric device.
@@ -163,10 +134,11 @@ class ZKBioAttendance(Thread):
     - stop(): Sets the _stop_event to signal the thread to stop gracefully.
     """
 
-    def __init__(self, machine_ip, port_no):
+    def __init__(self, machine_ip, port_no, password):
         super().__init__()
         self.machine_ip = machine_ip
         self.port_no = port_no
+        self.password = int(password)
         self._stop_event = Event()  # Initialize stop event
         self.conn = None
 
@@ -175,8 +147,8 @@ class ZKBioAttendance(Thread):
             zk_device = ZK(
                 self.machine_ip,
                 port=self.port_no,
-                timeout=5,
-                password=0,
+                timeout=60,
+                password=self.password,
                 force_udp=False,
                 ommit_ping=False,
             )
@@ -193,14 +165,17 @@ class ZKBioAttendance(Thread):
                             if attendance:
                                 user_id = attendance.user_id
                                 punch_code = attendance.punch
-                                date_time = attendance.timestamp
+                                date_time = django_timezone.make_aware(
+                                    attendance.timestamp
+                                )
+                                # date_time = attendance.timestamp
                                 date = date_time.date()
                                 time = date_time.time()
                                 device.last_fetch_date = date
                                 device.last_fetch_time = time
                                 device.save()
                                 bio_id = BiometricEmployees.objects.filter(
-                                    user_id=user_id
+                                    user_id=user_id, device_id=device
                                 ).first()
                                 if bio_id:
                                     if punch_code in {0, 3, 4}:
@@ -214,7 +189,10 @@ class ZKBioAttendance(Thread):
                                                 )
                                             )
                                         except Exception as error:
-                                            print(f"Got an error in clock_in {error}")
+                                            logger.error(
+                                                "Got an error in clock_in %s", error
+                                            )
+
                                             continue
                                     else:
                                         try:
@@ -227,137 +205,128 @@ class ZKBioAttendance(Thread):
                                                 )
                                             )
                                         except Exception as error:
-                                            print(f"Got an error in clock_out {error}")
+                                            logger.error(
+                                                "Got an error in clock_out", error
+                                            )
                                             continue
                             else:
                                 continue
         except ConnectionResetError as error:
-            ZKBioAttendance(self.machine_ip, self.port_no).start()
+            ZKBioAttendance(self.machine_ip, self.port_no, self.password).start()
 
     def stop(self):
+        """To stop the ZK live capture mode"""
         self.conn.end_live_capture = True
 
 
-class AnvizBiometricDeviceManager:
-    """Manages communication with Anviz biometric devices for attendance records."""
+class COSECBioAttendanceThread(Thread):
+    """
+    A thread class that handles the real-time retrieval and processing of
+    biometric attendance data from a COSEC biometric device.
+
+    Attributes:
+        device_id (int): The ID of the biometric device to interact with.
+        _stop_event (threading.Event): An event to signal when to stop the thread.
+
+    Methods:
+        run():
+            Continuously fetches attendance data from the COSEC device, processes
+            it, and updates the last fetched sequence and rollover count.
+
+        stop():
+            Signals the thread to stop by setting the _stop_event.
+    """
 
     def __init__(self, device_id):
-        """
-        Initializes the AnvizBiometricDeviceManager.
+        super().__init__()
+        self.device_id = device_id
+        self._stop_event = Event()
 
-        :param device_id: The Object ID of the biometric device.
-        """
-        self.device = BiometricDevices.objects.get(id=device_id)
-        self.begin_time = None
-        self.end_time = None
+    def run(self):
+        try:
+            device = BiometricDevices.objects.get(id=self.device_id)
+            if not device.is_live:
+                return
 
-    def get_attendance_payload(self):
-        """
-        Constructs the payload for retrieving attendance records.
-
-        :return: A dictionary containing the payload.
-        """
-        current_utc_time = datetime.utcnow()
-        self.begin_time = (
-            datetime.combine(self.device.last_fetch_date, self.device.last_fetch_time)
-            if self.device.last_fetch_date and self.device.last_fetch_time
-            else current_utc_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        )
-        self.end_time = current_utc_time
-        begin_time_str = self.begin_time.isoformat() + "+00:00"
-        end_time_str = self.end_time.isoformat() + "+00:00"
-        return {
-            "header": {
-                "nameSpace": "attendance.record",
-                "nameAction": "getrecord",
-                "version": "1.0",
-                "requestId": self.device.anviz_request_id,
-                "timestamp": "2022-10-21T07:39:07+00:00",
-            },
-            "authorize": {
-                "type": "token",
-                "token": self.device.api_token,
-            },
-            "payload": {
-                "begin_time": begin_time_str,
-                "end_time": end_time_str,
-                "order": "asc",
-                "page": "1",
-                "per_page": "100",
-            },
-        }
-
-    def refresh_api_token(self):
-        """
-        Refreshes the API token for the device.
-
-        This method sends a request to the API to refresh the token.
-        """
-        token_payload = {
-            "header": {
-                "nameSpace": "authorize.token",
-                "nameAction": "token",
-                "version": "1.0",
-                "requestId": self.device.anviz_request_id,
-                "timestamp": "2022-10-21T07:39:07+00:00",
-            },
-            "payload": {
-                "api_key": self.device.api_key,
-                "api_secret": self.device.api_secret,
-            },
-        }
-        response = requests.post(self.device.api_url, json=token_payload, timeout=30)
-        api_response = response.json()
-        token = api_response["payload"]["token"]
-        expires = api_response["payload"]["expires"]
-        self.device.api_token = token
-        self.device.api_expires = expires
-        self.device.save()
-
-    def get_attendance_records(self):
-        """
-        Retrieves attendance records from the biometric device.
-
-        :return: A dictionary containing the attendance records.
-        """
-        token_expire = {
-            "header": {"nameSpace": "System", "name": "Exception"},
-            "payload": {"type": "TOKEN_EXPIRES", "message": "TOKEN_EXPIRES"},
-        }
-        attendance_payload = self.get_attendance_payload()
-        response = requests.post(
-            self.device.api_url, json=attendance_payload, timeout=30
-        )
-        api_response = response.json()
-        if api_response == token_expire:
-            self.refresh_api_token()
-            attendance_payload = self.get_attendance_payload()
-            response = requests.post(
-                self.device.api_url, json=attendance_payload, timeout=30
+            device_args = COSECAttendanceArguments.objects.filter(
+                device_id=device
+            ).first()
+            last_fetch_roll_ovr_count = (
+                int(device_args.last_fetch_roll_ovr_count) if device_args else 0
             )
-            api_response = response.json()
-        page_count = response.json()["payload"]["pageCount"]
-        if page_count > 1:
-            page = attendance_payload["payload"]["page"]
-            for page in range(2, page_count + 1):
-                attendance_payload["payload"]["page"] = str(page)
-                response = requests.post(
-                    self.device.api_url, json=attendance_payload, timeout=30
+            last_fetch_seq_number = (
+                int(device_args.last_fetch_seq_number) if device_args else 1
+            )
+
+            cosec = COSECBiometric(
+                device.machine_ip,
+                device.port,
+                device.bio_username,
+                device.bio_password,
+                timeout=10,
+            )
+            while not self._stop_event.is_set():
+                attendances = cosec.get_attendance_events(
+                    last_fetch_roll_ovr_count, int(last_fetch_seq_number) + 1
                 )
-                if response.json() == token_expire:
-                    self.refresh_api_token()
-                    attendance_payload = self.get_attendance_payload()
-                    response = requests.post(
-                        self.device.api_url, json=attendance_payload, timeout=30
+                if not isinstance(attendances, list):
+                    self._stop_event.wait(5)
+                    continue
+
+                for attendance in attendances:
+                    ref_user_id = attendance["detail-1"]
+                    employee = BiometricEmployees.objects.filter(
+                        ref_user_id=ref_user_id
+                    ).first()
+                    if not employee:
+                        continue
+
+                    date_str = attendance["date"]
+                    time_str = attendance["time"]
+                    attendance_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+                    attendance_time = datetime.strptime(time_str, "%H:%M:%S").time()
+                    attendance_datetime = datetime.combine(
+                        attendance_date, attendance_time
                     )
-                page_records = response.json().get("payload", {}).get("list", [])
-                api_response["payload"]["list"].extend(page_records)
-        self.device.last_fetch_date, self.device.last_fetch_time = (
-            self.end_time.date(),
-            self.end_time.time(),
-        )
-        self.device.save()
-        return api_response
+                    punch_code = attendance["detail-2"]
+
+                    request_data = Request(
+                        user=employee.employee_id.employee_user_id,
+                        date=attendance_date,
+                        time=attendance_time,
+                        datetime=django_timezone.make_aware(attendance_datetime),
+                    )
+                    try:
+                        if punch_code in ["1", "3", "5", "7", "9", "0"]:
+                            clock_in(request_data)
+                        elif punch_code in ["2", "4", "6", "8", "10"]:
+                            clock_out(request_data)
+                    except Exception as error:
+                        logger.error("Error processing attendance: ", error)
+
+                if attendances:
+                    last_attendance = attendances[-1]
+                    last_fetch_seq_number = last_attendance["seq-No"]
+                    last_fetch_roll_ovr_count = last_attendance["roll-over-count"]
+                    COSECAttendanceArguments.objects.update_or_create(
+                        device_id=device,
+                        defaults={
+                            "last_fetch_roll_ovr_count": last_fetch_roll_ovr_count,
+                            "last_fetch_seq_number": last_fetch_seq_number,
+                        },
+                    )
+                # Sleep to prevent overwhelming the device with requests
+                self._stop_event.wait(2)
+
+        except Exception as error:
+            device = BiometricDevices.objects.get(id=self.device_id)
+            device.is_live = False
+            device.save()
+            logger.error("Error in COSECBioAttendanceThread: ", error)
+
+    def stop(self):
+        """Set the stop event to signal the thread to stop gracefully."""
+        self._stop_event.set()
 
 
 @login_required
@@ -365,36 +334,50 @@ class AnvizBiometricDeviceManager:
 @permission_required("biometric.view_biometricdevices")
 def biometric_devices_view(request):
     """
-    Renders a page displaying a list of active biometric devices.
+    Renders and filters the list of biometric devices based on query parameters.
 
-    Parameters:
-    - request: The HTTP request object.
-
-    Returns:
-    - HttpResponse: The rendered HTML page displaying the list of biometric devices.
+    Handles both initial page load and HTMX-based filter/search requests.
 
     Template:
     - "biometric/view_biometric_devices.html"
 
     Context:
     - biometric_form (BiometricDeviceForm): Form for adding new biometric devices.
-    - devices (QuerySet): Queryset of active biometric devices, ordered by creation date.
-    - f (BiometricDeviceFilter): Form for filtering biometric devices.
-
+    - devices (QuerySet): Filtered and paginated queryset of biometric devices.
+    - f (BiometricDeviceFilter): Filter form.
+    - pd (str): URL-encoded query params for HTMX push.
+    - filter_dict (dict): Parsed filter query params.
     """
-    biometric_form = BiometricDeviceForm()
-    filter_form = BiometricDeviceFilter()
-    biometric_devices = BiometricDevices.objects.filter(is_active=True).order_by(
-        "-created_at"
-    )
+    previous_data = request.GET.urlencode()
+    is_active = request.GET.get("is_active")
+
+    # Apply filters
+    filter_form = BiometricDeviceFilter(request.GET)
+    biometric_devices = filter_form.qs.order_by("-created_at")
+
+    # Default to is_active=True if not specified or "unknown"
+    if not is_active or is_active == "unknown":
+        biometric_devices = biometric_devices.filter(is_active=True)
+
+    # Paginate
     biometric_devices = paginator_qry(biometric_devices, request.GET.get("page"))
-    template = "biometric/view_biometric_devices.html"
-    context = {
-        "biometric_form": biometric_form,
-        "devices": biometric_devices,
-        "f": filter_form,
-    }
-    return render(request, template, context)
+
+    # Parse filters for reuse
+    data_dict = parse_qs(previous_data)
+    get_key_instances(BiometricDevices, data_dict)
+
+    # Render
+    return render(
+        request,
+        "biometric/view_biometric_devices.html",
+        {
+            "biometric_form": BiometricDeviceForm(),
+            "devices": biometric_devices,
+            "f": filter_form,
+            "pd": previous_data,
+            "filter_dict": data_dict,
+        },
+    )
 
 
 @login_required
@@ -421,22 +404,23 @@ def biometric_device_schedule(request, device_id):
     if request.method == "POST":
         scheduler_form = BiometricDeviceSchedulerForm(request.POST)
         if scheduler_form.is_valid():
+            duration = scheduler_form.cleaned_data["scheduler_duration"]
             if device.machine_type == "zk":
                 try:
                     port_no = device.port
                     machine_ip = device.machine_ip
+                    password = device.zk_password
                     conn = None
                     zk_device = ZK(
                         machine_ip,
                         port=port_no,
-                        timeout=5,
-                        password=0,
+                        timeout=60,
+                        password=int(password),
                         force_udp=False,
                         ommit_ping=False,
                     )
                     conn = zk_device.connect()
                     conn.test_voice(index=0)
-                    duration = request.POST.get("scheduler_duration")
                     device = BiometricDevices.objects.get(id=device_id)
                     device.scheduler_duration = duration
                     device.is_scheduler = True
@@ -444,14 +428,14 @@ def biometric_device_schedule(request, device_id):
                     device.save()
                     scheduler = BackgroundScheduler()
                     scheduler.add_job(
-                        lambda: zk_biometric_device_attendance(device.id),
+                        lambda: zk_biometric_attendance_scheduler(device.id),
                         "interval",
                         seconds=str_time_seconds(device.scheduler_duration),
                     )
                     scheduler.start()
-                    return HttpResponse("<script>window.location.reload()</script>")
+                    return SolichRedirect(request)
                 except Exception as error:
-                    print(f"An error comes in biometric_device_schedule {error}")
+                    logger.error("An error comes in biometric_device_schedule ", error)
                     script = """
                     <script>
                         Swal.fire({
@@ -469,31 +453,62 @@ def biometric_device_schedule(request, device_id):
                     """
                     return HttpResponse(script)
             elif device.machine_type == "anviz":
-                duration = request.POST.get("scheduler_duration")
                 device.is_scheduler = True
                 device.scheduler_duration = duration
                 device.save()
                 scheduler = BackgroundScheduler()
                 scheduler.add_job(
-                    lambda: anviz_biometric_device_attendance(device.id),
+                    lambda: anviz_biometric_attendance_scheduler(device.id),
                     "interval",
                     seconds=str_time_seconds(device.scheduler_duration),
                 )
                 scheduler.start()
-                return HttpResponse("<script>window.location.reload()</script>")
+                return SolichRedirect(request)
+            elif device.machine_type == "dahua":
+                device.is_scheduler = True
+                device.is_live = False
+                device.scheduler_duration = duration
+                device.save()
+                scheduler = BackgroundScheduler()
+                scheduler.add_job(
+                    lambda: dahua_biometric_attendance_scheduler(device.id),
+                    "interval",
+                    seconds=str_time_seconds(device.scheduler_duration),
+                )
+                scheduler.start()
+                return SolichRedirect(request)
+            elif device.machine_type == "cosec":
+                device.is_scheduler = True
+                device.is_live = False
+                device.scheduler_duration = duration
+                device.save()
+                scheduler = BackgroundScheduler()
+                existing_thread = settings.BIO_DEVICE_THREADS.get(device.id)
+                if existing_thread:
+                    existing_thread.stop()
+                    del settings.BIO_DEVICE_THREADS[device.id]
+                scheduler.add_job(
+                    lambda: cosec_biometric_attendance_scheduler(device.id),
+                    "interval",
+                    seconds=str_time_seconds(device.scheduler_duration),
+                )
+                scheduler.start()
+                return SolichRedirect(request)
+            elif device.machine_type == "etimeoffice":
+                device.is_scheduler = True
+                device.is_live = False
+                device.scheduler_duration = duration
+                device.save()
+                scheduler = BackgroundScheduler()
+                scheduler.add_job(
+                    lambda: etimeoffice_biometric_attendance_scheduler(device.id),
+                    "interval",
+                    seconds=str_time_seconds(device.scheduler_duration),
+                )
+                scheduler.start()
+                return SolichRedirect(request)
             else:
-                duration = request.POST.get("scheduler_duration")
-                device.is_scheduler = True
-                device.scheduler_duration = duration
-                device.save()
-                scheduler = BackgroundScheduler()
-                scheduler.add_job(
-                    lambda: cosec_biometric_device_attendance(device.id),
-                    "interval",
-                    seconds=str_time_seconds(device.scheduler_duration),
-                )
-                scheduler.start()
-                return HttpResponse("<script>window.location.reload()</script>")
+                return SolichRedirect(request)
 
         context["scheduler_form"] = scheduler_form
         response = render(request, "biometric/scheduler_device_form.html", context)
@@ -525,7 +540,7 @@ def biometric_device_unschedule(request, device_id):
     device.is_scheduler = False
     device.save()
     messages.success(request, _("Biometric device unscheduled successfully"))
-    return redirect(f"/biometric/search-devices?{previous_data}")
+    return redirect(f"/biometric/view-biometric-devices/?{previous_data}")
 
 
 @login_required
@@ -542,7 +557,10 @@ def biometric_device_add(request):
     Returns:
     - HttpResponse: Renders the 'add_biometric_device.html' template with the biometric device form.
     """
-    previous_data = unquote(request.GET.urlencode())[len("pd=") :]
+    previous_data = unquote(request.GET.urlencode())
+    previous_data = (
+        previous_data[3:] if previous_data.startswith("pd=") else previous_data
+    )
     biometric_form = BiometricDeviceForm()
     if request.method == "POST":
         biometric_form = BiometricDeviceForm(request.POST)
@@ -551,7 +569,7 @@ def biometric_device_add(request):
             messages.success(request, _("Biometric device added successfully."))
             biometric_form = BiometricDeviceForm()
     context = {"biometric_form": biometric_form, "pd": previous_data}
-    return render(request, "biometric/add_biometric_device.html", context)
+    return render(request, "biometric/biometric_device_form.html", context)
 
 
 @login_required
@@ -570,7 +588,10 @@ def biometric_device_edit(request, device_id):
     - HttpResponse: Renders the 'edit_biometric_device.html' template with the biometric
                     device form pre-filled with existing data.
     """
-    device = BiometricDevices.objects.get(id=device_id)
+    device = BiometricDevices.find(device_id)
+    if not device:
+        messages.error(request, _("Biometric device not found."))
+        return render(request, "biometric/biometric_device_form.html")
     biometric_form = BiometricDeviceForm(instance=device)
     if request.method == "POST":
         biometric_form = BiometricDeviceForm(request.POST, instance=device)
@@ -581,7 +602,7 @@ def biometric_device_edit(request, device_id):
         "biometric_form": biometric_form,
         "device_id": device_id,
     }
-    return render(request, "biometric/edit_biometric_device.html", context)
+    return render(request, "biometric/biometric_device_form.html", context)
 
 
 @login_required
@@ -593,12 +614,15 @@ def biometric_device_archive(request, device_id):
     This method is used to archive or un-archive devices
     """
     previous_data = request.GET.urlencode()
-    device_obj = BiometricDevices.objects.get(id=device_id)
+    device_obj = BiometricDevices.find(device_id)
+    if not device_obj:
+        messages.error(request, _("Biometric device not found."))
+        return redirect(f"/biometric/view-biometric-devices/?{previous_data}")
     device_obj.is_active = not device_obj.is_active
     device_obj.save()
     message = _("archived") if not device_obj.is_active else _("un-archived")
     messages.success(request, _("Device is %(message)s") % {"message": message})
-    return redirect(f"/biometric/search-devices?{previous_data}")
+    return redirect(f"/biometric/view-biometric-devices/?{previous_data}")
 
 
 @login_required
@@ -614,236 +638,391 @@ def biometric_device_delete(request, device_id):
     - device_id (uuid): The ID of the biometric device to be deleted.
 
     Returns:
-    - HttpResponseRedirect: Redirects to the 'search-devices' page after deleting the
+    - HttpResponseRedirect: Redirects to the 'view-biometric-devices' page after deleting the
                             biometric device.
 
     """
-    device = BiometricDevices.objects.get(id=device_id)
-    device.delete()
     previous_data = request.GET.urlencode()
+    device_obj = BiometricDevices.find(device_id)
+    if not device_obj:
+        messages.error(request, _("Biometric device not found."))
+        return redirect(f"/biometric/view-biometric-devices/?{previous_data}")
+    device_obj.delete()
     messages.success(request, _("Biometric device deleted successfully."))
-    return redirect(f"/biometric/search-devices?{previous_data}")
+    return redirect(f"/biometric/view-biometric-devices/?{previous_data}")
+
+
+def render_connection_response(title, text, icon):
+    """
+    Helper function to render the connection
+    response from device test connection.
+    """
+    context = {
+        "title": title,
+        "text": text,
+        "icon": icon,
+    }
+    return render_to_string("biometric/test_connection_script.html", context)
+
+
+def test_zkteco_connection(device):
+    """Test connection for ZKTeco device."""
+    conn = None
+    port_no = device.port
+    machine_ip = device.machine_ip
+    password = device.zk_password
+    zk_device = ZK(
+        machine_ip,
+        port=port_no,
+        timeout=60,
+        password=int(password),
+        force_udp=False,
+        ommit_ping=False,
+    )
+    try:
+        conn = zk_device.connect()
+        conn.test_voice(index=0)
+        find_employees_in_zk(device.id)
+        return render_connection_response(
+            _("Connection Successful"),
+            _("ZKTeco test connection successful."),
+            "success",
+        )
+    except zk_exception.ZKErrorResponse:
+        return render_connection_response(
+            _("Authentication Error"),
+            _("Double-check the provided IP, Port, and Password."),
+            "warning",
+        )
+    except Exception:
+        logger.error("ZKTeco connection error", exc_info=True)
+        return render_connection_response(
+            _("Connection unsuccessful"),
+            _("Please check the IP, Port, and Password."),
+            "warning",
+        )
+    finally:
+        if conn is not None:
+            conn.disconnect()
+
+
+def test_anviz_connection(device):
+    """Test connection for Anviz device."""
+
+    try:
+        from .anviz import CrossChexCloudAPI
+
+        anviz = CrossChexCloudAPI(
+            api_url=device.api_url,
+            api_key=device.api_key,
+            api_secret=device.api_secret,
+            anviz_request_id=device.anviz_request_id,
+        )
+        test_response = anviz.test_connection()
+
+        if test_response.get("token"):
+            device.api_token = test_response.get("token")
+            device.api_expires = test_response.get("expires")
+            device.save()
+            records = anviz.get_attendance_records()
+
+            return render_connection_response(
+                _("Connection Successful"),
+                _("Anviz test connection successful."),
+                "success",
+            )
+        else:
+            return render_connection_response(
+                _("Connection unsuccessful"),
+                _("API credentials might be incorrect."),
+                "warning",
+            )
+    except Exception as error:
+        logger.error("Anviz connection error", exc_info=True)
+        return render_connection_response(
+            _("Connection unsuccessful"), _("API request failed."), "warning"
+        )
+
+
+def test_cosec_connection(device):
+    """Test connection for COSEC device."""
+    cosec = COSECBiometric(
+        device.machine_ip,
+        device.port,
+        device.bio_username,
+        device.bio_password,
+        timeout=10,
+    )
+    response = cosec.basic_config()
+    if response.get("app"):
+        find_employees_in_cosec(device.id)
+        return render_connection_response(
+            _("Connection Successful"),
+            _("Matrix test connection successful."),
+            "success",
+        )
+    else:
+        return render_connection_response(
+            _("Connection unsuccessful"),
+            _("Double-check the provided Machine IP, Username, and Password."),
+            "warning",
+        )
+
+
+def test_dahua_connection(device):
+    """Test connection for Dahua device."""
+    dahua = DahuaAPI(
+        ip=device.machine_ip,
+        username=device.bio_username,
+        password=device.bio_password,
+    )
+    response = dahua.get_system_info()
+    if response.get("status_code") == 200:
+        return render_connection_response(
+            _("Connection Successful"),
+            _("Dahua test connection successful."),
+            "success",
+        )
+    else:
+        return render_connection_response(
+            _("Connection unsuccessful"),
+            _("Double-check the provided Machine IP, Username, and Password."),
+            "warning",
+        )
+
+
+def test_etimeoffice_connection(device):
+    """Test connection for e-TimeOffice device."""
+    now = datetime.now()
+    etimeoffice = ETimeOfficeAPI(
+        username=device.bio_username,
+        password=device.bio_password,
+    )
+
+    from_date = f"{now.day:02d}/{now.month:02d}/{now.year}_00:00"
+    to_date = (
+        f"{now.day:02d}/{now.month:02d}/{now.year}_{now.hour:02d}:{now.minute:02d}"
+    )
+
+    try:
+        response = etimeoffice.download_punch_data(from_date=from_date, to_date=to_date)
+        if response.get("Msg") == "Success":
+            return render_connection_response(
+                _("Connection Successful"),
+                _("e-Time Office test connection successful."),
+                "success",
+            )
+
+        error_msg = response.get("Message")
+        return render_connection_response(
+            _("Connection unsuccessful"),
+            _("Double-check the provided API Url, Username, and Password: {}").format(
+                error_msg
+            ),
+            "warning",
+        )
+
+    except Exception as e:
+        return render_connection_response(
+            _("Connection error"),
+            _(f"API request failed with exception: {str(e)}"),
+            "danger",
+        )
 
 
 @login_required
 @install_required
 @hx_request_required
 @permission_required("biometric.view_biometricdevices")
-def search_devices(request):
+def biometric_device_test(request, device_id):
     """
-    This method is used to search biometric device model and return matching objects
+    Test the connection with the specified biometric device.
     """
-    previous_data = request.GET.urlencode()
-    search = request.GET.get("search")
-    is_active = request.GET.get("is_active")
-    if search is None:
-        search = ""
-    devices = BiometricDeviceFilter(request.GET).qs.order_by("-created_at")
-    if not is_active or is_active == "unknown":
-        devices = devices.filter(is_active=True)
-    data_dict = []
-    data_dict = parse_qs(previous_data)
-    get_key_instances(BiometricDevices, data_dict)
-    template = "biometric/card_biometric_devices.html"
-    if request.GET.get("view") == "list":
-        template = "biometric/list_biometric_devices.html"
 
-    devices = paginator_qry(devices, request.GET.get("page"))
-    return render(
-        request,
-        template,
-        {
-            "devices": devices,
-            "pd": previous_data,
-            "filter_dict": data_dict,
-        },
-    )
+    # Retrieve device and validate
+    device = BiometricDevices.objects.filter(id=device_id).first()
+    if not device:
+        return HttpResponse("Device not found.", status=404)
+
+    script = ""
+    try:
+        if device.machine_type == "zk":
+            script = test_zkteco_connection(device)
+        elif device.machine_type == "anviz":
+            script = test_anviz_connection(device)
+        elif device.machine_type == "cosec":
+            script = test_cosec_connection(device)
+        elif device.machine_type == "dahua":
+            script = test_dahua_connection(device)
+        elif device.machine_type == "etimeoffice":
+            script = test_etimeoffice_connection(device)
+        else:
+            script = render_connection_response(
+                "Connection unsuccessful",
+                "Please select a valid biometric device.",
+                "warning",
+            )
+    except Exception as error:
+        logger.error("Error in biometric_device_test", exc_info=True)
+        script = render_connection_response(
+            "Connection unsuccessful", "An unexpected error occurred.", "warning"
+        )
+
+    return HttpResponse(script)
 
 
 @login_required
 @install_required
 @hx_request_required
-@permission_required("biometric.add_biometricdevices")
-def biometric_device_test(request, device_id):
-    """
-    Test the connection with the specified biometric device.
+@permission_required("biometric.view_biometricdevices")
+def biometric_device_bulk_fetch_logs(request):
+    script = ""
+    zk_ids = request.GET.getlist("selected_device_ids")
+    zk_devices = BiometricDevices.objects.filter(id__in=zk_ids, machine_type="zk")
 
-    Parameters:
-    - request (HttpRequest): Django HttpRequest object.
-    - device_id (uuid): ID of the biometric device to test.
+    if not zk_devices:
+        messages.error(request, "")
+        script = render_connection_response(
+            _("Biometric device not supported."),
+            _(
+                "Bulk log fetching is currently available only for ZKTeco / eSSL devices. Support for other biometric systems will be added soon."
+            ),
+            "warning",
+        )
+        return HttpResponse(script)
 
-    Returns:
-    - HttpResponse: HTML response containing JavaScript code to display
-                    a notification about the connection test result.
-    """
-    device = BiometricDevices.objects.get(id=device_id)
-    if device.machine_type == "zk":
-        port_no = device.port
-        machine_ip = device.machine_ip
-        conn = None
-        # create ZK instance
-        zk_device = ZK(
-            machine_ip,
-            port=port_no,
-            timeout=5,
-            password=0,
-            force_udp=False,
-            ommit_ping=False,
+    attendance_count, error_message = zk_biometric_attendance_logs(zk_devices)
+    if isinstance(attendance_count, int):
+        script = render_connection_response(
+            _("Logs Fetched Successfully"),
+            _(
+                f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+            ),
+            "success",
         )
-        try:
-            conn = zk_device.connect()
-            conn.test_voice(index=0)
-            find_employees_in_zk(device_id)
-            script = """<script>
-                    Swal.fire({
-                      text: "Test connection successful.",
-                      icon: "success",
-                      showConfirmButton: false,
-                      timer: 1500,
-                      timerProgressBar: true,
-                      didClose: () => {
-                        location.reload();
-                        },
-                    });
-                    </script>
-                """
-        except Exception as error:
-            print(f"An error comes in biometric_device_test {error}")
-            script = """
-           <script>
-                Swal.fire({
-                  title : "Connection unsuccessful",
-                  text: "Please double-check the accuracy of the provided IP Address and Port Number for correctness",
-                  icon: "warning",
-                  showConfirmButton: false,
-                  timer: 3500,
-                  timerProgressBar: true,
-                  didClose: () => {
-                    location.reload();
-                    },
-                });
-            </script>
-            """
-        finally:
-            if conn:
-                conn.disconnect()
-    elif device.machine_type == "anviz":
-        payload = {
-            "header": {
-                "nameSpace": "authorize.token",
-                "nameAction": "token",
-                "version": "1.0",
-                "requestId": device.anviz_request_id,
-                "timestamp": "2022-10-21T07:39:07+00:00",
-            },
-            "payload": {"api_key": device.api_key, "api_secret": device.api_secret},
-        }
-        error = {
-            "header": {"nameSpace": "System", "name": "Exception"},
-            "payload": {"type": "AUTH_ERROR", "message": "AUTH_ERROR"},
-        }
-        script = """
-           <script>
-                Swal.fire({
-                  title : "Connection unsuccessful",
-                  text: "Please double-check the accuracy of the provided API Url , API Key and API Secret for correctness",
-                  icon: "warning",
-                  showConfirmButton: false,
-                  timer: 3500,
-                  timerProgressBar: true,
-                  didClose: () => {
-                    location.reload();
-                    },
-                });
-            </script>
-            """
-        try:
-            response = requests.post(device.api_url, json=payload, timeout=5)
-            if response.status_code != 200:
-                pass
-            api_response = response.json()
-            if api_response == error:
-                pass
-            else:
-                payload = api_response["payload"]
-                api_token = payload["token"]
-                api_expires = payload["expires"]
-                device.api_token = api_token
-                device.api_expires = api_expires
-                device.save()
-                anviz_device = AnvizBiometricDeviceManager(device_id)
-                attendance_records = anviz_device.get_attendance_records()
-                script = """<script>
-                    Swal.fire({
-                      text: "Test connection successful.",
-                      icon: "success",
-                      showConfirmButton: false,
-                      timer: 1500,
-                      timerProgressBar: true,
-                      didClose: () => {
-                        location.reload();
-                        },
-                    });
-                    </script>
-                """
-        except Exception as error:
-            pass
-    elif device.machine_type == "cosec":
-        cosec = COSECBiometric(
-            device.machine_ip,
-            device.port,
-            device.cosec_username,
-            device.cosec_password,
-            timeout=10,
+    elif "Authentication" in error_message:
+        script = render_connection_response(
+            _("Authentication Error"),
+            _("Double-check the provided IP, Port, and Password."),
+            "warning",
         )
-        response = cosec.basic_config()
-        if response.get("app"):
-            find_employees_in_cosec(device_id)
-            script = """<script>
-                    Swal.fire({
-                      text: "Test connection successful.",
-                      icon: "success",
-                      showConfirmButton: false,
-                      timer: 1500,
-                      timerProgressBar: true,
-                      didClose: () => {
-                        location.reload();
-                        },
-                    });
-                    </script>
-                """
-        else:
-            script = """
-           <script>
-                Swal.fire({
-                  title : "Connection unsuccessful",
-                  text: "Please double-check the accuracy of the provided Machine IP , Username and Password for correctness",
-                  icon: "warning",
-                  showConfirmButton: false,
-                  timer: 3500,
-                  timerProgressBar: true,
-                  didClose: () => {
-                    location.reload();
-                    },
-                });
-            </script>
-            """
     else:
-        script = """
-           <script>
-                Swal.fire({
-                  title : "Connection unsuccessful",
-                  text: "Please select a valid biometric device",
-                  icon: "warning",
-                  showConfirmButton: false,
-                  timer: 3500,
-                  timerProgressBar: true,
-                  didClose: () => {
-                    location.reload();
-                    },
-                });
-            </script>
-            """
+        script = render_connection_response(
+            _("Connection Unsuccessful"),
+            _(f"Please check the IP, Port, and Password. Error: {error_message}"),
+            "warning",
+        )
+    return HttpResponse(script)
+
+
+@login_required
+@install_required
+@hx_request_required
+@permission_required("biometric.view_biometricdevices")
+def biometric_device_fetch_logs(request, device_id=None):
+    """
+    Fetches biometric attendance logs from a specified device.
+
+    This view function connects to a biometric device based on the device type (zk, anviz, cosec, dahua, or etimeoffice)
+    and retrieves the attendance logs.
+    """
+    device = BiometricDevices.find(device_id)
+    if not device:
+        return HttpResponse("Device not found.", status=404)
+    script = ""
+    if device.machine_type == "zk":
+        attendance_count, error_message = zk_biometric_attendance_logs(device)
+        if isinstance(attendance_count, int):
+            script = render_connection_response(
+                _("Logs Fetched Successfully"),
+                _(
+                    f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+                ),
+                "success",
+            )
+        elif "Authentication" in error_message:
+            script = render_connection_response(
+                _("Authentication Error"),
+                _("Double-check the provided IP, Port, and Password."),
+                "warning",
+            )
+        else:
+            script = render_connection_response(
+                _("Connection Unsuccessful"),
+                _(f"Please check the IP, Port, and Password. Error: {error_message}"),
+                "warning",
+            )
+    elif device.machine_type == "anviz":
+        attendance_count = anviz_biometric_attendance_logs(device)
+        if isinstance(attendance_count, int):
+            script = render_connection_response(
+                _("Logs Fetched Successfully"),
+                _(
+                    f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+                ),
+                "success",
+            )
+        else:
+            script = render_connection_response(
+                _("Connection unsuccessful"),
+                _("API credentials might be incorrect."),
+                "warning",
+            )
+
+    elif device.machine_type == "cosec":
+        attendance_count = cosec_biometric_attendance_logs(device)
+        if isinstance(attendance_count, int):
+            script = render_connection_response(
+                _("Logs Fetched Successfully"),
+                _(
+                    f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+                ),
+                "success",
+            )
+        else:
+            script = render_connection_response(
+                _("Connection unsuccessful"),
+                _("Double-check the provided Machine IP, Username, and Password."),
+                "warning",
+            )
+    elif device.machine_type == "dahua":
+        attendance_count = dahua_biometric_attendance_logs(device)
+        if isinstance(attendance_count, int):
+            script = render_connection_response(
+                _("Logs Fetched Successfully"),
+                _(
+                    f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+                ),
+                "success",
+            )
+        else:
+            script = render_connection_response(
+                _("Connection unsuccessful"),
+                _("Double-check the provided Machine IP, Username, and Password."),
+                "warning",
+            )
+    elif device.machine_type == "etimeoffice":
+        attendance_count = etimeoffice_biometric_attendance_logs(device)
+        if isinstance(attendance_count, int):
+            script = render_connection_response(
+                _("Logs Fetched Successfully"),
+                _(
+                    f"Biometric attendance logs fetched successfully. Total records: {attendance_count}"
+                ),
+                "success",
+            )
+        else:
+            script = render_connection_response(
+                _("Connection unsuccessful"),
+                _("Double-check the provided API Url, Username, and Password"),
+                "warning",
+            )
+    else:
+        script = render_connection_response(
+            "Connection unsuccessful",
+            "Please select a valid biometric device.",
+            "warning",
+        )
 
     return HttpResponse(script)
 
@@ -864,19 +1043,27 @@ def zk_employees_fetch(device):
         device.machine_ip,
         port=device.port,
         timeout=1,
-        password=0,
+        password=int(device.zk_password),
         force_udp=False,
         ommit_ping=False,
     )
     conn = zk_device.connect()
     conn.enable_device()
     users = conn.get_users()
-    fingers = conn.get_templates()
+    try:  # 1002
+        fingers = conn.get_templates()
+    except:
+        fingers = []
+
+    bio_employees = BiometricEmployees.objects.filter(device_id=device)
+    bio_lookup = {bio.user_id: bio for bio in bio_employees}
+
     employees = []
     for user in users:
         user_id = user.user_id
         uid = user.uid
-        bio_id = BiometricEmployees.objects.filter(user_id=user_id).first()
+        bio_id = bio_lookup.get(user_id)
+
         if bio_id:
             employee = bio_id.employee_id
             employee_work_info = EmployeeWorkInformation.objects.filter(
@@ -927,7 +1114,7 @@ def cosec_employee_fetch(device_id):
     device = BiometricDevices.objects.get(id=device_id)
     employees = BiometricEmployees.objects.filter(device_id=device)
     cosec = COSECBiometric(
-        device.machine_ip, device.port, device.cosec_username, device.cosec_password
+        device.machine_ip, device.port, device.bio_username, device.bio_password
     )
     for employee in employees:
         user = cosec.get_cosec_user(user_id=employee.user_id)
@@ -961,7 +1148,7 @@ def find_employees_in_cosec(device_id):
     device = BiometricDevices.objects.get(id=device_id)
     employees = Employee.objects.filter(is_active=True).values_list("id", "badge_id")
     cosec = COSECBiometric(
-        device.machine_ip, device.port, device.cosec_username, device.cosec_password
+        device.machine_ip, device.port, device.bio_username, device.bio_password
     )
     existing_user_ids = BiometricEmployees.objects.filter(device_id=device).values_list(
         "user_id", flat=True
@@ -1000,7 +1187,12 @@ def find_employees_in_zk(device_id):
             "user_id", flat=True
         )
     )
-    zk_device = ZK(device.machine_ip, port=device.port, timeout=5)
+    zk_device = ZK(
+        device.machine_ip,
+        port=device.port,
+        password=int(device.zk_password),
+        timeout=60,
+    )
     conn = zk_device.connect()
     zk_users = {user.user_id: user.uid for user in conn.get_users()}
     biometric_employees_to_create = [
@@ -1011,11 +1203,7 @@ def find_employees_in_zk(device_id):
             device_id_id=device_id,
         )
         for employee_id, badge_id in employees
-        if badge_id
-        and badge_id.isalnum()
-        and len(badge_id) <= 9
-        and badge_id in zk_users
-        and badge_id not in existing_user_ids
+        if badge_id and badge_id in zk_users and badge_id not in existing_user_ids
     ]
     BiometricEmployees.objects.bulk_create(biometric_employees_to_create)
     conn.disconnect()
@@ -1070,13 +1258,33 @@ def biometric_device_employees(request, device_id, **kwargs):
                     "pd": previous_data,
                 }
                 return render(request, "biometric/view_cosec_employees.html", context)
+            if device.machine_type == "dahua":
+                employees = BiometricEmployees.objects.filter(device_id=device_id)
+                context = {
+                    "device_id": device.id,
+                    "employees": employees,
+                }
+                return render(
+                    request, "biometric_users/dahua/view_dahua_employees.html", context
+                )
+            if device.machine_type == "etimeoffice":
+                employees = BiometricEmployees.objects.filter(device_id=device_id)
+                context = {
+                    "device_id": device.id,
+                    "employees": employees,
+                }
+                return render(
+                    request,
+                    "biometric_users/etimeoffice/view_etimeoffice_employees.html",
+                    context,
+                )
         except Exception as error:
-            print(f"An error occurred: {error}")
+            logger.error("An error occurred: ", error)
             messages.info(
                 request,
                 _(
                     "Failed to establish a connection. Please verify the accuracy of the IP\
-                    Address and Port No. of the device."
+                    Address , Port No. and Password of the device."
                 ),
             )
     else:
@@ -1110,7 +1318,8 @@ def search_employee_device(request):
         employees = zk_employees_fetch(device)
         if search:
             search_employees = BiometricEmployees.objects.filter(
-                employee_id__employee_first_name__icontains=search
+                Q(employee_id__employee_first_name__icontains=search)
+                | Q(employee_id__employee_last_name__icontains=search)
             )
             search_uids = search_employees.values_list("uid", flat=True)
             employees = [
@@ -1123,11 +1332,29 @@ def search_employee_device(request):
             "device_id": device_id,
             "pd": previous_data,
         }
+    elif device.machine_type == "dahua" or device.machine_type == "etimeoffice":
+        search_employees = BiometricEmployees.objects.filter(device_id=device)
+        if search:
+            search_employees = search_employees.filter(
+                Q(employee_id__employee_first_name__icontains=search)
+                | Q(employee_id__employee_last_name__icontains=search)
+            )
+        template = (
+            "biometric_users/dahua/list_dahua_employees.html"
+            if device.machine_type == "dahua"
+            else "biometric_users/etimeoffice/list_etimeoffice_employees.html"
+        )
+        context = {
+            "device_id": device.id,
+            "employees": search_employees,
+        }
+
     else:
         employees = cosec_employee_fetch(device_id)
         if search:
             search_employees = BiometricEmployees.objects.filter(
-                employee_id__employee_first_name__icontains=search, device_id=device
+                Q(employee_id__employee_first_name__icontains=search)
+                | Q(employee_id__employee_last_name__icontains=search)
             )
         else:
             search_employees = BiometricEmployees.objects.filter(device_id=device)
@@ -1171,8 +1398,8 @@ def delete_biometric_user(request, uid, device_id):
     zk_device = ZK(
         device.machine_ip,
         port=device.port,
-        timeout=5,
-        password=0,
+        timeout=60,
+        password=int(device.zk_password),
         force_udp=False,
         ommit_ping=False,
     )
@@ -1182,10 +1409,8 @@ def delete_biometric_user(request, uid, device_id):
     employee_bio.delete()
     messages.success(
         request,
-        _(
-            "{} successfully removed from the biometric device.".format(
-                employee_bio.employee_id
-            ),
+        _("{} successfully removed from the biometric device.").format(
+            employee_bio.employee_id
         ),
     )
     redirect_url = f"/biometric/biometric-device-employees/{device_id}/"
@@ -1213,8 +1438,8 @@ def enable_cosec_face_recognition(request, user_id, device_id):
         cosec = COSECBiometric(
             device.machine_ip,
             device.port,
-            device.cosec_username,
-            device.cosec_password,
+            device.bio_username,
+            device.bio_password,
         )
         enable_fr = cosec.enable_user_face_recognition(user_id=user_id, enable_fr=True)
         response_code = enable_fr.get("Response-Code")
@@ -1250,8 +1475,8 @@ def edit_cosec_user(request, user_id, device_id):
     cosec = COSECBiometric(
         device.machine_ip,
         device.port,
-        device.cosec_username,
-        device.cosec_password,
+        device.bio_username,
+        device.bio_password,
     )
     user = cosec.get_cosec_user(user_id)
     if user.get("name"):
@@ -1260,16 +1485,19 @@ def edit_cosec_user(request, user_id, device_id):
         day = int(user["validity-date-dd"])
         date_object = datetime(year, month, day)
         formatted_date = date_object.strftime("%Y-%m-%d")
-        form = COSECUserForm(
-            initial={
-                "name": user["name"],
-                "user_active": bool(int(user["user-active"])),
-                "vip": bool(int(user["vip"])),
-                "validity_enable": bool(int(user["validity-enable"])),
-                "validity_end_date": formatted_date,
-                "by_pass_finger": bool(int(user["by-pass-finger"])),
-            }
-        )
+        initial_data = {
+            "name": user["name"],
+            "user_active": bool(int(user["user-active"])),
+            "vip": bool(int(user["vip"])),
+            "validity_enable": bool(int(user["validity-enable"])),
+            "validity_end_date": formatted_date,
+        }
+
+        if "by-pass-finger" in user:
+            initial_data["by_pass_finger"] = bool(int(user["by-pass-finger"]))
+
+        form = COSECUserForm(initial=initial_data)
+
         if request.method == "POST":
             form = COSECUserForm(request.POST)
             if form.is_valid():
@@ -1304,7 +1532,7 @@ def edit_cosec_user(request, user_id, device_id):
                     messages.success(
                         request, _("Biometric user data updated successfully")
                     )
-                    return HttpResponse("<script>window.location.reload()</script>")
+                    return SolichRedirect(request)
                 if update_user.get("error"):
                     error = update_user.get("error")
                     if "validity-date-yyyy" in error:
@@ -1325,7 +1553,7 @@ def edit_cosec_user(request, user_id, device_id):
 @login_required
 @install_required
 @permission_required("biometric.delete_biometricemployees")
-def delete_Solich_cosec_user(request, user_id, device_id):
+def delete_solich_cosec_user(request, user_id, device_id):
     """
     View function to delete a user from a COSEC biometric device and database.
 
@@ -1346,18 +1574,16 @@ def delete_Solich_cosec_user(request, user_id, device_id):
         cosec = COSECBiometric(
             device.machine_ip,
             device.port,
-            device.cosec_username,
-            device.cosec_password,
+            device.bio_username,
+            device.bio_password,
         )
         response = cosec.delete_cosec_user(user_id)
         if response.get("Response-Code") and response.get("Response-Code") == "0":
             employee_bio.delete()
             messages.success(
                 request,
-                _(
-                    "{} successfully removed from the biometric device.".format(
-                        employee_bio.employee_id
-                    ),
+                _("{} successfully removed from the biometric device.").format(
+                    employee_bio.employee_id
                 ),
             )
         else:
@@ -1395,8 +1621,8 @@ def bio_users_bulk_delete(request):
         zk_device = ZK(
             device.machine_ip,
             port=device.port,
-            timeout=5,
-            password=0,
+            timeout=60,
+            password=int(device.zk_password),
             force_udp=False,
             ommit_ping=False,
         )
@@ -1409,14 +1635,12 @@ def bio_users_bulk_delete(request):
             conn.refresh_data()
             messages.success(
                 request,
-                _(
-                    "{} successfully removed from the biometric device.".format(
-                        employee_bio.employee_id
-                    ),
+                _("{} successfully removed from the biometric device.").format(
+                    employee_bio.employee_id
                 ),
             )
     except Exception as error:
-        print(f"An error occurred: {error}")
+        logger.error("An error occurred: ", error)
     return JsonResponse({"messages": "Success"})
 
 
@@ -1441,8 +1665,8 @@ def cosec_users_bulk_delete(request):
         cosec = COSECBiometric(
             device.machine_ip,
             device.port,
-            device.cosec_username,
-            device.cosec_password,
+            device.bio_username,
+            device.bio_password,
         )
         for user_id in ids:
             cosec.delete_cosec_user(user_id=user_id)
@@ -1458,7 +1682,7 @@ def cosec_users_bulk_delete(request):
             )
 
     except Exception as error:
-        print(f"An error occurred: {error}")
+        logger.error("An error occurred: ", error)
     return JsonResponse({"messages": "Success"})
 
 
@@ -1494,8 +1718,8 @@ def add_biometric_user(request, device_id):
                 zk_device = ZK(
                     device.machine_ip,
                     port=device.port,
-                    timeout=5,
-                    password=0,
+                    timeout=60,
+                    password=int(device.zk_password),
                     force_udp=False,
                     ommit_ping=False,
                 )
@@ -1527,7 +1751,8 @@ def add_biometric_user(request, device_id):
                             user_id=str(user_id),
                             card=0,
                         )
-                        # The ZK Biometric user ID must be a character value that can be converted to an integer.
+                        # The ZK Biometric user ID must be a character value
+                        # that can be converted to an integer.
                         BiometricEmployees.objects.create(
                             uid=uid,
                             user_id=str(user_id),
@@ -1536,25 +1761,21 @@ def add_biometric_user(request, device_id):
                         )
                         messages.success(
                             request,
-                            _(
-                                "{} added to biometric device successfully".format(
-                                    employee
-                                ),
+                            _("{} added to biometric device successfully").format(
+                                employee
                             ),
                         )
                     else:
                         messages.info(
                             request,
-                            _(
-                                "{} already added to biometric device".format(employee),
-                            ),
+                            _("{} already added to biometric device").format(employee),
                         )
             else:
                 cosec = COSECBiometric(
                     device.machine_ip,
                     device.port,
-                    device.cosec_username,
-                    device.cosec_password,
+                    device.bio_username,
+                    device.bio_password,
                 )
                 basic = cosec.basic_config()
                 if basic.get("app"):
@@ -1592,13 +1813,222 @@ def add_biometric_user(request, device_id):
         except Exception as error:
             if device.machine_type == "zk":
                 conn.disable_device()
-                print(f"An error occurred: {str(error)}")
-        return HttpResponse("<script>window.location.reload()</script>")
+                logger.error("An error occurred: ", str(error))
+        return SolichRedirect(request)
     return render(
         request,
         "biometric/add_biometric_user.html",
         context={"form": employee_add_form, "device_id": device_id},
     )
+
+
+@login_required
+@install_required
+@hx_request_required
+def map_biometric_users(request, device_id):
+    """
+    Maps an solich employee to a biometric user on a specified biometric device.
+    """
+    device = BiometricDevices.find(device_id)
+    form = MapBioUsers(request.POST or None)
+    template = "biometric_users/dahua/map_dahua_users.html"
+
+    if device.machine_type == "etimeoffice":
+        template = "biometric_users/etimeoffice/map_etimeoffice_users.html"
+        form.fields["user_id"].label = _("Emp Code")
+
+    if request.method == "POST" and form.is_valid():
+        user_id = form.cleaned_data["user_id"]
+        employee = form.cleaned_data["employee_id"]
+        if device and employee:
+            BiometricEmployees.objects.create(
+                user_id=user_id, employee_id=employee, device_id=device
+            )
+
+            messages.success(
+                request,
+                _("Selected employee successfully mapped to the biometric user"),
+            )
+            form = MapBioUsers()
+
+            if device.machine_type == "etimeoffice":
+                form.fields["user_id"].label = _("Emp Code")
+
+    return render(
+        request,
+        template,
+        {"form": form, "device_id": device_id},
+    )
+
+
+@login_required
+@install_required
+@hx_request_required
+def add_dahua_biometric_user(request, device_id):
+    """
+    Adds a new employee to a Dahua biometric device.
+
+    This view handles the process of adding an employee as a user to a Dahua biometric device.
+    """
+    device = BiometricDevices.find(device_id)
+    form = DahuaUserForm()
+    if request.method == "POST":
+        form = DahuaUserForm(request.POST)
+        if form.is_valid():
+            employee_id = form.cleaned_data["employee"]
+            card_no = form.cleaned_data["card_no"]
+            user_id = form.cleaned_data["user_id"]
+            card_status = form.cleaned_data["card_status"]
+            card_type = form.cleaned_data["card_type"]
+            password = form.cleaned_data["password"]
+            valid_date_end = form.cleaned_data["valid_date_end"]
+
+            try:
+                employee = Employee.objects.get(id=employee_id) if employee_id else None
+            except Employee.DoesNotExist:
+                messages.error(request, _("Employee not found."))
+                return render(
+                    request, "biometric_users/dahua/add_dahua_user.html", context
+                )
+
+            dahua = DahuaAPI(
+                ip=device.machine_ip,
+                username=device.bio_username,
+                password=device.bio_password,
+            )
+
+            response = dahua.enroll_new_user(
+                card_name=employee.get_full_name() if employee else "",
+                card_no=card_no,
+                user_id=user_id,
+                card_status=card_status,
+                card_type=card_type,
+                password=password,
+                valid_date_end=valid_date_end,
+            )
+
+            if response.get("status_code") == 200:
+                BiometricEmployees.objects.create(
+                    dahua_card_no=card_no,
+                    user_id=user_id,
+                    employee_id=employee,
+                    device_id=device,
+                )
+                messages.success(
+                    request,
+                    _("{} added to biometric device successfully").format(
+                        employee.get_full_name() if employee else ""
+                    ),
+                )
+                form = DahuaUserForm()
+            else:
+                messages.error(request, _("Failed to add user to biometric device."))
+    context = {"form": form, "device_id": device_id}
+    return render(request, "biometric_users/dahua/add_dahua_user.html", context)
+
+
+@login_required
+@hx_request_required
+@install_required
+def find_employee_badge_id(request):
+    """
+    Retrieves the badge ID of an employee based on their employee ID.
+    """
+    employee_id = request.GET.get("employee")
+    user_id = Employee.objects.get(id=employee_id).badge_id if employee_id else ""
+    input_field = f"""
+    <input type="text" name="user_id" maxlength="50" class="oh-input w-100"
+           placeholder="User ID" required="" id="id_user_id" value="{user_id}">
+    """
+    return HttpResponse(input_field)
+
+
+@login_required
+@hx_request_required
+@install_required
+def delete_dahua_user(request, obj_id=None):
+    """
+    Deletes a Dahua biometric user or multiple users from a device.
+    """
+    script = "<script>window.location.reload();</script>"
+    try:
+        if request.method == "POST" and obj_id:
+            user = BiometricEmployees.objects.get(id=obj_id)
+            user.delete()
+            messages.success(
+                request, _("{} successfully deleted!").format(user.employee_id)
+            )
+            script = "<script>reloadMessage();</script>"
+        if request.method == "DELETE":
+            user_ids = request.GET.getlist("ids")
+            device_id = request.GET.get("device_id")
+            if device_id:
+                script = f"""
+                            <span hx-get="/biometric/biometric-device-employees/{device_id}/"
+                                hx-target="#dahuUsersList" hx-select="#dahuUsersList" hx-trigger="load delay:200ms"
+                                hx-swap="outerHTML" hx-on-htmx-before-request="reloadMessage();">
+                            </span>
+                        """
+            if user_ids:
+                users = BiometricEmployees.objects.filter(user_id__in=user_ids)
+                if users:
+                    count = users.count()
+                    users.delete()
+                    messages.success(
+                        request, _("{} users successfully deleted!").format(count)
+                    ),
+                else:
+                    messages.warning(
+                        request,
+                        _("No rows are selected for deleting users from device."),
+                    )
+    except Exception as e:
+        messages.error(request, _("An error occurred: {}").format(str(e)))
+    return HttpResponse(script)
+
+
+@login_required
+@install_required
+@hx_request_required
+@permission_required("biometric.delete_biometricemployees")
+def delete_etimeoffice_user(request, obj_id=None):
+    """
+    Deletes a user or multiple users from the eTimeOffice biometric system.
+    """
+    script = "<script>window.location.href = '/';</script>"
+    if request.method == "POST":
+        user = BiometricEmployees.objects.get(id=obj_id)
+        device_id = user.device_id.id
+        user.delete()
+        messages.success(
+            request, _("{} successfully deleted!").format(user.employee_id)
+        )
+        script = "<script>reloadMessage();</script>"
+    if request.method == "DELETE":
+        user_ids = request.GET.getlist("ids")
+        device_id = request.GET.get("device_id")
+        if device_id:
+            script = f"""
+                            <span hx-get="/biometric/biometric-device-employees/{device_id}/"
+                                hx-target="#eTimeOfficeUsersList" hx-select="#eTimeOfficeUsersList" hx-trigger="load delay:200ms"
+                                hx-swap="outerHTML" hx-on-htmx-before-request="reloadMessage();">
+                            </span>
+                        """
+        if user_ids:
+            users = BiometricEmployees.objects.filter(user_id__in=user_ids)
+            if users:
+                count = users.count()
+                users.delete()
+                messages.success(
+                    request, _("{} users successfully deleted!").format(count)
+                ),
+            else:
+                messages.warning(
+                    request,
+                    _("No rows are selected for deleting users from device."),
+                )
+
+    return HttpResponse(script)
 
 
 @login_required
@@ -1619,25 +2049,48 @@ def biometric_device_live(request):
     if is_live:
         port_no = device.port
         machine_ip = device.machine_ip
+        password = int(device.zk_password)
         conn = None
         # create ZK instance
-        zk_device = ZK(
-            machine_ip,
-            port=port_no,
-            timeout=5,
-            password=0,
-            force_udp=False,
-            ommit_ping=False,
-        )
         try:
-            conn = zk_device.connect()
-            instance = ZKBioAttendance(machine_ip, port_no)
-            conn.test_voice(index=14)
-            if conn:
-                device.is_live = True
-                device.is_scheduler = False
-                device.save()
-                instance.start()
+            if device.machine_type == "zk":
+                zk_device = ZK(
+                    machine_ip,
+                    port=port_no,
+                    timeout=60,
+                    password=int(password),
+                    force_udp=False,
+                    ommit_ping=False,
+                )
+                conn = zk_device.connect()
+                instance = ZKBioAttendance(machine_ip, port_no, password)
+                conn.test_voice(index=14)
+                if conn:
+                    device.is_live = True
+                    device.is_scheduler = False
+                    device.save()
+                    instance.start()
+            elif device.machine_type == "cosec":
+                cosec = COSECBiometric(
+                    device.machine_ip,
+                    device.port,
+                    device.bio_username,
+                    device.bio_password,
+                    timeout=10,
+                )
+                response = cosec.basic_config()
+                if response.get("app"):
+                    device.is_live = True
+                    device.is_scheduler = False
+                    device.save()
+                    thread = COSECBioAttendanceThread(device.id)
+                    thread.start()
+                    settings.BIO_DEVICE_THREADS[device.id] = thread
+                else:
+                    raise TimeoutError
+            else:
+                pass
+
             script = """<script>
                     Swal.fire({
                       text: "The live capture mode has been activated successfully.",
@@ -1646,7 +2099,7 @@ def biometric_device_live(request):
                       timer: 1500,
                       timerProgressBar: true, // Show a progress bar as the timer counts down
                       didClose: () => {
-                        location.reload(); // Reload the page after the SweetAlert is closed
+                        location.reload();
                         },
                     });
                     </script>
@@ -1654,7 +2107,7 @@ def biometric_device_live(request):
         except TimeoutError as error:
             device.is_live = False
             device.save()
-            print(f"An error comes in biometric_device_live {error}")
+            logger.error("An error comes in biometric_device_live", error)
             script = """
            <script>
                 Swal.fire({
@@ -1676,6 +2129,12 @@ def biometric_device_live(request):
     else:
         device.is_live = False
         device.save()
+        if device.machine_type == "cosec":
+            existing_thread = settings.BIO_DEVICE_THREADS.get(device.id)
+            if existing_thread:
+                existing_thread.stop()
+                del settings.BIO_DEVICE_THREADS[device.id]
+
         script = """
            <script>
                 Swal.fire({
@@ -1693,126 +2152,247 @@ def biometric_device_live(request):
     return HttpResponse(script)
 
 
-def zk_biometric_device_attendance(device_id):
+def zk_biometric_attendance_logs(device_or_devices):
     """
-    Retrieve attendance records from a ZK biometric device and update the clock-in/clock-out status.
+    Retrieve and process attendance logs from one or more ZKTeco biometric devices.
 
-    :param device_id: The ID of the ZK biometric device.
+    Handles scenarios where the same user_id may exist across multiple devices for the same employee.
+
+    :param device_or_devices: A single BiometricDevice instance or a queryset/list of them.
+    :return: Tuple (number_of_attendance_processed, error_message or None)
     """
-    device = BiometricDevices.objects.get(id=device_id)
-    if device.is_scheduler:
+    if hasattr(device_or_devices, "__iter__") and not isinstance(
+        device_or_devices, dict
+    ):
+        devices = list(device_or_devices)
+    else:
+        devices = [device_or_devices]
+
+    errors = []
+    combined_attendances = []
+    patch_direction = {"in": 0, "out": 1}
+
+    bio_id_map = {
+        (bio.device_id_id, bio.user_id): bio
+        for bio in BiometricEmployees.objects.filter(device_id__in=devices)
+    }
+
+    for device in devices:
         port_no = device.port
         machine_ip = device.machine_ip
         conn = None
         zk_device = ZK(
             machine_ip,
             port=port_no,
-            timeout=5,
-            password=0,
+            timeout=60,
+            password=int(device.zk_password),
             force_udp=False,
             ommit_ping=False,
         )
+
         try:
             conn = zk_device.connect()
             conn.enable_device()
             attendances = conn.get_attendance()
+            if not attendances:
+                continue
+
             last_attendance_datetime = attendances[-1].timestamp
+
             if device.last_fetch_date and device.last_fetch_time:
-                filtered_attendances = [
-                    attendance
-                    for attendance in attendances
-                    if attendance.timestamp.date() >= device.last_fetch_date
-                    and attendance.timestamp.time() > device.last_fetch_time
+                filtered = [
+                    att
+                    for att in attendances
+                    if (att.timestamp.date() > device.last_fetch_date)
+                    or (
+                        att.timestamp.date() == device.last_fetch_date
+                        and att.timestamp.time() > device.last_fetch_time
+                    )
                 ]
             else:
-                filtered_attendances = attendances
+                filtered = attendances
+
+            # Update last fetch markers
             device.last_fetch_date = last_attendance_datetime.date()
             device.last_fetch_time = last_attendance_datetime.time()
             device.save()
-            for attendance in filtered_attendances:
-                user_id = attendance.user_id
-                punch_code = attendance.punch
-                date_time = attendance.timestamp
-                date = date_time.date()
-                time = date_time.time()
-                bio_id = BiometricEmployees.objects.filter(user_id=user_id).first()
-                if bio_id:
-                    request_data = Request(
-                        user=bio_id.employee_id.employee_user_id,
-                        date=date,
-                        time=time,
-                        datetime=date_time,
-                    )
-                    if punch_code in {0, 3, 4}:
-                        try:
-                            clock_in(request_data)
-                        except Exception as error:
-                            print(f"Got an error : {error}")
-                    else:
-                        try:
-                            clock_out(request_data)
-                        except Exception as error:
-                            print(f"Got an error : {error}")
-        except Exception as error:
-            print(f"Process terminate : {error}")
+            for attendance in filtered:
+                attendance.device = device  # Attach device info
+                attendance.punch = (
+                    patch_direction[device.device_direction]
+                    if device.device_direction in patch_direction
+                    else attendance.punch
+                )  # Update punch code based on device direction
+                combined_attendances.append(attendance)
+
+        except zk_exception.ZKErrorResponse as e:
+            errors.append(f"[{device.name}] ZKError: {str(e)}")
+        except Exception as e:
+            logger.error(f"[{device.name}] General Error", exc_info=True)
+            errors.append(f"[{device.name}] Error: {str(e)}")
         finally:
             if conn:
                 conn.disconnect()
 
+    # Sort all filtered attendances by time
+    combined_attendances.sort(key=lambda a: a.timestamp)
 
-def anviz_biometric_device_attendance(device_id):
-    """
-    Retrieves attendance records from an Anviz biometric device and processes them.
-
-    :param device_id: The Object Id of the Anviz biometric device.
-    """
-    device = BiometricDevices.objects.get(id=device_id)
-    if device.is_scheduler:
-        anviz_device = AnvizBiometricDeviceManager(device_id)
-        attendance_records = anviz_device.get_attendance_records()
-        for attendance in attendance_records["payload"]["list"]:
-            badge_id = attendance["employee"]["workno"]
-            punch_code = attendance["checktype"]
-            date_time_obj = datetime.strptime(
-                attendance["checktime"], "%Y-%m-%dT%H:%M:%S%z"
+    for attendance in combined_attendances:
+        user_id = attendance.user_id
+        punch_code = attendance.punch
+        date_time = django_timezone.make_aware(attendance.timestamp)
+        date = date_time.date()
+        time = date_time.time()
+        device_id = attendance.device.id
+        bio_id = bio_id_map.get((device_id, user_id))
+        if bio_id:
+            request_data = Request(
+                user=bio_id.employee_id.employee_user_id,
+                date=date,
+                time=time,
+                datetime=date_time,
             )
-            target_timezone = pytz.timezone(settings.TIME_ZONE)
-            date_time_obj = date_time_obj.astimezone(target_timezone)
-            employee = Employee.objects.filter(badge_id=badge_id).first()
-            if employee:
-                request_data = Request(
-                    user=employee.employee_user_id,
-                    date=date_time_obj.date(),
-                    time=date_time_obj.time(),
-                    datetime=date_time_obj,
+            try:
+                if punch_code in {0, 3, 4}:
+                    clock_in(request_data)
+                elif punch_code in {1, 2, 5}:
+                    clock_out(request_data)
+            except Exception:
+                logger.error(
+                    f"[Device: {attendance.device.name}] Punch processing error",
+                    exc_info=True,
                 )
+
+    return len(combined_attendances), "; ".join(errors) if errors else None
+
+
+def zk_biometric_attendance_scheduler(device_id):
+    """
+    Scheduler function used for attendance logs
+    """
+    device = BiometricDevices.find(device_id)
+    if device and device.is_scheduler:
+        zk_biometric_attendance_logs(device)
+
+
+def anviz_biometric_attendance_logs(device):
+    """
+    Retrieves attendance records from an Anviz biometric device
+    and processes them based on device direction configuration.
+    """
+
+    current_utc_time = datetime.utcnow()
+
+    anviz_device = CrossChexCloudAPI(
+        api_url=device.api_url,
+        api_key=device.api_key,
+        api_secret=device.api_secret,
+        anviz_request_id=device.anviz_request_id,
+    )
+
+    begin_time = (
+        datetime.combine(device.last_fetch_date, device.last_fetch_time)
+        if device.last_fetch_date and device.last_fetch_time
+        else current_utc_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+
+    attendance_records = anviz_device.get_attendance_records(
+        begin_time=begin_time,
+        token=device.api_token,
+    )
+
+    # Update last fetch time immediately
+    device.last_fetch_date = current_utc_time.date()
+    device.last_fetch_time = current_utc_time.time()
+    device.save(update_fields=["last_fetch_date", "last_fetch_time"])
+
+    processed_count = 0
+
+    for attendance in attendance_records.get("list", []):
+        badge_id = attendance["employee"]["workno"]
+        punch_code = attendance["checktype"]
+
+        date_time_utc = datetime.strptime(
+            attendance["checktime"], "%Y-%m-%dT%H:%M:%S%z"
+        )
+        date_time_obj = date_time_utc.astimezone(django_timezone.get_current_timezone())
+
+        employee = Employee.objects.filter(badge_id=badge_id).first()
+        if not employee:
+            continue
+
+        request_data = Request(
+            user=employee.employee_user_id,
+            date=date_time_obj.date(),
+            time=date_time_obj.time(),
+            datetime=date_time_obj,
+        )
+
+        try:
+            # --------------------------------------------------
+            # SYSTEM DIRECTION (auto based on punch code)
+            # --------------------------------------------------
+            if device.device_direction == "system":
                 if punch_code in {0, 128}:
-                    try:
-                        clock_in(request_data)
-                    except Exception as error:
-                        print(f"Error in clock in {error}")
+                    clock_in(request_data)
                 else:
-                    try:
-                        # // 1 , 129 check type check out and door close
-                        clock_out(request_data)
-                    except Exception as error:
-                        print(f"Error in clock out {error}")
+                    clock_out(request_data)
+
+            # --------------------------------------------------
+            # FORCE IN DEVICE
+            # --------------------------------------------------
+            elif device.device_direction == "in":
+                clock_in(request_data)
+
+            # --------------------------------------------------
+            # FORCE OUT DEVICE
+            # --------------------------------------------------
+            elif device.device_direction == "out":
+                clock_out(request_data)
+
+            # --------------------------------------------------
+            # ALTERNATE IN / OUT DEVICE
+            # --------------------------------------------------
+            elif device.device_direction == "alternate":
+                last_activity = (
+                    AttendanceActivity.objects.filter(
+                        employee_id=employee,
+                        attendance_date=date_time_obj.date(),
+                    )
+                    .order_by("-in_datetime", "-out_datetime")
+                    .first()
+                )
+
+                # If no record or last record has clock_out → IN
+                if not last_activity or last_activity.clock_out:
+                    clock_in(request_data)
+                else:
+                    clock_out(request_data)
+
+            processed_count += 1
+
+        except Exception as error:
+            logger.error(
+                f"Attendance sync failed for employee {employee.id}",
+                exc_info=error,
+            )
+
+    return processed_count
 
 
-def cosec_biometric_device_attendance(device_id):
+def anviz_biometric_attendance_scheduler(device_id):
     """
-    Retrieve and process attendance events from a COSEC biometric device.
-
-    This function fetches attendance events from the specified COSEC biometric device
-    and processes them to record clock-in and clock-out events for employees.
-
-    Args:
-        device_id (uuid): The ID of the COSEC biometric device.
+    Schedules the attendance log retrieval for an Anviz biometric device.
     """
-    device = BiometricDevices.objects.get(id=device_id)
-    if not device.is_scheduler:
-        return
+    device = BiometricDevices.find(device_id)
+    if device and device.is_scheduler:
+        anviz_biometric_attendance_logs(device)
 
+
+def cosec_biometric_attendance_logs(device):
+    """
+    Retrieves and processes attendance logs from a COSEC biometric device.
+    """
     device_args = COSECAttendanceArguments.objects.filter(device_id=device).first()
     last_fetch_roll_ovr_count = (
         int(device_args.last_fetch_roll_ovr_count) if device_args else 0
@@ -1822,19 +2402,16 @@ def cosec_biometric_device_attendance(device_id):
     cosec = COSECBiometric(
         device.machine_ip,
         device.port,
-        device.cosec_username,
-        device.cosec_password,
+        device.bio_username,
+        device.bio_password,
         timeout=10,
     )
     attendances = cosec.get_attendance_events(
-        last_fetch_roll_ovr_count, last_fetch_seq_number
+        last_fetch_roll_ovr_count, int(last_fetch_seq_number) + 1
     )
 
     if not isinstance(attendances, list):
         return
-
-    if device_args and attendances:
-        attendances.pop(0)
 
     for attendance in attendances:
         ref_user_id = attendance["detail-1"]
@@ -1853,18 +2430,18 @@ def cosec_biometric_device_attendance(device_id):
             user=employee.employee_id.employee_user_id,
             date=attendance_date,
             time=attendance_time,
-            datetime=attendance_datetime,
+            datetime=django_timezone.make_aware(attendance_datetime),
         )
 
         try:
-            if punch_code in ["1", "3", "5", "7", "9"]:
+            if punch_code in ["1", "3", "5", "7", "9", "0"]:
                 clock_in(request_data)
             elif punch_code in ["2", "4", "6", "8", "10"]:
                 clock_out(request_data)
             else:
                 pass
         except Exception as error:
-            print(f"Error processing attendance: {error}")
+            logger.error("Error processing attendance: ", error)
 
     if attendances:
         last_attendance = attendances[-1]
@@ -1875,6 +2452,183 @@ def cosec_biometric_device_attendance(device_id):
                 "last_fetch_seq_number": last_attendance["seq-No"],
             },
         )
+    return len(attendances)
+
+
+def cosec_biometric_attendance_scheduler(device_id):
+    """
+    Retrieve and process attendance events from a COSEC biometric device.
+
+    This function fetches attendance events from the specified COSEC biometric device
+    and processes them to record clock-in and clock-out events for employees.
+
+    Args:
+        device_id (uuid): The ID of the COSEC biometric device.
+    """
+    device = BiometricDevices.find(device_id)
+    if device and device.is_scheduler:
+        cosec_biometric_attendance_logs(device)
+
+
+def dahua_biometric_attendance_logs(device):
+    """
+    Retrieves logs from a Dahua biometric device and marks attendance in Solich.
+
+    This function fetches biometric logs from the specified device, processes the attendance records,
+    and updates the attendance system in Solich. If an employee has an active clock-in record,
+    it marks their clock-out; otherwise, it registers a new clock-in entry.
+
+    Args:
+        device_id (int): The unique identifier of the biometric device.
+
+    Returns:
+        None
+    """
+    begin_time = (
+        datetime.combine(device.last_fetch_date, device.last_fetch_time)
+        + timedelta(seconds=1)
+        if device.last_fetch_date and device.last_fetch_time
+        else datetime.combine(datetime.today(), datetime.min.time())
+    )
+
+    dahua = DahuaAPI(
+        ip=device.machine_ip, username=device.bio_username, password=device.bio_password
+    )
+    logs = dahua.get_control_card_rec(start_time=begin_time)
+
+    if logs.get("status_code") == 200:
+        for log in logs.get("records", []):
+            user_id = log.get("user_id")
+            if not user_id:
+                continue
+
+            employee = BiometricEmployees.objects.filter(
+                user_id=user_id, device_id=device
+            ).first()
+            if not employee:
+                continue
+
+            attendance_datetime = log.get("create_time")
+            user_tz = pytz.timezone(TIME_ZONE)
+            attendance_datetime = attendance_datetime.astimezone(user_tz)
+
+            last_none_activity = (
+                AttendanceActivity.objects.filter(
+                    employee_id=employee.employee_id,
+                    clock_out=None,
+                )
+                .order_by("in_datetime")
+                .last()
+            )
+
+            request_data = Request(
+                user=employee.employee_id.employee_user_id,
+                date=attendance_datetime.date(),
+                time=attendance_datetime.time(),
+                datetime=attendance_datetime,
+            )
+
+            if last_none_activity:
+                clock_out(request_data)
+            else:
+                clock_in(request_data)
+
+        if logs.get("records"):
+            last_log = logs["records"][-1]
+            device.last_fetch_date = last_log["create_time"].date()
+            device.last_fetch_time = last_log["create_time"].time()
+            device.save()
+        return len(logs.get("records", []))
+    else:
+        return "error"
+
+
+def dahua_biometric_attendance_scheduler(device_id):
+    """
+    Schedules the attendance log retrieval for a Dahua biometric device.
+    """
+    device = BiometricDevices.find(device_id)
+    if device and device.is_scheduler:
+        dahua_biometric_attendance_logs(device)
+
+
+def etimeoffice_biometric_attendance_logs(device):
+    """
+    Retrieves and processes attendance logs from an eTimeOffice biometric device.
+    """
+    now = datetime.now()
+    etimeoffice = ETimeOfficeAPI(
+        username=device.bio_username,
+        password=device.bio_password,
+    )
+
+    from_date = (
+        f"{(datetime.combine(device.last_fetch_date, device.last_fetch_time) + timedelta(minutes=1)):%d/%m/%Y_%H:%M}"
+        if device.last_fetch_date and device.last_fetch_time
+        else f"{now:%d/%m/%Y}_00:00"
+    )
+    to_date = f"{now:%d/%m/%Y_%H:%M}"
+
+    logs = etimeoffice.download_punch_data(from_date=from_date, to_date=to_date)
+    if logs.get("Msg") != "Success":
+        return "error"
+
+    punch_data = logs.get("PunchData", [])
+    if not punch_data:
+        return 0
+
+    user_tz = pytz.timezone(TIME_ZONE)
+
+    employee_map = {
+        emp.user_id: emp for emp in BiometricEmployees.objects.filter(device_id=device)
+    }
+
+    for log in reversed(punch_data):
+        user_id = log.get("Empcode")
+        if not user_id or user_id not in employee_map:
+            continue
+
+        employee = employee_map[user_id]
+        attendance_datetime = log["PunchDate"].astimezone(user_tz)
+
+        request_data = Request(
+            user=employee.employee_id.employee_user_id,
+            date=attendance_datetime.date(),
+            time=attendance_datetime.time(),
+            datetime=attendance_datetime,
+        )
+
+        last_none_activity = (
+            AttendanceActivity.objects.filter(
+                employee_id=employee.employee_id,
+                clock_out=None,
+            )
+            .order_by("in_datetime")
+            .last()
+        )
+
+        if last_none_activity:
+            clock_out(request_data)
+        else:
+            clock_in(request_data)
+
+    last_log = punch_data[0]
+    device.last_fetch_date, device.last_fetch_time = (
+        last_log["PunchDate"].date(),
+        last_log["PunchDate"].time(),
+    )
+    device.save()
+
+    return len(punch_data)
+
+
+def etimeoffice_biometric_attendance_scheduler(device_id):
+    """
+    Schedules the attendance log retrieval for an eTimeOffice biometric device.
+    """
+    device = BiometricDevices.find(device_id)
+    if device and device.is_scheduler:
+        etimeoffice_biometric_attendance_logs(device)
 
 
 try:
@@ -1885,7 +2639,7 @@ try:
                 if device.machine_type == "anviz":
                     scheduler = BackgroundScheduler()
                     scheduler.add_job(
-                        lambda: anviz_biometric_device_attendance(device.id),
+                        lambda: anviz_biometric_attendance_scheduler(device.id),
                         "interval",
                         seconds=str_time_seconds(device.scheduler_duration),
                     )
@@ -1893,15 +2647,34 @@ try:
                 elif device.machine_type == "zk":
                     scheduler = BackgroundScheduler()
                     scheduler.add_job(
-                        lambda: zk_biometric_device_attendance(device.id),
+                        lambda: zk_biometric_attendance_scheduler(device.id),
+                        "interval",
+                        seconds=str_time_seconds(device.scheduler_duration),
+                        id=f"biometric_{device.id}",
+                    )
+                    scheduler.start()
+                elif device.machine_type == "dahua":
+                    scheduler = BackgroundScheduler()
+                    scheduler.add_job(
+                        lambda: dahua_biometric_attendance_scheduler(device.id),
                         "interval",
                         seconds=str_time_seconds(device.scheduler_duration),
                     )
                     scheduler.start()
+
                 elif device.machine_type == "cosec":
                     scheduler = BackgroundScheduler()
                     scheduler.add_job(
-                        lambda: cosec_biometric_device_attendance(device.id),
+                        lambda: cosec_biometric_attendance_scheduler(device.id),
+                        "interval",
+                        seconds=str_time_seconds(device.scheduler_duration),
+                    )
+                    scheduler.start()
+
+                elif device.machine_type == "etimeoffice":
+                    scheduler = BackgroundScheduler()
+                    scheduler.add_job(
+                        lambda: etimeoffice_biometric_attendance_scheduler(device.id),
                         "interval",
                         seconds=str_time_seconds(device.scheduler_duration),
                     )
@@ -1910,4 +2683,3 @@ try:
                     pass
 except:
     pass
-

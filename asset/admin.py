@@ -32,4 +32,3 @@ admin.site.register(AssetAssignment)
 admin.site.register(AssetLot)
 admin.site.register(AssetReport)
 admin.site.register(AssetDocuments)
-

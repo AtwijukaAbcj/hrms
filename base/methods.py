@@ -1,49 +1,346 @@
-import io
+import ast
+import calendar
+import contextlib
 import json
 import os
 import random
-from datetime import date, datetime, time
+import re
+from datetime import date, datetime, time, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
+import pdfkit
 from django.apps import apps
 from django.conf import settings
+from django.contrib.auth.models import Group
 from django.contrib.staticfiles import finders
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.paginator import Paginator
 from django.db import models
-from django.db.models import F, ForeignKey, ManyToManyField, OneToOneField
+from django.db.models import ForeignKey, ManyToManyField, OneToOneField, Q
 from django.db.models.functions import Lower
 from django.forms.models import ModelChoiceField
 from django.http import HttpResponse
-from django.template.loader import get_template, render_to_string
+from django.template.loader import render_to_string
 from django.utils.translation import gettext as _
-from xhtml2pdf import pisa
 
-from base.models import Company, DynamicPagination
+from base.models import (
+    Company,
+    CompanyLeaves,
+    DefaultExportPermission,
+    DynamicPagination,
+    Holidays,
+)
 from employee.models import Employee, EmployeeWorkInformation
-from solich.decorators import login_required
-from leave.models import LeaveRequest, LeaveRequestConditionApproval
-from recruitment.models import Candidate
+from solich.solich_middlewares import _thread_locals
+
+CHART_CONFIG = {
+    "offline_employees": {
+        "app": "attendance",
+        "perm": "employee.view_employee",
+        "need_reporting_manager": True,
+    },
+    "online_employees": {
+        "app": "attendance",
+        "perm": "employee.view_employee",
+        "need_reporting_manager": True,
+    },
+    "overall_leave_chart": {
+        "app": "leave",
+        "perm": "leave.view_leaverequest",
+    },
+    "hired_candidates": {
+        "app": "recruitment",
+        "perm": "recruitment.view_candidate",
+        "need_stage_manager": True,
+    },
+    "onboarding_candidates": {
+        "app": "onboarding",
+        "perm": "recruitment.view_candidate",
+        "need_stage_manager": True,
+    },
+    "recruitment_analytics": {
+        "app": "recruitment",
+        "perm": "recruitment.view_recruitment",
+        "need_stage_manager": True,
+    },
+    "attendance_analytic": {
+        "app": "attendance",
+        "perm": "attendance.view_attendance",
+        "need_reporting_manager": True,
+    },
+    "hours_chart": {
+        "app": "attendance",
+        "perm": "attendance.view_attendance",
+        "need_reporting_manager": True,
+    },
+    "objective_status": {
+        "app": "pms",
+        "perm": "pms.view_employeeobjective",
+        "need_reporting_manager": True,
+    },
+    "key_result_status": {
+        "app": "pms",
+        "perm": "pms.view_employeekeyresult",
+        "need_reporting_manager": True,
+    },
+    "feedback_status": {
+        "app": "pms",
+        "perm": "pms.view_feedback",
+        "need_reporting_manager": True,
+    },
+    "shift_request_approve": {
+        "app": "base",
+        "perm": "base.change_shiftrequest",
+        "need_reporting_manager": True,
+    },
+    "work_type_request_approve": {
+        "app": "base",
+        "perm": "base.change_worktyperequest",
+        "need_reporting_manager": True,
+    },
+    "overtime_approve": {
+        "app": "attendance",
+        "perm": "attendance.change_attendance",
+        "need_reporting_manager": True,
+    },
+    "attendance_validate": {
+        "app": "attendance",
+        "perm": "attendance.change_attendance",
+        "need_reporting_manager": True,
+    },
+    "leave_request_approve": {
+        "app": "leave",
+        "perm": "leave.change_leaverequest",
+        "need_reporting_manager": True,
+    },
+    "leave_allocation_approve": {
+        "app": "leave",
+        "perm": "leave.change_leaveallocationrequest",
+        "need_reporting_manager": True,
+    },
+    "asset_request_approve": {
+        "app": "asset",
+        "perm": "asset.change_assetrequest",
+        "need_reporting_manager": True,
+    },
+    "employee_work_info": {
+        "app": "employee",
+        "perm": "employee.change_employee",
+        "need_reporting_manager": True,
+    },
+    "employees_chart": {"app": "employee"},
+    "gender_chart": {"app": "employee"},
+    "department_chart": {"app": "base"},
+}
+
+# Tokens that must never resolve in a user-supplied mail-template body —
+# they would leak password hashes, session metadata, or full request state.
+_FORBIDDEN_TEMPLATE_ATTRS = ("password", "username", "META", "session", "_state")
+_FORBIDDEN_TEMPLATE_TAGS = ("debug", "load")
 
 
-def filtersubordinates(request, queryset, perm=None, field=None):
+def sanitize_mail_template_body(body):
     """
-    This method is used to filter out subordinates queryset element.
+    Strip dangerous Django-template constructs from a user-supplied mail body.
+
+    Mail-preview endpoints render arbitrary user-supplied bodies through the
+    Django template engine, which exposes attribute traversal on any object
+    in the context (User.password, request.META, etc.). This function removes
+    variable expressions that reference forbidden attributes and removes
+    forbidden template tags. It does not aim to be a full Django-template
+    parser; it normalizes whitespace inside `{{ ... }}` / `{% ... %}` so
+    obvious bypasses like `{{ request . user . password }}` are also caught.
+    """
+    if not body:
+        return body
+
+    def _strip_variable(match):
+        # Normalize: remove all whitespace inside {{ ... }} so
+        # `{{ a . password }}` and `{{a.password|upper}}` both collapse to
+        # a single token we can inspect.
+        inner = re.sub(r"\s+", "", match.group(1))
+        # Split filters off: `a.password|upper` -> `a.password`
+        var_path = inner.split("|", 1)[0]
+        parts = var_path.split(".")
+        if any(part in _FORBIDDEN_TEMPLATE_ATTRS for part in parts):
+            return ""
+        return match.group(0)
+
+    def _strip_tag(match):
+        inner = match.group(1).strip()
+        tag_name = inner.split(None, 1)[0] if inner else ""
+        if tag_name in _FORBIDDEN_TEMPLATE_TAGS:
+            return ""
+        return match.group(0)
+
+    body = re.sub(r"\{\{(.*?)\}\}", _strip_variable, body, flags=re.DOTALL)
+    body = re.sub(r"\{%(.*?)%\}", _strip_tag, body, flags=re.DOTALL)
+    return body
+
+
+def sanitize_mail_template_placeholders(body, allowed_template_words):
+    """
+    Keep only known-safe ``{{ ... }}`` placeholders in user-provided mail bodies.
+
+    Args:
+        body (str): Raw user-provided HTML/template content.
+        allowed_template_words (set[str]): Allowed placeholder expressions like
+            ``instance.get_full_name`` or ``instance.get_interview|safe``.
+
+    Returns:
+        str: Body with unknown template variables and all template tags removed.
+    """
+    if not body:
+        return body
+
+    allowed_words = {
+        word.replace(" ", "") for word in (allowed_template_words or set())
+    }
+
+    def _keep_only_allowed_variable(match):
+        original = match.group(0)
+        # Normalize whitespace so bypasses like `{{ instance . get_full_name }}`
+        # compare against the canonical allowlist entries.
+        expression = re.sub(r"\s+", "", match.group(1))
+        return original if expression in allowed_words else ""
+
+    # Keep only allowlisted variables.
+    body = re.sub(
+        r"\{\{(.*?)\}\}",
+        _keep_only_allowed_variable,
+        body,
+        flags=re.DOTALL,
+    )
+    # Drop all `{% ... %}` blocks in previews (debug/if/for/load/etc.).
+    body = re.sub(r"\{%(.*?)%\}", "", body, flags=re.DOTALL)
+    return body
+
+
+def build_safe_template_request(request):
+    """
+    Build a sanitized request proxy for template rendering.
+
+    Keeps a `request` object available in context while preventing access to
+    sensitive request/user internals such as password hashes, META, session,
+    csrf token internals, etc.
+    """
+    user = getattr(request, "user", None)
+    safe_user = SimpleNamespace(
+        id=getattr(user, "id", None),
+        username=getattr(user, "username", ""),
+        is_authenticated=bool(getattr(user, "is_authenticated", False)),
+        is_staff=bool(getattr(user, "is_staff", False)),
+        is_superuser=bool(getattr(user, "is_superuser", False)),
+    )
+
+    return SimpleNamespace(
+        method=getattr(request, "method", ""),
+        path=getattr(request, "path", ""),
+        user=safe_user,
+    )
+
+
+def users_count(self):
+    """
+    Restrict Group users_count to selected company context
+    """
+    return Employee.objects.filter(employee_user_id__in=self.user_set.all()).count()
+
+
+Group.add_to_class("users_count", property(users_count))
+
+
+# def filtersubordinates(request, queryset, perm=None, field="employee_id"):
+#     """
+#     This method is used to filter out subordinates queryset element.
+#     """
+#     user = request.user
+#     if user.has_perm(perm):
+#         return queryset
+
+#     if not request:
+#         return queryset
+#     if NESTED_SUBORDINATE_VISIBILITY:
+#         current_managers = [
+#             request.user.employee_get.id,
+#         ]
+#         all_subordinates = Q(
+#             **{
+#                 f"{field}__employee_work_info__reporting_manager_id__in": current_managers
+#             }
+#         )
+
+#         while True:
+#             sub_managers = queryset.filter(
+#                 **{
+#                     f"{field}__employee_work_info__reporting_manager_id__in": current_managers
+#                 }
+#             ).values_list(f"{field}__id", flat=True)
+#             if not sub_managers.exists():
+#                 break
+#             current_managers = sub_managers
+#             all_subordinates |= Q(
+#                 **{
+#                     f"{field}__employee_work_info__reporting_manager_id__in": sub_managers
+#                 }
+#             )
+
+#         return queryset.filter(all_subordinates)
+
+#     manager = Employee.objects.filter(employee_user_id=user).first()
+
+#     if field:
+#         filter_expression = f"{field}__employee_work_info__reporting_manager_id"
+#         queryset = queryset.filter(**{filter_expression: manager})
+#         return queryset
+
+#     queryset = queryset.filter(
+#         employee_id__employee_work_info__reporting_manager_id=manager
+#     )
+#     return queryset
+
+
+def filtersubordinates(
+    request,
+    queryset,
+    perm=None,
+    field="employee_id",
+    nested=settings.NESTED_SUBORDINATE_VISIBILITY,
+):
+    """
+    Filters a queryset to include only the current user's subordinates.
+    Respects the user's permission: if the user has `perm`, returns full queryset.
+
+    Args:
+        request: HttpRequest
+        queryset: Django queryset to filter
+        perm: permission codename string
+        field: ForeignKey field pointing to Employee (default "employee_id")
+        nested: if True, include all nested subordinates; else only direct subordinates
+
+    Returns:
+        Filtered queryset
     """
     user = request.user
-    if user.has_perm(perm):
-        return queryset
 
-    manager = Employee.objects.filter(employee_user_id=user).first()
+    if perm and user.has_perm(perm):
+        return queryset  # User has permission to view all
 
-    if field:
-        filter_expression = f"{field}__employee_work_info__reporting_manager_id"
-        queryset = queryset.filter(**{filter_expression: manager})
-        return queryset
+    if not hasattr(user, "employee_get") or user.employee_get is None:
+        return queryset.none()  # No employee associated, return empty
 
-    queryset = queryset.filter(
-        employee_id__employee_work_info__reporting_manager_id=manager
-    )
-    return queryset
+    # Get subordinate employee IDs
+    sub_ids = get_subordinate_employee_ids(request, nested=nested)
+
+    # Include own records explicitly
+    own_id = user.employee_get.id
+
+    # Build filter
+    filter_ids = sub_ids + [own_id] if sub_ids else [own_id]
+
+    # Return filtered queryset
+    return queryset.filter(**{f"{field}__id__in": filter_ids})
 
 
 def filter_own_records(request, queryset, perm=None):
@@ -72,11 +369,41 @@ def filter_own_and_subordinate_recordes(request, queryset, perm=None):
 
 def filtersubordinatesemployeemodel(request, queryset, perm=None):
     """
-    This method is used to filter out subordinates queryset element.
+    This method is used to filter out all subordinates in the entire reporting chain.
     """
     user = request.user
     if user.has_perm(perm):
         return queryset
+
+    if not request:
+        return queryset
+
+    if settings.NESTED_SUBORDINATE_VISIBILITY:
+        # Initialize the set of subordinates with the current manager(s)
+        current_managers = [
+            request.user.employee_get.id,
+        ]
+        all_subordinates = Q(
+            employee_work_info__reporting_manager_id__in=current_managers
+        )
+
+        # Iteratively find subordinates in the chain
+        while True:
+            sub_managers = queryset.filter(
+                employee_work_info__reporting_manager_id__in=current_managers
+            ).values_list("id", flat=True)
+
+            if not sub_managers.exists():
+                break
+
+            current_managers = sub_managers
+            all_subordinates |= Q(
+                employee_work_info__reporting_manager_id__in=sub_managers
+            )
+
+        # Apply the filter to the queryset
+        return queryset.filter(all_subordinates).distinct()
+
     manager = Employee.objects.filter(employee_user_id=user).first()
     queryset = queryset.filter(employee_work_info__reporting_manager_id=manager)
     return queryset
@@ -93,18 +420,100 @@ def is_reportingmanager(request):
         return False
 
 
-def choosesubordinates(
-    request,
-    form,
-    perm,
-):
+# def choosesubordinates(
+#     request,
+#     form,
+#     perm,
+# ):
+#     user = request.user
+#     if user.has_perm(perm):
+#         return form
+#     manager = Employee.objects.filter(employee_user_id=user).first()
+#     queryset = Employee.objects.filter(employee_work_info__reporting_manager_id=manager)
+#     form.fields["employee_id"].queryset = queryset
+#     return form
+
+
+def choosesubordinates(request, form, perm):
+    """
+    Dynamically set subordinate choices for employee field based on permissions
+    and nested subordinate visibility.
+    """
     user = request.user
     if user.has_perm(perm):
         return form
     manager = Employee.objects.filter(employee_user_id=user).first()
-    queryset = Employee.objects.filter(employee_work_info__reporting_manager_id=manager)
-    form.fields["employee_id"].queryset = queryset
+    if not manager:
+        return form
+
+    # Start with direct subordinates
+    current_managers = [manager.id]
+    all_subordinates = Q(employee_work_info__reporting_manager_id__in=current_managers)
+
+    if settings.NESTED_SUBORDINATE_VISIBILITY:
+        # Recursively find all subordinates in the chain
+        while True:
+            sub_managers = Employee.objects.filter(
+                employee_work_info__reporting_manager_id__in=current_managers
+            ).values_list("id", flat=True)
+
+            if not sub_managers.exists():
+                break
+
+            current_managers = sub_managers
+            all_subordinates |= Q(
+                employee_work_info__reporting_manager_id__in=sub_managers
+            )
+
+    queryset = Employee.objects.filter(all_subordinates).distinct()
+
+    # Assign to form field
+    if "employee_id" in form.fields:
+        form.fields["employee_id"].queryset = queryset
+
     return form
+
+
+def get_subordinate_employee_ids(
+    request, nested=settings.NESTED_SUBORDINATE_VISIBILITY
+):
+    """
+    Returns a list of subordinate Employee IDs under the current user.
+
+    If nested=True, includes all subordinates recursively across the reporting hierarchy.
+    If nested=False, includes only direct subordinates.
+    """
+    user = request.user
+    if not hasattr(user, "employee_get"):
+        return []
+
+    manager_id = user.employee_get.id
+
+    if nested:
+        # Recursive approach for all levels
+        current_managers = [manager_id]
+        all_sub_ids = set()
+
+        while current_managers:
+            sub_ids = list(
+                Employee.objects.filter(
+                    employee_work_info__reporting_manager_id__in=current_managers
+                ).values_list("id", flat=True)
+            )
+            if not sub_ids:
+                break
+            all_sub_ids.update(sub_ids)
+            current_managers = sub_ids
+
+        return list(all_sub_ids)
+    else:
+        # Only direct subordinates
+        direct_sub_ids = list(
+            Employee.objects.filter(
+                employee_work_info__reporting_manager_id=manager_id
+            ).values_list("id", flat=True)
+        )
+        return direct_sub_ids
 
 
 def choosesubordinatesemployeemodel(request, form, perm):
@@ -398,6 +807,7 @@ def closest_numbers(numbers: list, input_number: int) -> tuple:
     previous_number = input_number
     next_number = input_number
     try:
+        numbers = list(map(int, numbers))
         index = numbers.index(input_number)
         if index > 0:
             previous_number = numbers[index - 1]
@@ -414,8 +824,71 @@ def closest_numbers(numbers: list, input_number: int) -> tuple:
     return (previous_number, next_number)
 
 
-@login_required
-def export_data(request, model, form_class, filter_class, file_name):
+def format_export_value(value, employee):
+    work_info = EmployeeWorkInformation.objects.filter(employee_id=employee).first()
+    time_format = (
+        work_info.company_id.time_format
+        if work_info and work_info.company_id
+        else "HH:mm"
+    )
+    date_format = (
+        work_info.company_id.date_format
+        if work_info and work_info.company_id
+        else "MMM. D, YYYY"
+    )
+
+    if isinstance(value, time):
+        # Convert the string to a datetime.time object
+        check_in_time = datetime.strptime(str(value).split(".")[0], "%H:%M:%S").time()
+
+        # Print the formatted time for each format
+        for format_name, format_string in settings.SOLICH_TIME_FORMATS.items():
+            if format_name == time_format:
+                value = check_in_time.strftime(format_string)
+
+    elif type(value) == date:
+        # Convert the string to a datetime.date object
+        start_date = datetime.strptime(str(value), "%Y-%m-%d").date()
+        # Print the formatted date for each format
+        for format_name, format_string in settings.SOLICH_DATE_FORMATS.items():
+            if format_name == date_format:
+                value = start_date.strftime(format_string)
+
+    elif isinstance(value, datetime):
+        value = str(value)
+
+    return value
+
+
+def has_export_access(request, model):
+    """
+    Centralized export-access check reused by every export endpoint.
+
+    Superusers always have access. When the "Default Export Access"
+    setting is enabled for the requesting user's current company (or not
+    yet configured for that company), every user of that company may
+    export data. Otherwise access falls back to the per-module
+    ``export_<model>`` permission.
+    """
+    user = request.user
+    if user.is_superuser:
+        return True
+
+    selected_company = request.session.get("selected_company")
+    if not selected_company or selected_company == "all":
+        company = None
+    else:
+        company = Company.objects.filter(id=selected_company).first()
+
+    setting = DefaultExportPermission.objects.filter(company_id=company).first()
+    if setting is None or setting.is_enabled:
+        return True
+
+    export_codename = f"{model._meta.app_label}.export_{model._meta.model_name}"
+    return user.has_perm(export_codename)
+
+
+def export_data(request, model, form_class, filter_class, file_name, perm=None):
     fields_mapping = {
         "male": _("Male"),
         "female": _("Female"),
@@ -439,9 +912,17 @@ def export_data(request, model, form_class, filter_class, file_name):
         "cancelled": _("Cancelled"),
         "rejected": _("Rejected"),
         "cancelled_and_rejected": _("Cancelled & Rejected"),
-        "late_come": _("Late Come"),
-        "early_out": _("Early Out"),
+        "late_come": _("Late Arrival"),
+        "early_out": _("Early Departure"),
     }
+    employee = request.user.employee_get
+
+    from solich.http.response import SolichRedirect
+
+    if not has_export_access(request, model):
+        return SolichRedirect(
+            request, message=_("You dont have access to export this data")
+        )
 
     selected_columns = []
     today_date = date.today().strftime("%Y-%m-%d")
@@ -451,13 +932,31 @@ def export_data(request, model, form_class, filter_class, file_name):
     form = form_class()
     model_fields = model._meta.get_fields()
     export_objects = filter_class(request.GET).qs
+    if perm:
+        export_objects = filtersubordinates(request, export_objects, perm)
+
+    # If the caller selected specific rows in the list view (instance_ids),
+    # export exactly those - not whatever the filter fields happen to match -
+    # same convention as the standalone quick-export button and the Employee
+    # export flow. No selection falls back to the filtered queryset above,
+    # unchanged.
+    instance_ids = request.GET.get("instance_ids")
+    has_instance_ids = False
+    if instance_ids:
+        with contextlib.suppress(ValueError, SyntaxError):
+            instance_ids = ast.literal_eval(instance_ids)
+            if instance_ids:
+                export_objects = model.objects.filter(pk__in=instance_ids)
+                has_instance_ids = True
+
     selected_fields = request.GET.getlist("selected_fields")
 
     if not selected_fields:
         selected_fields = form.fields["selected_fields"].initial
-        ids = request.GET.get("ids")
-        id_list = json.loads(ids)
-        export_objects = model.objects.filter(id__in=id_list)
+        if not has_instance_ids:
+            ids = request.GET.get("ids", "[]")
+            id_list = json.loads(ids)
+            export_objects = model.objects.filter(id__in=id_list)
 
     for field in form.fields["selected_fields"].choices:
         value = field[0]
@@ -487,96 +986,20 @@ def export_data(request, model, form_class, filter_class, file_name):
                     value = _(value.title())
 
                 # Check if the type of 'value' is time
-                if isinstance(value, time):
-                    user = request.user
-                    employee = user.employee_get
-
-                    # Taking the company_name of the user
-                    info = EmployeeWorkInformation.objects.filter(employee_id=employee)
-                    if info.exists():
-                        for data in info:
-                            employee_company = data.company_id
-                        company_name = Company.objects.filter(id=employee_company.id)
-                        emp_company = company_name.first()
-                        # Access the date_format attribute directly
-                        time_format = (
-                            emp_company.time_format if emp_company else "hh:mm A"
-                        )
-                    else:
-                        time_format = "hh:mm A"
-
-                    time_formats = {
-                        "hh:mm A": "%I:%M %p",  # 12-hour format
-                        "HH:mm": "%H:%M",  # 24-hour format
-                    }
-
-                    # Convert the string to a datetime.time object
-                    check_in_time = datetime.strptime(
-                        str(value).split(".")[0], "%H:%M:%S"
-                    ).time()
-
-                    # Print the formatted time for each format
-                    for format_name, format_string in time_formats.items():
-                        if format_name == time_format:
-                            value = check_in_time.strftime(format_string)
-
-                # Check if the type of 'value' is date
-                if type(value) == date:
-                    user = request.user
-                    employee = user.employee_get
-
-                    # Taking the company_name of the user
-                    info = EmployeeWorkInformation.objects.filter(employee_id=employee)
-                    if info.exists():
-                        for data in info:
-                            employee_company = data.company_id
-                        company_name = Company.objects.filter(company=employee_company)
-                        emp_company = company_name.first()
-
-                        # Access the date_format attribute directly
-                        date_format = (
-                            emp_company.date_format if emp_company else "MMM. D, YYYY"
-                        )
-                    else:
-                        date_format = "MMM. D, YYYY"
-                    # Define date formats
-                    date_formats = {
-                        "DD-MM-YYYY": "%d-%m-%Y",
-                        "DD.MM.YYYY": "%d.%m.%Y",
-                        "DD/MM/YYYY": "%d/%m/%Y",
-                        "MM/DD/YYYY": "%m/%d/%Y",
-                        "YYYY-MM-DD": "%Y-%m-%d",
-                        "YYYY/MM/DD": "%Y/%m/%d",
-                        "MMMM D, YYYY": "%B %d, %Y",
-                        "DD MMMM, YYYY": "%d %B, %Y",
-                        "MMM. D, YYYY": "%b. %d, %Y",
-                        "D MMM. YYYY": "%d %b. %Y",
-                        "dddd, MMMM D, YYYY": "%A, %B %d, %Y",
-                    }
-
-                    # Convert the string to a datetime.date object
-                    start_date = datetime.strptime(str(value), "%Y-%m-%d").date()
-
-                    # Print the formatted date for each format
-                    for format_name, format_string in date_formats.items():
-                        if format_name == date_format:
-                            value = start_date.strftime(format_string)
-                if isinstance(value, datetime):
-                    value = str(value)
+                value = format_export_value(value, employee)
                 data_export[verbose_name].append(value)
 
     data_frame = pd.DataFrame(data=data_export)
-    styled_data_frame = data_frame.style.applymap(
-        lambda x: "text-align: center", subset=pd.IndexSlice[:, :]
-    )
 
     response = HttpResponse(content_type="application/ms-excel")
     response["Content-Disposition"] = f'attachment; filename="{file_name}"'
 
     writer = pd.ExcelWriter(response, engine="xlsxwriter")
-    styled_data_frame.to_excel(writer, index=False, sheet_name="Sheet1")
+    data_frame.to_excel(writer, index=False, sheet_name="Sheet1")
+    workbook = writer.book
+    center_format = workbook.add_format({"align": "center"})
     worksheet = writer.sheets["Sheet1"]
-    worksheet.set_column("A:Z", 18)
+    worksheet.set_column("A:Z", 18, center_format)
     writer.close()
 
     return response
@@ -584,25 +1007,85 @@ def export_data(request, model, form_class, filter_class, file_name):
 
 def reload_queryset(fields):
     """
-    This method is used to reload the querysets in the form
+    Reloads querysets in the form based on active filters and selected company.
     """
-    for k, v in fields.items():
-        if isinstance(v, ModelChoiceField):
-            if v.queryset.model == Employee:
-                v.queryset = v.queryset.model.objects.filter(is_active=True)
-            elif v.queryset.model == Candidate:
-                v.queryset = v.queryset.model.objects.filter(is_active=True)
+    request = getattr(_thread_locals, "request", None)
+    selected_company = request.session.get("selected_company") if request else None
+
+    recruitment_installed = apps.is_installed("recruitment")
+    model_filters = {
+        "Employee": {"is_active": True},
+        "Candidate": {"is_active": True} if recruitment_installed else None,
+    }
+
+    for field in fields.values():
+        if not isinstance(field, ModelChoiceField):
+            continue
+
+        model = field.queryset.model
+        model_name = model.__name__
+
+        if model_name == "Company":
+            if selected_company and selected_company != "all":
+                field.queryset = model.objects.filter(id=selected_company)
+            elif selected_company == "all" and request:
+                allowed = getattr(request, "allowed_company_ids", None)
+                if allowed is not None:
+                    field.queryset = model.objects.filter(id__in=allowed)
+                else:
+                    field.queryset = model.objects.all()
             else:
-                v.queryset = v.queryset.model.objects.all()
-    return
+                field.queryset = model.objects.all()
+        elif (filters := model_filters.get(model_name)) is not None:
+            field.queryset = model.objects.filter(**filters)
+        elif model_name == "Permission":
+            # Rendering permission choices calls str(permission), which touches
+            # content_type; without select_related that's one query per permission.
+            field.queryset = model.objects.select_related("content_type").all()
+        else:
+            field.queryset = model.objects.all()
+
+    return fields
 
 
-def check_manager(employee, instance):
+# def check_manager(employee, instance):
+
+
+#     try:
+#         if isinstance(instance, Employee):
+#             return instance.employee_work_info.reporting_manager_id == employee
+#         return employee == instance.employee_id.employee_work_info.reporting_manager_id
+#     except:
+#         return False
+
+
+def check_manager(employee, instance, nested=settings.NESTED_SUBORDINATE_VISIBILITY):
+    """
+    Check if the given employee manages the instance employee.
+    Supports both direct and nested (indirect) checks.
+    """
+
     try:
-        if isinstance(instance, Employee):
-            return instance.employee_work_info.reporting_manager_id == employee
-        return employee == instance.employee_id.employee_work_info.reporting_manager_id
-    except:
+        # Get the target employee
+        target_employee = (
+            instance if isinstance(instance, Employee) else instance.employee_id
+        )
+
+        # Direct manager check
+        direct_manager = target_employee.employee_work_info.reporting_manager_id
+        if not nested:
+            return direct_manager == employee
+
+        # Recursive (nested) manager check
+        current_manager = direct_manager
+        while current_manager:
+            if current_manager == employee:
+                return True
+            current_manager = current_manager.employee_work_info.reporting_manager_id
+
+        return False
+
+    except Exception:
         return False
 
 
@@ -650,64 +1133,379 @@ def link_callback(uri, rel):
     return path
 
 
-def generate_pdf(template_path, context, path=True, title=None, html=True):
-    template_path = template_path
-    context_data = context
-    title = (
-        f"""{context_data.get("employee")}'s payslip for {context_data.get("range")}.pdf"""
-        if not title
-        else title
-    )
+# def generate_pdf(template_path, context, path=True, title=None, html=True):
+#     template_path = template_path
+#     context_data = context
+#     title = (
+#         f"""{context_data.get("employee")}'s payslip for {context_data.get("range")}.pdf"""
+#         if not title
+#         else title
+#     )
+#     response = HttpResponse(content_type="application/pdf")
+#     response["Content-Disposition"] = f"attachment; filename={title}"
 
-    response = HttpResponse(content_type="application/pdf")
-    response["Content-Disposition"] = f"attachment; filename={title}"
+#     if html:
+#         html = template_path
+#     else:
+#         template = get_template(template_path)
+#         html = template.render(context_data)
+
+#     pisa_status = pisa.CreatePDF(
+#         html.encode("utf-8"),
+#         dest=response,
+#         link_callback=link_callback,
+#     )
+
+#     if pisa_status.err:
+#         return HttpResponse("We had some errors <pre>" + html + "</pre>")
+
+#     return response
+
+
+def generate_pdf(template_path, context, path=True, title=None, html=True):
+    title = "Document" if not title else title
 
     if html:
         html = template_path
     else:
-        template = get_template(template_path)
-        html = template.render(context_data)
+        html = render_to_string(template_path, context)
 
-    pisa_status = pisa.CreatePDF(
-        html.encode("utf-8"),
-        dest=response,
-        link_callback=link_callback,
-    )
-
-    if pisa_status.err:
-        return HttpResponse("We had some errors <pre>" + html + "</pre>")
+    response = template_pdf(template=html, html=True, filename=title)
 
     return response
 
 
-def filter_conditional_leave_request(request):
-    approval_manager = Employee.objects.filter(employee_user_id=request.user).first()
-    leave_request_ids = []
-    multiple_approval_requests = LeaveRequestConditionApproval.objects.filter(
-        manager_id=approval_manager
-    )
-    for instance in multiple_approval_requests:
-        if instance.sequence > 1:
-            pre_sequence = instance.sequence - 1
-            leave_request_id = instance.leave_request_id
-            instance = LeaveRequestConditionApproval.objects.filter(
-                leave_request_id=leave_request_id, sequence=pre_sequence
-            ).first()
-            if instance and instance.is_approved:
-                leave_request_ids.append(instance.leave_request_id.id)
-        else:
-            leave_request_ids.append(instance.leave_request_id.id)
-    return LeaveRequest.objects.filter(pk__in=leave_request_ids)
-
-
-def get_pagination():
+def get_pagination(default=20):
     from solich.solich_middlewares import _thread_locals
 
     request = getattr(_thread_locals, "request", None)
     user = request.user
     page = DynamicPagination.objects.filter(user_id=user).first()
-    count = 50
+    count = default
     if page:
         count = page.pagination
     return count
 
+
+def paginator_qry(queryset, page_number):
+    """
+    Common paginator method
+    """
+    paginator = Paginator(queryset, get_pagination())
+    queryset = paginator.get_page(page_number)
+    return queryset
+
+
+def is_holiday(date, employee=None):
+    """
+    Check if the given date is a holiday.
+    Args:
+        date (datetime.date): The date to check.
+        employee: Optional Employee instance. When provided, only non-specific holidays
+                  or specific holidays that include this employee are matched.
+    Returns:
+        Holidays or bool: The Holidays object if the date is a holiday, otherwise False.
+    """
+    holidays = Holidays.objects.filter(
+        Q(start_date__lte=date, end_date__gte=date)
+        | Q(recurring=True, start_date__month=date.month, start_date__day=date.day)
+    )
+    if employee is not None:
+        holidays = holidays.filter(Q(is_specific=False) | Q(employees=employee))
+    holiday = holidays.first()
+    return holiday if holiday else False
+
+
+def is_company_leave(input_date):
+    """
+    Check if the given date is a company leave.
+    Args:
+        input_date (datetime.date): The date to check.
+    Returns:
+        CompanyLeaves or bool: The CompanyLeaves object if the date is a company leave, otherwise False.
+    """
+    # Calculate the week number within the month (0-4) and weekday (0 for Monday to 6 for Sunday)
+    first_day_of_month = input_date.replace(day=1)
+    adjusted_day = (
+        input_date.day + first_day_of_month.weekday()
+    )  # Adjust day based on first day of the month
+    date_week_no = (adjusted_day - 1) // 7  # Calculate the week number (0-based)
+    date_week_day = input_date.weekday()  # Get weekday (0 for Monday to 6 for Sunday)
+
+    # Query for company leaves that match the week number and weekday
+    company_leave = CompanyLeaves.objects.filter(
+        Q(
+            based_on_week=None, based_on_week_day=date_week_day
+        )  # Match week-independent leaves
+        | Q(
+            based_on_week=date_week_no, based_on_week_day=date_week_day
+        )  # Match specific week and weekday
+    ).first()
+
+    return company_leave if company_leave else False
+
+
+def get_date_range(start_date, end_date):
+    """
+    Returns a list of all dates within a given date range.
+
+    Args:
+        start_date (date): The start date of the range.
+        end_date (date): The end date of the range.
+
+    Returns:
+        list: A list of date objects representing all dates within the range.
+
+    Example:
+        start_date = date(2023, 1, 1)
+        end_date = date(2023, 1, 10)
+        date_range = get_date_range(start_date, end_date)
+
+    """
+    date_list = []
+    delta = end_date - start_date
+
+    for i in range(delta.days + 1):
+        current_date = start_date + timedelta(days=i)
+        date_list.append(current_date)
+    return date_list
+
+
+def get_holiday_dates(range_start: date, range_end: date, employee=None) -> list:
+    """
+    :return: this functions returns a list of all holiday dates.
+    """
+    pay_range_dates = get_date_range(start_date=range_start, end_date=range_end)
+    query = Q()
+    for check_date in pay_range_dates:
+        query |= Q(start_date__lte=check_date, end_date__gte=check_date)
+    holidays = Holidays.objects.filter(query)
+    if employee is not None:
+        holidays = holidays.filter(Q(is_specific=False) | Q(employees=employee))
+    holiday_dates = set([])
+    for holiday in holidays:
+        holiday_dates = holiday_dates | (
+            set(
+                get_date_range(start_date=holiday.start_date, end_date=holiday.end_date)
+            )
+        )
+    return list(set(holiday_dates))
+
+
+def get_company_leave_dates(year):
+    """
+    :return: This function returns a list of all company leave dates
+    """
+    company_leaves = CompanyLeaves.objects.all()
+    company_leave_dates = []
+    for company_leave in company_leaves:
+        based_on_week = company_leave.based_on_week
+        based_on_week_day = company_leave.based_on_week_day
+        for month in range(1, 13):
+            if based_on_week is not None:
+                # Set Sunday as the first day of the week
+                calendar.setfirstweekday(6)
+                month_calendar = calendar.monthcalendar(year, month)
+                weeks = month_calendar[int(based_on_week)]
+                weekdays_in_weeks = [day for day in weeks if day != 0]
+                for day in weekdays_in_weeks:
+                    leave_date = datetime.strptime(
+                        f"{year}-{month:02}-{day:02}", "%Y-%m-%d"
+                    ).date()
+                    if (
+                        leave_date.weekday() == int(based_on_week_day)
+                        and leave_date not in company_leave_dates
+                    ):
+                        company_leave_dates.append(leave_date)
+            else:
+                # Set Monday as the first day of the week
+                calendar.setfirstweekday(0)
+                month_calendar = calendar.monthcalendar(year, month)
+                for week in month_calendar:
+                    if week[int(based_on_week_day)] != 0:
+                        leave_date = datetime.strptime(
+                            f"{year}-{month:02}-{week[int(based_on_week_day)]:02}",
+                            "%Y-%m-%d",
+                        ).date()
+                        if leave_date not in company_leave_dates:
+                            company_leave_dates.append(leave_date)
+    return company_leave_dates
+
+
+def get_working_days(start_date, end_date, employee=None):
+    """
+    This method is used to calculate the total working days, total leave, worked days on that period
+
+    Args:
+        start_date (_type_): the start date from the data needed
+        end_date (_type_): the end date till the date needed
+        employee: Optional Employee instance to scope specific holidays.
+    """
+
+    holiday_dates = get_holiday_dates(start_date, end_date, employee)
+
+    # appending company/holiday leaves
+    # Note: Duplicate entry may exist
+    company_leave_dates = (
+        list(
+            set(
+                get_company_leave_dates(start_date.year)
+                + get_company_leave_dates(end_date.year)
+            )
+        )
+        + holiday_dates
+    )
+
+    date_range = get_date_range(start_date, end_date)
+
+    # making unique list of company/holiday leave dates then filtering
+    # the leave dates only between the start and end date
+    company_leave_dates = [
+        date
+        for date in list(set(company_leave_dates))
+        if start_date <= date <= end_date
+    ]
+
+    working_days_between_ranges = list(set(date_range) - set(company_leave_dates))
+    total_working_days = len(working_days_between_ranges)
+
+    return {
+        # Total working days on that period
+        "total_working_days": total_working_days,
+        # All the working dates between the start and end date
+        "working_days_on": working_days_between_ranges,
+        # All the company/holiday leave dates between the range
+        "company_leave_dates": company_leave_dates,
+    }
+
+
+def get_next_month_same_date(date_obj):
+    date_copy = date_obj
+    month = date_obj.month + 1
+    year = date_obj.year
+    if month > 12:
+        month = 1
+        year = year + 1
+    day = date_copy.day
+    total_days_in_month = calendar.monthrange(year, month)[1]
+    day = min(day, total_days_in_month)
+    return date(day=day, month=month, year=year)
+
+
+def get_subordinates(request):
+    """
+    This method is used to filter out subordinates queryset element.
+    """
+    user = request.user.employee_get
+    subordinates = Employee.objects.filter(
+        employee_work_info__reporting_manager_id=user
+    )
+    return subordinates
+
+
+def format_date(date_str):
+    # List of possible date formats to try
+
+    for format_name, format_string in settings.SOLICH_DATE_FORMATS.items():
+        try:
+            return datetime.strptime(date_str, format_string).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format: {date_str}")
+
+
+def eval_validate(value):
+    """
+    Method to validate the dynamic value
+    """
+    value = ast.literal_eval(value)
+    return value
+
+
+def check_chart_permission(request, charts):
+    """
+    Check which dashboard charts the user has permission to view.
+    Args:
+        request: Django request object
+        charts: list of (chart_name, ...) tuples
+    """
+    from base.templatetags.basefilters import is_reportingmanager
+
+    if apps.is_installed("recruitment"):
+        from recruitment.templatetags.recruitmentfilters import is_stagemanager
+    else:
+        is_stagemanager = lambda u: False  # fallback if recruitment not installed
+
+    def has_chart_access(chart_name):
+        config = CHART_CONFIG.get(chart_name)
+        if not config:
+            return False
+
+        # app must be installed
+        if not apps.is_installed(config["app"]):
+            return False
+
+        # check permission
+        perm = config.get("perm")
+        if perm and request.user.has_perm(perm):
+            return True
+
+        # reporting manager check
+        if config.get("need_reporting_manager") and is_reportingmanager(request.user):
+            return True
+
+        # stage manager check
+        if config.get("need_stage_manager") and is_stagemanager(request.user):
+            return True
+
+        # allow unrestricted charts
+        return not perm
+
+    return [chart for chart in charts if has_chart_access(chart[0])]
+
+
+def template_pdf(template, context={}, html=False, filename="payslip.pdf"):
+    """
+    Generate a PDF file from an HTML template and context data.
+
+    Args:
+        template_path (str): The path to the HTML template.
+        context (dict): The context data to render the template.
+        html (bool): If True, return raw HTML instead of a PDF.
+
+    Returns:
+        HttpResponse: A response with the generated PDF file or raw HTML.
+    """
+    try:
+        bootstrap_css = '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">'
+        html_content = f"{bootstrap_css}\n{template}"
+
+        pdf_options = {
+            "page-size": "A4",
+            "margin-top": "10mm",
+            "margin-bottom": "10mm",
+            "margin-left": "10mm",
+            "margin-right": "10mm",
+            "encoding": "UTF-8",
+            "enable-local-file-access": None,
+            "dpi": 300,
+            "zoom": 1.3,
+            "footer-center": "[page]/[topage]",
+        }
+
+        pdf = pdfkit.from_string(html_content, False, options=pdf_options)
+
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f"inline; filename={filename}"
+        return response
+    except Exception as e:
+        return HttpResponse(f"Error generating PDF: {str(e)}", status=500)
+
+
+def generate_otp():
+    """
+    Function to generate a random 6-digit OTP (One-Time Password).
+    Returns:
+        str: A 6-digit random OTP as a string.
+    """
+    return str(random.randint(100000, 999999))

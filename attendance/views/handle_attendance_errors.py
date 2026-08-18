@@ -1,5 +1,13 @@
 """Module for handling attendance error data."""
 
+import uuid
+
+import pandas as pd
+from django.conf import settings
+from django.http import HttpResponse
+
+from solich.methods import remove_dynamic_url
+
 
 def handle_attendance_errors(error_list):
     """
@@ -25,23 +33,21 @@ def handle_attendance_errors(error_list):
         "Check-out": [],
         "Worked hour": [],
         "Minimum hour": [],
-        "Error1": [],
-        "Error2": [],
-        "Error3": [],
-        "Error4": [],
-        "Error5": [],
-        "Error6": [],
-        "Error7": [],
-        "Error8": [],
-        "Error9": [],
-        "Error10": [],
-        "Error11": [],
-        "Error12": [],
-        "Error13": [],
-        "Error14": [],
-        "Error15": [],
-        "Error16": [],
-        "Error17": [],
+        "Badge ID Error": [],
+        "Shift Error": [],
+        "Work Type Error": [],
+        "Check-in Validation Error": [],
+        "Check-out Validation Error": [],
+        "Attendance Error": [],
+        "Attendance Date Validation Error": [],
+        "Check-in Error": [],
+        "Check-out Error": [],
+        "Worked Hours Error": [],
+        "Minimum Hour Error": [],
+        "Attendance Date Error": [],
+        "Check-out Date Error": [],
+        "Check-out Date Error": [],
+        "Other Errors": [],
     }
     for item in error_list:
         for key, value in error_data.items():
@@ -56,6 +62,20 @@ def handle_attendance_errors(error_list):
 
     for key in keys_to_remove:
         del error_data[key]
+    data_frame = pd.DataFrame(error_data, columns=error_data.keys())
+    response = HttpResponse(content_type="application/ms-excel")
+    response["Content-Disposition"] = 'attachment; filename="ImportError.xlsx"'
+    data_frame.to_excel(response, index=False)
 
-    return error_data
+    def get_error_sheet(request):
+        remove_dynamic_url(path_info)
+        return response
 
+    from attendance.urls import path, urlpatterns
+
+    # Create a unique path for the error file download
+    path_info = f"error-sheet-{uuid.uuid4()}"
+    urlpatterns.append(path(path_info, get_error_sheet, name=path_info))
+    settings.DYNAMIC_URL_PATTERNS.append(path_info)
+    path_info = f"attendance/{path_info}"
+    return path_info

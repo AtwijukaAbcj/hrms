@@ -249,7 +249,7 @@
         />
       {% else %}
         <img
-          src="{% static 'images/ui/auth-su-logo.png' %}"
+          src="{% static 'images/ui/auth-logo.png' %}"
           alt="Solich"
         />
       {% endif %}
@@ -259,6 +259,8 @@
   </div>
 
   <script src="{% static 'build/js/web.frontend.min.js' %}"></script>
+
+  <script src="{% url 'javascript-catalog' %}"></script>
 
   <script src="https://code.jquery.com/jquery-3.6.4.min.js"></script>
 

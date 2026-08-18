@@ -1,11 +1,11 @@
 {% load i18n %}
 <section class="oh-wrapper oh-main__topbar" x-data="{searchShow: false}">
   <div class="oh-main__titlebar oh-main__titlebar--left">
-    <h1 class="oh-main__titlebar-title fw-bold mb-0">{{nav_title}}</h1>
+    <h1 class="oh-main__titlebar-title fw-bold mb-0">{{nav_title|safe}}</h1>
     <a
       class="oh-main__titlebar-search-toggle"
       role="button"
-      aria-label="Toggle Search"
+      aria-label="{% trans 'Toggle Search' %}"
       @click="searchShow = !searchShow"
     >
       <ion-icon
@@ -14,7 +14,18 @@
       ></ion-icon>
     </a>
   </div>
-  <form autocomplete="off" id="filterForm" onsubmit="event.preventDefault()" hx-get="{{search_url}}" hx-replace-url="true" hx-target="{{search_swap_target}}" class="oh-main__titlebar oh-main__titlebar--right">
+  {% if search_url %}
+  <form autocomplete="off"
+    id="filterForm"
+    onsubmit="event.preventDefault()"
+    hx-get="{{search_url}}"
+    hx-trigger="load, submit"
+    hx-replace-url="false"
+    hx-target="{{search_swap_target}}"
+    hx-on:submit="htmxLoadIndicator(this);"
+    class="oh-main__titlebar oh-main__titlebar--right"
+  >
+    <input type="text" name="nav_url" value="{{request.path}}" hidden>
     <div class="oh-input-group oh-input__search-group" id="searchGroup">
       <ion-icon
         name="search-outline"
@@ -24,8 +35,8 @@
         type="text"
         class="oh-input oh-input__icon"
         name="search"
-        aria-label="Search Input"
-        placeholder="Search"
+        aria-label="{% trans 'Search Input' %}"
+        placeholder="{% trans 'Search' %}"
         autocomplete="false"
         autofocus ="true"
         onkeyup="
@@ -54,7 +65,7 @@
       />
       {% if search_in %}
       <input type="text" hidden name="search_field">
-      <div class="custom-dropdown" id="dropdown">
+      <div class="custom-dropdown" id="dropdown" style="z-index: 1000 !important;">
         <ul class="search_content">
           {% for option in search_in %}
           <li>
@@ -73,11 +84,18 @@
       {% if view_types %}
       <ul class="oh-view-types">
         {% for type in view_types %}
-        <li class="oh-view-type" onclick="$(this).closest('form').attr('hx-get','{{type.url}}');$(this).closest('form').find('#applyFilter').click();
+        <li class="oh-view-type" data-url="{{type.url}}" data-type="{{type.type}}" hx-get="{% url "active-hnv-view-type" %}?view={{type.type}}&path={{request.path}}" hx-swap="none" onclick="$(this).closest('form').attr('hx-get','{{type.url}}?&referrer={{request.META.HTTP_REFERER}}&{{request.GET.urlencode}}');$(this).closest('form').find('#applyFilter').click();
            ">
           <a class="oh-btn oh-btn--view" {{type.attrs|safe}}
           ><ion-icon name="{{type.icon}}"></ion-icon
           ></a>
+          {% if active_view.type == type.type %}
+          <script>
+            $("form#filterForm.oh-main__titlebar oh-main__titlebar--right").attr('hx-get','{{type.url}}');
+            $(".oh-view-types .oh-view-type[data-type={{type.type}}] a").addClass("oh-btn--view-active")
+
+          </script>
+          {% endif %}
         </li>
         {% endfor %}
       </ul>
@@ -100,9 +118,32 @@
             <button
              type="submit"
              id="applyFilter"
-             onclick="filterCountUpdate('filterForm')"
+             onclick="
+             filterCountUpdate('filterForm');
+              // if (event.isTrusted) {
+                var formData = new FormData($('#filterForm')[0]);
+                var filterData = {};
+                formData.forEach((value, key) => {
+                    if (filterData[key]) {
+                        filterData[key] = [].concat(filterData[key], value);
+                    } else {
+                        filterData[key] = value;
+                    }
+                });
+                $.ajax({
+                  type: 'get',
+                  url: `{% url 'last-applied-filter' %}`,
+                  data: filterData,
+                  traditional:true,
+                  success: function (response) {
+
+                  }
+                });
+
+              // }
+             "
              class="oh-btn oh-btn--secondary oh-btn--small w-100">
-              {% trans "Filter" %}
+              {% trans "Apply" %}
             </button>
           </div>
         </div>
@@ -119,7 +160,7 @@
       {% if group_by_fields %}
       <div class="oh-dropdown" x-data="{open: false}">
         <button class="oh-btn ml-2" @click="open = !open" onclick="event.preventDefault()">
-          <ion-icon name="library-outline" class="mr-1 md hydrated" role="img" aria-label="library outline"></ion-icon>
+          <ion-icon name="library-outline" class="mr-1 md hydrated" role="img" aria-label="{% trans 'library outline' %}"></ion-icon>
           {% trans "Group By" %}
           <div id="filterCount"></div>
         </button>
@@ -129,7 +170,7 @@
             <div class="row">
               <div class="col-sm-12 col-md-12 col-lg-6">
                 <div class="oh-input-group">
-                  <label class="oh-label" for="id_field">{% trans "Field" %}</label>
+                  <label class="oh-label" for="id_field">{% trans "Fields" %}</label>
                 </div>
               </div>
               <div class="col-sm-12 col-md-12 col-lg-6">
@@ -173,6 +214,8 @@
       <input type="hidden" id="pageInput">
       <input type="hidden" id="sortInput">
     </form>
+    {% endif %}
+
     {% if create_attrs %}
     <a
       class="oh-btn oh-btn--secondary ml-2"
@@ -182,7 +225,7 @@
         name="add-sharp"
         class="mr-1 md hydrated"
         role="img"
-        aria-label="add sharp"
+        aria-label="{% trans 'add sharp' %}"
       ></ion-icon
       >{% trans "Create" %}
     </a>
@@ -190,6 +233,36 @@
 
   </div>
   <script>
+    var form = $('#filterForm')[0];
+    var data ={{last_filter|safe}}
+    for (const key in data) {
+      const field = form.elements[key];
+      if ({{empty_inputs|safe}}.includes(key)) {
+        continue
+      }
+      const value = data[key][0];  // Get the first element in the array
+
+      if (field) {
+        if (field.type === 'checkbox') {
+          field.checked = value === 'on';
+        } else if (field.type === 'select-multiple') {
+          // Handle multiple select fields
+          Array.from(field.options).forEach(option => {
+            option.selected = data[key].includes(option.value);
+          });
+        } else {
+          field.value = value;  // Set the value for other input types
+        }
+      }
+    }
+    setTimeout(() => {
+      $(".oh-btn--view-active").click();
+      {% if apply_first_filter %}
+      if (!$(".oh-btn--view-active").length) {
+        $("#applyFilter").click()
+      }
+      {% endif %}
+    }, 100);
     $(".oh-btn--view").click(function (e) {
       e.preventDefault();
       $(".oh-btn--view-active").removeClass("oh-btn--view-active");
@@ -215,8 +288,13 @@
 <script>
   filterCountUpdate("filterForm")
   $(document).ready(function () {
-    $("#filterForm select").select2("destroy")
-    $("#filterForm select").parent().find("span").remove()
-    $("#filterForm select").select2()
+    // Only initialize filter selects that the global initializer (htmxSelect2.js)
+    // hasn't already handled — avoids double-init and the stray-widget cleanup it
+    // previously required.
+    $("#filterForm select").each(function () {
+      if (!$(this).hasClass("select2-hidden-accessible")) {
+        $(this).select2({ width: '100%' });
+      }
+    });
   });
 </script>

@@ -1,49 +1,33 @@
 {% extends 'index.html' %}
-{% block content %} {% load static %}
-<style>
-  .loan-type{
-    background: #73bbe12b;
-    font-size: .8rem;
-    padding: 4px 8px;
-    border-radius: 10px;
-    margin-bottom: 6px;
-    font-weight: 600;
-    color: #357579;
-  }
-</style>
-  {% load i18n %}
-  {% include 'payroll/loan/nav.html' %}
-  <div id="loanContainer">
-    {% if records %}
-      {% include 'payroll/loan/records_card.html' %}
-    {% else %}
-      {% include 'filter_tags.html' %}
-      <main :class="sidebarOpen ? 'oh-main__sidebar-visible' : ''">
-        <div class="oh-wrapper">
-          <div class="oh-404">
-              <img style="    width: 150px;height: 150px;" src="{% static 'images/ui/loan.png' %}" class="oh-404__image mb-4" alt="Page not found. 404."/>
-              <h5 class="oh-404__subtitle">{% trans "There are currently no loans to consider." %}</h5>
-          </div>
-        </div>
-      </main>
-    {% endif %}
-  </div>
-  <div class="oh-modal" id="loanModal" role="dialog" aria-hidden="true">
-    <div class="oh-modal__dialog" style="max-width: 550px">
-      <div class="oh-modal__dialog-header">
-        <button type="button" class="oh-modal__close" aria-label="Close"><ion-icon name="close-outline"></ion-icon></button>
-      </div>
-
-      <div class="oh-modal__dialog-body" id="loanModalBody"></div>
+{% block content %}
+    {% load static %}
+    <style>
+        .loan-type {
+            margin-bottom: 6px;
+            padding: 4px 8px;
+            border-radius: 10px;
+            background: #73bbe12b;
+            color: #357579;
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+    </style>
+    {% load i18n %}
+    {% include 'payroll/loan/nav.html' %}
+    <div id="loanContainer">
+        {% if records %}
+            {% include 'payroll/loan/records_card.html' %}
+        {% else %}
+            {% include 'filter_tags.html' %}
+            <div class="oh-empty">
+                <img
+                    src="{% static 'images/ui/search.svg' %}"
+                    class="oh-404__image"
+                    alt="{% trans 'Page not found. 404.' %}"
+                >
+                <h1 class="oh-empty__title">{% trans "No Records found." %}</h1>
+                <p class="oh-empty__subtitle">{% trans "There are currently no loans to consider." %}</p>
+            </div>
+        {% endif %}
     </div>
-  </div>
-  <div class="oh-modal" id="viewInstallmentModal" role="dialog" aria-hidden="true">
-    <div class="oh-modal__dialog" style="max-width: 550px">
-      {% comment %} <div class="oh-modal__dialog-header">
-        <button type="button" class="oh-modal__close" aria-label="Close"><ion-icon name="close-outline"></ion-icon></button>
-      </div> {% endcomment %}
-
-      <div class="oh-modal__dialog oh-modal__dialog-relative" id="viewInstallmentModalBody"></div>
-    </div>
-  </div>
 {% endblock %}

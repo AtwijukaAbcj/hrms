@@ -69,6 +69,7 @@
 						href="#"
 						id="ticketsBulkDelete"
 						class="oh-dropdown__link oh-dropdown__link--danger"
+						data-action="delete"
 						onclick = "ticketsBulkDelete(event)"
 						>{% trans "Delete" %}</a
 					>
@@ -93,7 +94,7 @@
 						name="add-outline"
 						class="me-1 md hydrated"
 						role="img"
-						aria-label="add outline"
+						aria-label="{% trans 'add outline' %}"
 					></ion-icon>
 					{% trans "Create" %}
 				</button>
@@ -117,7 +118,7 @@
 			<h2 class="oh-modal__dialog-title" id="createTitle">
 				{% trans "Create Ticket" %}
 			</h2>
-			<button class="oh-modal__close" aria-label="Close">
+			<button class="oh-modal__close" aria-label={% trans 'Close' %}>
 				<ion-icon name="close-outline"></ion-icon>
 			</button>
 		</div>
@@ -137,7 +138,7 @@
 			<h2 class="oh-modal__dialog-title" id="editTitle">
 				{% trans "Update Ticket" %}
 			</h2>
-			<button class="oh-modal__close" aria-label="Close">
+			<button class="oh-modal__close" aria-label={% trans 'Close' %}>
 				<ion-icon name="close-outline"></ion-icon>
 			</button>
 		</div>

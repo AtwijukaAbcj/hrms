@@ -5,6 +5,7 @@ This module is used to register scheduled tasks
 """
 
 import json
+import sys
 from datetime import date, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -53,23 +54,24 @@ def generate_payslip(date, companies, all):
     # Remove duplicates if an employee has multiple active contracts
     active_employees = active_employees.distinct()
     # find the date range
-    start_date = date - relativedelta(months=1)
-    end_date = date - timedelta(days=1)
+    period_start = date - relativedelta(months=1)
+    period_end = date - timedelta(days=1)
     # Payslip creation
     for employee in active_employees:
         payslip = Payslip.objects.filter(
-            employee_id=employee, start_date=start_date, end_date=end_date
+            employee_id=employee, start_date=period_start, end_date=period_end
         ).first()
         if payslip:
             continue
         contract = Contract.objects.filter(
             employee_id=employee, contract_status="active"
         ).first()
-        if end_date < contract.contract_start_date:
+        if period_end < contract.contract_start_date:
             continue
-        if start_date < contract.contract_start_date:
-            start_date = contract.contract_start_date
-        payslip_data = payroll_calculation(employee, start_date, end_date)
+        # A contract starting mid-period shortens only that employee's payslip,
+        # so the adjusted start must stay local to this iteration.
+        start_date = max(period_start, contract.contract_start_date)
+        payslip_data = payroll_calculation(employee, start_date, period_end)
         payslip_data["payslip"] = payslip
         data = {}
         data["employee"] = employee
@@ -137,8 +139,11 @@ def auto_payslip_generate():
                 generate_payslip(date=date.today(), companies=companies, all=False)
 
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(expire_contract, "interval", hours=4)
-scheduler.add_job(auto_payslip_generate, "interval", hours=3)
-scheduler.start()
-
+if not any(
+    cmd in sys.argv
+    for cmd in ["makemigrations", "migrate", "compilemessages", "flush", "shell"]
+):
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(expire_contract, "interval", hours=4)
+    scheduler.add_job(auto_payslip_generate, "interval", hours=3)
+    scheduler.start()

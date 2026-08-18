@@ -1,13 +1,15 @@
 """
-Solich_automation/signals.py
+solich_automation/signals.py
 
 """
 
 import copy
 import logging
 import threading
+import time
 import types
 
+from bs4 import BeautifulSoup
 from django import template
 from django.core.mail import EmailMessage
 from django.db import models
@@ -15,8 +17,11 @@ from django.db.models.query import QuerySet
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 
+from base.methods import build_safe_template_request, sanitize_mail_template_body
 from solich.solich_middlewares import _thread_locals
+from solich.models import has_xss
 from solich.signals import post_bulk_update, pre_bulk_update
+from notifications.signals import notify
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +39,29 @@ setattr(QuerySet, "from_list", from_list)
 
 SIGNAL_HANDLERS = []
 INSTANCE_HANDLERS = []
+REFRESH_METHODS = {}
 
 
 def start_automation():
     """
     Automation signals
     """
+    from base.models import SolichMailTemplate
     from solich_automations.methods.methods import get_model_class, split_query_string
     from solich_automations.models import MailAutomation
 
     @receiver(post_delete, sender=MailAutomation)
     @receiver(post_save, sender=MailAutomation)
-    def automation_pre_create(sender, instance, **kwargs):
+    def automation_signal(sender, instance, **kwargs):
+        """
+        signal method to handle automation post save
+        """
+        start_connection()
+        track_previous_instance()
+
+    @receiver(post_delete, sender=SolichMailTemplate)
+    @receiver(post_save, sender=SolichMailTemplate)
+    def template_signal(sender, instance, **kwargs):
         """
         signal method to handle automation post save
         """
@@ -60,6 +76,8 @@ def start_automation():
             post_save.disconnect(handler, sender=handler.model_class)
             post_bulk_update.disconnect(handler, sender=handler.model_class)
         SIGNAL_HANDLERS.clear()
+
+    REFRESH_METHODS["clear_connection"] = clear_connection
 
     def create_post_bulk_update_handler(automation, model_class, query_strings):
         def post_bulk_update_handler(sender, queryset, *args, **kwargs):
@@ -81,10 +99,10 @@ def start_automation():
                         )
 
             previous_bulk_record = getattr(_thread_locals, "previous_bulk_record", None)
-            previous_queryset = None
+            previous_queryset_copy = []
             if previous_bulk_record:
-                previous_queryset = previous_bulk_record["queryset"]
-                previous_queryset_copy = previous_bulk_record["queryset_copy"]
+                previous_queryset = previous_bulk_record.get("queryset", None)
+                previous_queryset_copy = previous_bulk_record.get("queryset_copy", [])
 
             bulk_thread = threading.Thread(
                 target=_bulk_update_thread_handler,
@@ -171,6 +189,8 @@ def start_automation():
             post_save.connect(
                 dynamic_signal_handler, sender=dynamic_signal_handler.model_class
             )
+
+    REFRESH_METHODS["start_connection"] = start_connection
 
     def create_pre_bulk_update_handler(automation, model_class):
         def pre_bulk_update_handler(sender, queryset, *args, **kwargs):
@@ -333,7 +353,8 @@ def send_mail(request, automation, instance):
     mail sending method
     """
     from base.backends import ConfiguredEmailBackend
-    from base.methods import generate_pdf
+    from base.methods import eval_validate, generate_pdf
+    from employee.models import Employee
     from solich_automations.methods.methods import (
         get_model_class,
         get_related_field_model,
@@ -341,39 +362,151 @@ def send_mail(request, automation, instance):
     from solich_views.templatetags.generic_template_filters import getattribute
 
     mail_template = automation.mail_template
-    pk = getattribute(instance, automation.mail_details)
+    employees = []
+    to_emails = []
+
+    if instance.pk:
+        # refreshing instance due to m2m fields are not loading here some times
+        time.sleep(0.1)
+        instance = instance._meta.model.objects.get(pk=instance.pk)
+
+    pk_or_text = getattribute(instance, automation.mail_details)
     model_class = get_model_class(automation.model)
     model_class = get_related_field_model(model_class, automation.mail_details)
-    mail_to_instance = model_class.objects.filter(pk=pk).first()
-    tos = []
-    for mapping in eval(automation.mail_to):
-        tos.append(getattribute(mail_to_instance, mapping))
-    to = tos[:1]
-    cc = tos[1:]
+    context_instance = None
+    if isinstance(pk_or_text, int):
+        context_instance = model_class.objects.filter(pk=pk_or_text).first()
+
+    for mapping in eval_validate(automation.mail_to):
+        result = getattribute(instance, mapping)
+        if isinstance(result, list):
+            to_emails.extend(result)
+        else:
+            to_emails.append(result)
+
+    to_emails = list(filter(None, set(to_emails)))
+
+    employees = Employee.objects.filter(
+        models.Q(email__in=to_emails)
+        | models.Q(employee_work_info__email__in=to_emails)
+    ).select_related("employee_work_info")
+
+    employees = list(employees)
+    try:
+        also_sent_to = automation.also_sent_to.select_related(
+            "employee_work_info"
+        ).all()
+        if also_sent_to.exists():
+            employees.extend(emp for emp in also_sent_to if emp)
+    except Exception as e:
+        logger.error(e)
+
+    cc_emails = [str(emp.get_mail()) for emp in also_sent_to if emp and emp.get_mail()]
+    user_ids = [emp.employee_user_id for emp in employees]
+
+    to = to_emails
+    cc = cc_emails
+
     email_backend = ConfiguredEmailBackend()
-    host = email_backend.dynamic_from_email_with_display_name
-    if mail_to_instance and request:
+    default_email = email_backend.dynamic_from_email_with_display_name
+
+    from_email = default_email
+    reply_to = [default_email]
+
+    if request and hasattr(request, "user") and hasattr(request.user, "employee_get"):
+        try:
+            user = request.user.employee_get
+            display_email_name = f"{user.get_full_name()} <{user.get_mail()}>"  # 983
+            from_email = display_email_name
+            reply_to = [display_email_name]
+        except Exception as e:
+            logger.error(f"Error generating user-based email display name: {e}")
+
+    if pk_or_text and request and to_emails:
         attachments = []
         try:
             sender = request.user.employee_get
         except:
             sender = None
-        for template_attachment in automation.template_attachments.all():
-            template_bdy = template.Template(template_attachment.body)
-            context = template.Context({"instance": mail_to_instance, "self": sender})
-            render_bdy = template_bdy.render(context)
-            attachments.append(
-                (
-                    "Document",
-                    generate_pdf(render_bdy, {}, path=False, title="Document").content,
-                    "application/pdf",
-                )
-            )
+        # Automation bodies/titles are admin-authored Django template source
+        # stored in the DB, rendered here with real employee/instance data and
+        # (for attachments) fed to wkhtmltopdf. sanitize_mail_template_body()
+        # strips forbidden attribute access (password, META, session, ...) and
+        # forbidden tags; build_safe_template_request() keeps `request` usable
+        # in templates without exposing its sensitive internals.
+        safe_request = build_safe_template_request(request)
+        if context_instance:
+            if template_attachments := automation.template_attachments.all():
+                for template_attachment in template_attachments:
+                    template_bdy = template.Template(
+                        sanitize_mail_template_body(template_attachment.body)
+                    )
+                    context = template.Context(
+                        {
+                            "instance": context_instance,
+                            "self": sender,
+                            "model_instance": instance,
+                            "request": safe_request,
+                        }
+                    )
+                    render_bdy = template_bdy.render(context)
+                    # A blocklist over the raw template source can be bypassed
+                    # by splitting a dangerous tag across separate {{ }}
+                    # expressions that only combine into e.g. "<script>" once
+                    # rendered. Re-check the actual rendered HTML -- the thing
+                    # that's about to reach wkhtmltopdf (which runs with
+                    # local-file-access enabled) -- not just the source.
+                    if has_xss(render_bdy):
+                        logger.error(
+                            "Automation '%s': rendered attachment body failed "
+                            "the post-render XSS check; skipping this PDF "
+                            "attachment.",
+                            automation.title,
+                        )
+                        continue
+                    attachments.append(
+                        (
+                            "Document",
+                            generate_pdf(
+                                render_bdy, {}, path=False, title="Document"
+                            ).content,
+                            "application/pdf",
+                        )
+                    )
 
-        template_bdy = template.Template(mail_template.body)
-        context = template.Context({"instance": mail_to_instance, "self": sender})
+            template_bdy = template.Template(
+                sanitize_mail_template_body(mail_template.body)
+            )
+        else:
+            template_bdy = template.Template(sanitize_mail_template_body(pk_or_text))
+        context = template.Context(
+            {
+                "instance": context_instance,
+                "self": sender,
+                "model_instance": instance,
+                "request": safe_request,
+            }
+        )
         render_bdy = template_bdy.render(context)
-        email = EmailMessage(automation.title, render_bdy, host, to=to, cc=cc)
+
+        title_template = template.Template(
+            sanitize_mail_template_body(automation.title)
+        )
+        title_context = template.Context(
+            {"instance": instance, "self": sender, "request": safe_request}
+        )
+        render_title = title_template.render(title_context)
+        soup = BeautifulSoup(render_bdy, "html.parser")
+        plain_text = soup.get_text(separator="\n")
+
+        email = EmailMessage(
+            subject=render_title,
+            body=render_bdy,
+            to=to,
+            cc=cc,
+            from_email=from_email,
+            reply_to=reply_to,
+        )
         email.content_subtype = "html"
 
         email.attachments = attachments
@@ -381,11 +514,35 @@ def send_mail(request, automation, instance):
         def _send_mail(email):
             try:
                 email.send()
+                logger.info(
+                    f"Automation <Mail> {automation.title} is triggered by {request.user.employee_get}"
+                )
             except Exception as e:
                 logger.error(e)
 
-        thread = threading.Thread(
-            target=lambda: _send_mail(email),
-        )
-        thread.start()
+        def _send_notification(text):
+            notify.send(
+                sender,
+                recipient=user_ids,
+                verb=f"{text}",
+                icon="person-remove",
+                redirect="",
+            )
+            logger.info(
+                f"Automation <Notification> {automation.title} is triggered by {request.user.employee_get}"
+            )
 
+        if automation.delivery_channel != "notification":
+            thread = threading.Thread(
+                target=lambda: _send_mail(email),
+            )
+            thread.start()
+
+        if automation.delivery_channel != "email":
+            thread = threading.Thread(
+                target=lambda: _send_notification(plain_text),
+            )
+            thread.start()
+        logger.info(
+            f"Automation Triggered | {automation.get_delivery_channel_display()} | {automation}"
+        )

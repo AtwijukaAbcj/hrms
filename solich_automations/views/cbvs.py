@@ -1,13 +1,23 @@
 """
-Solich_automations/views/cbvs.py
+solich_automations/views/cbvs.py
 """
 
-from django.contrib import messages
-from django.urls import reverse_lazy
-from django.utils.decorators import method_decorator
-from django.utils.translation import gettext_lazy as _trans
+import json
+import os
+from typing import Any
 
-from solich.decorators import login_required, permission_required
+from django.conf import settings
+from django.contrib import messages
+from django.core import serializers
+from django.http import HttpResponse
+from django.shortcuts import redirect, render
+from django.urls import reverse, reverse_lazy
+from django.utils.decorators import method_decorator
+from django.utils.translation import gettext_lazy as _
+from django.views import View
+
+from base.models import SolichMailTemplate
+from solich.decorators import hx_request_required, login_required, permission_required
 from solich_automations import models
 from solich_automations.filters import AutomationFilter
 from solich_automations.forms import AutomationForm
@@ -16,11 +26,12 @@ from solich_views.generic.cbv import views
 
 @method_decorator(login_required, name="dispatch")
 @method_decorator(
-    permission_required("Solich_automation.view_mailautomation"), name="dispatch"
+    permission_required("solich_automations.view_mailautomation"), name="dispatch"
 )
 class AutomationSectionView(views.SolichSectionView):
     """
-    AutomationSectionView
+    Legacy standalone Mail Automations page. Migrated into Settings > Mail;
+    redirect direct visits to the settings page.
     """
 
     nav_url = reverse_lazy("mail-automations-nav")
@@ -28,15 +39,18 @@ class AutomationSectionView(views.SolichSectionView):
     view_container_id = "listContainer"
 
     script_static_paths = [
-        "static/automation/automation.js",
+        "/automation/automation.js",
     ]
 
-    template_name = "Solich_automations/section_view.html"
+    template_name = "solich_automations/section_view.html"
+
+    def get(self, request, *args, **kwargs):
+        return redirect("mail-automations-view")
 
 
 @method_decorator(login_required, name="dispatch")
 @method_decorator(
-    permission_required("Solich_automation.view_mailautomation"), name="dispatch"
+    permission_required("solich_automations.view_mailautomation"), name="dispatch"
 )
 class AutomationNavView(views.SolichNavView):
     """
@@ -45,21 +59,49 @@ class AutomationNavView(views.SolichNavView):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.create_attrs = f"""
-            hx-get="{reverse_lazy("create-automation")}"
-            hx-target="#genericModalBody"
-            data-target="#genericModal"
-            data-toggle="oh-modal-toggle"
-        """
+        self.actions = []
+        if self.request.user.has_perm("solich_automations.add_mailautomation"):
+            self.create_attrs = f"""
+                hx-get="{reverse_lazy("create-automation")}"
+                hx-target="#genericModalBody"
+                data-target="#genericModal"
+                data-toggle="oh-modal-toggle"
+            """
 
-    nav_title = _trans("Automations")
+            self.actions.append(
+                {
+                    "action": _("Load Automations"),
+                    "attrs": f"""
+                        data-toggle="oh-modal-toggle"
+                        data-target="#genericModal"
+                        hx-target="#genericModalBody"
+                        hx-get="{reverse_lazy('load-automations')}"
+                        style="cursor: pointer;"
+                    """,
+                }
+            )
+
+        if self.request.user.has_perm("solich_automations.add_mailautomation"):
+            self.actions.append(
+                {
+                    "action": _("Refresh Automations"),
+                    "attrs": f"""
+                        hx-get="{reverse_lazy('refresh-automations')}"
+                        hx-target="#reloadMessages"
+                        class="oh-btn oh-btn--light-bkg"
+                    """,
+                }
+            )
+
+    nav_title = _("Mail Automations")
     search_url = reverse_lazy("mail-automations-list-view")
     search_swap_target = "#listContainer"
+    template_name = "generic/inline_nav.html"
 
 
 @method_decorator(login_required, name="dispatch")
 @method_decorator(
-    permission_required("Solich_automation.change_mailautomation"), name="dispatch"
+    permission_required("solich_automations.change_mailautomation"), name="dispatch"
 )
 class AutomationFormView(views.SolichFormView):
     """
@@ -68,14 +110,17 @@ class AutomationFormView(views.SolichFormView):
 
     form_class = AutomationForm
     model = models.MailAutomation
-    new_display_title = _trans("New Automation")
-    template_name = "Solich_automations/automation_form.html"
+    new_display_title = _("New Automation")
+    template_name = "solich_automations/automation_form.html"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.view_id = "automation"
 
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
         instance = models.MailAutomation.objects.filter(pk=self.kwargs["pk"]).first()
         kwargs["instance"] = instance
-
         return kwargs
 
     def form_valid(self, form: AutomationForm) -> views.HttpResponse:
@@ -84,15 +129,14 @@ class AutomationFormView(views.SolichFormView):
             if form.instance.pk:
                 message = "Automation updated"
             form.save()
-
-            messages.success(self.request, _trans(message))
+            messages.success(self.request, _(message))
             return self.HttpResponse()
         return super().form_valid(form)
 
 
 @method_decorator(login_required, name="dispatch")
 @method_decorator(
-    permission_required("Solich_automation.view_mailautomation"), name="dispatch"
+    permission_required("solich_automations.view_mailautomation"), name="dispatch"
 )
 class AutomationListView(views.SolichListView):
     """
@@ -115,8 +159,8 @@ class AutomationListView(views.SolichListView):
             "action": "Edit",
             "icon": "create-outline",
             "attrs": """
-                class="oh-btn oh-btn--light-bkg w-100"
-                hx-get="{edit_url}"
+                class="oh-btn oh-btn--light-bkg oh-btn--sq-sm"
+                hx-get="{edit_url}?instance_ids={ordered_ids}"
                 hx-target="#genericModalBody"
                 data-target="#genericModal"
                 data-toggle="oh-modal-toggle"
@@ -126,7 +170,7 @@ class AutomationListView(views.SolichListView):
             "action": "Delete",
             "icon": "trash-outline",
             "attrs": """
-            class="oh-btn oh-btn--light-bkg w-100 tex-danger"
+            class="oh-btn oh-btn--danger oh-btn--sq-sm"
             onclick="
                 event.stopPropagation();
                 confirm('Do you want to delete the automation?','{delete_url}')
@@ -134,17 +178,19 @@ class AutomationListView(views.SolichListView):
             """,
         },
     ]
-
+    header_attrs = {"action": "style='width:100px;'"}
     columns = [
         ("Title", "title"),
         ("Model", "model"),
+        ("Trigger", "trigger_display"),
+        ("Delivery Channel", "get_delivery_channel_display"),
         ("Email Mapping", "get_mail_to_display"),
     ]
 
 
 @method_decorator(login_required, name="dispatch")
 @method_decorator(
-    permission_required("Solich_automation.view_mailautomation"), name="dispatch"
+    permission_required("solich_automations.view_mailautomation"), name="dispatch"
 )
 class AutomationDetailedView(views.SolichDetailedView):
     """
@@ -152,39 +198,121 @@ class AutomationDetailedView(views.SolichDetailedView):
     """
 
     model = models.MailAutomation
-    title = "Detailed View"
+    title = _("Detailed View")
     header = {
         "title": "title",
         "subtitle": "title",
         "avatar": "get_avatar",
     }
     body = [
-        ("Model", "model"),
-        ("Mail Templates", "mail_template"),
-        ("Mail To", "get_mail_to_display"),
-        ("Trigger", "trigger_display"),
+        (_("Model"), "model"),
+        (_("Mail Templates"), "mail_template"),
+        (_("Mail To"), "get_mail_to_display"),
+        (_("Mail Cc"), "get_mail_cc_display"),
+        (_("Trigger"), "trigger_display"),
     ]
-    actions = [
-        {
-            "action": "Edit",
-            "icon": "create-outline",
-            "attrs": """
-            hx-get="{edit_url}"
-            hx-target="#genericModalBody"
-            data-toggle="oh-modal-toggle"
-            data-target="#genericModal"
-            class="oh-btn oh-btn--info w-50"
-            """,
-        },
-        {
-            "action": "Delete",
-            "icon": "trash-outline",
-            "attrs": """
-            class="oh-btn oh-btn--danger w-50"
-            onclick="
-                confirm('Do you want to delete the automation?','{delete_url}')
-            "
-            """,
-        },
-    ]
+    action_method = "detail_view_actions"
 
+
+@method_decorator(login_required, name="dispatch")
+@method_decorator(hx_request_required, name="dispatch")
+@method_decorator(
+    permission_required("solich_automations.add_mailautomation"), name="dispatch"
+)
+class LoadAutomationsView(View):
+    template_name = "solich_automations/load_automation.html"
+    template_file = os.path.join(settings.BASE_DIR, "load_data", "mail_templates.json")
+    automation_file = os.path.join(
+        settings.BASE_DIR, "load_data", "mail_automations.json"
+    )
+
+    def load_json_files(self):
+        with open(self.template_file, "r") as tf:
+            templates_raw = json.load(tf)
+        with open(self.automation_file, "r") as af:
+            automations_raw = json.load(af)
+        return templates_raw, automations_raw
+
+    def get(self, request):
+        templates_raw, automations_raw = self.load_json_files()
+
+        template_lookup = {item["pk"]: item["fields"]["body"] for item in templates_raw}
+
+        processed_automations = []
+        for automation in automations_raw:
+            processed = automation.copy()
+            template_pk = automation["fields"].get("mail_template")
+            processed["template_body"] = template_lookup.get(template_pk, "")
+            processed_automations.append(processed)
+
+        return render(
+            request,
+            self.template_name,
+            {"automations": processed_automations},
+        )
+
+    def post(self, request):
+        templates_raw, automations_raw = self.load_json_files()
+
+        template_lookup = {item["pk"]: item["fields"]["body"] for item in templates_raw}
+
+        selected_ids = [int(k) for k in request.POST.keys() if k.isdigit()]
+        selected_automations = [a for a in automations_raw if a["pk"] in selected_ids]
+
+        required_template_pks = {
+            a["fields"].get("mail_template")
+            for a in selected_automations
+            if a["fields"].get("mail_template")
+        }
+
+        for template_json in templates_raw:
+            if template_json["pk"] in required_template_pks:
+                template_data = list(
+                    serializers.deserialize("json", json.dumps([template_json]))
+                )[0].object
+                existing = SolichMailTemplate.objects.filter(
+                    title=template_data.title
+                ).first()
+                if not existing:
+                    template_data.pk = None
+                    template_data.save()
+
+        for automation_json in selected_automations:
+            deserialized = list(
+                serializers.deserialize("json", json.dumps([automation_json]))
+            )[0]
+            automation_obj = deserialized.object
+
+            template_pk = automation_json["fields"].get("mail_template")
+            template_body = template_lookup.get(template_pk)
+            mail_template = SolichMailTemplate.objects.filter(
+                body=template_body
+            ).first()
+            automation_obj.mail_template = mail_template
+
+            if not models.MailAutomation.objects.filter(
+                title=automation_obj.title
+            ).exists():
+                automation_obj.pk = None
+                automation_obj.save()
+
+                messages.success(
+                    request,
+                    _("Automation '%(automation_obj_title)s' added successfully.")
+                    % {"automation_obj_title": automation_obj.title},
+                )
+            else:
+                messages.warning(
+                    request,
+                    _("Automation '%(automation_obj_title)s' already exists.")
+                    % {"automation_obj_title": automation_obj.title},
+                )
+
+        script = """
+            <script>
+                $("#reloadMessagesButton").click();
+                $('#applyFilter').click();
+                $('.oh-modal--show').first().removeClass('oh-modal--show');
+            </script>
+        """
+        return HttpResponse(script)

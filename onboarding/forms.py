@@ -27,76 +27,24 @@ from typing import Any
 
 from django import forms
 from django.contrib.auth.forms import UserCreationForm as UserForm
-from django.contrib.auth.models import User
 from django.forms import DateInput, ValidationError
 from django.template.loader import render_to_string
 from django.utils.translation import gettext_lazy as _
 
+from base.forms import ModelForm
 from base.methods import reload_queryset
 from employee.filters import EmployeeFilter
 from employee.models import Employee, EmployeeBankDetails
-from solich import solich_middlewares
+from solich_auth.models import SolichUser
 from solich_widgets.widgets.solich_multi_select_field import SolichMultiSelectField
 from solich_widgets.widgets.select_widgets import SolichMultiSelectWidget
-from onboarding.models import CandidateTask, OnboardingStage, OnboardingTask
+from onboarding.models import (
+    CandidateStage,
+    CandidateTask,
+    OnboardingStage,
+    OnboardingTask,
+)
 from recruitment.models import Candidate
-
-
-class ModelForm(forms.ModelForm):
-    """
-    Overriding django default model form to apply some styles
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        request = getattr(solich_middlewares._thread_locals, "request", None)
-        reload_queryset(self.fields)
-        for _, field in self.fields.items():
-            widget = field.widget
-
-            if isinstance(widget, (forms.DateInput)):
-                field.initial = date.today()
-
-            if isinstance(widget, (forms.DateInput)):
-                field.widget.attrs.update({"class": "oh-input  w-100"})
-            elif isinstance(
-                widget, (forms.NumberInput, forms.EmailInput, forms.TextInput)
-            ):
-                field.widget.attrs.update(
-                    {"class": "oh-input w-100", "placeholder": field.label}
-                )
-            elif isinstance(widget, (forms.Select,)):
-                field.widget.attrs.update(
-                    {"class": "oh-select oh-select-2 select2-hidden-accessible"}
-                )
-            elif isinstance(widget, (forms.Textarea)):
-                field.widget.attrs.update(
-                    {
-                        "class": "oh-input w-100",
-                        "placeholder": field.label,
-                        "rows": 2,
-                        "cols": 40,
-                    }
-                )
-            elif isinstance(
-                widget,
-                (
-                    forms.CheckboxInput,
-                    forms.CheckboxSelectMultiple,
-                ),
-            ):
-                field.widget.attrs.update({"class": "oh-switch__checkbox"})
-            try:
-                self.fields["employee_id"].initial = request.user.employee_get
-            except:
-                pass
-
-            try:
-                self.fields["company_id"].initial = (
-                    request.user.employee_get.get_company
-                )
-            except:
-                pass
 
 
 class UserCreationFormCustom(UserForm):
@@ -156,21 +104,6 @@ class UserCreationFormCustom(UserForm):
                 field.widget.attrs.update({"class": "oh-switch__checkbox"})
 
 
-class OnboardingStageForm(ModelForm):
-    """
-    Form for OnboardingStage model
-    """
-
-    class Meta:
-        """
-        Meta class to add additional info
-        """
-
-        model = OnboardingStage
-        fields = "__all__"
-        exclude = ["sequence", "is_active"]
-
-
 class OnboardingCandidateForm(ModelForm):
     """
     Form for Candidate model
@@ -208,7 +141,7 @@ class OnboardingCandidateForm(ModelForm):
 
 class UserCreationForm(UserCreationFormCustom):
     """
-    Form for User model
+    Form for SolichUser model
     """
 
     class Meta:
@@ -216,7 +149,7 @@ class UserCreationForm(UserCreationFormCustom):
         Meta class to add some additional options
         """
 
-        model = User
+        model = SolichUser
         fields = ["password1", "password2"]
 
 
@@ -236,6 +169,7 @@ class OnboardingViewTaskForm(ModelForm):
         queryset=Employee.objects.all(),
         # widget=forms.SelectMultiple(attrs={"class": "select2-hidden-accessible "})
     )
+    is_required = forms.BooleanField(required=False, label=_("Is Required"))
 
     class Meta:
         """
@@ -267,21 +201,14 @@ class OnboardingViewTaskForm(ModelForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=True,
                 instance=self.instance,
             ),
-            label="Task Managers",
+            label=_("Task Managers"),
         )
         reload_queryset(self.fields)
-        stage = self.initial.get("stage_id")
-        if stage:
-            # Adjust the queryset based on the 'stage'
-            candidate_ids = stage.candidate.all().values_list("candidate_id", flat=True)
-            cand_queryset = Candidate.objects.filter(id__in=candidate_ids)
-            self.fields["candidates"].queryset = cand_queryset
-            self.fields["candidates"].initial = cand_queryset
 
 
 class OnboardingTaskForm(ModelForm):
@@ -296,7 +223,7 @@ class OnboardingTaskForm(ModelForm):
 
         model = OnboardingTask
         fields = "__all__"
-        exclude = ["stage_id", "is_active"]
+        exclude = ["is_active"]
         widgets = {
             "candidates": forms.SelectMultiple(
                 attrs={"class": "oh-select oh-select-2 w-100 select2-hidden-accessible"}
@@ -310,12 +237,12 @@ class OnboardingTaskForm(ModelForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=True,
                 instance=self.instance,
             ),
-            label="Task Managers",
+            label=self.fields["employee_id"].label,
         )
         stage_id = self.initial.get("stage_id")
         if stage_id:
@@ -342,21 +269,22 @@ class OnboardingViewStageForm(ModelForm):
     Form for OnboardingStageModel
     """
 
-    verbose_name = "Stage"
-
     class Meta:
         """
         Meta class for add some additional options
         """
 
         model = OnboardingStage
-        fields = ["stage_title", "employee_id", "is_final_stage"]
+        fields = ["stage_title", "employee_id", "is_final_stage", "recruitment_id"]
         labels = {
             "stage_title": _("Stage Title"),
             "is_final_stage": _("Is Final Stage"),
         }
 
     def __init__(self, *args, **kwargs):
+        """
+        Initializes the form with custom field settings and widgets.
+        """
         super().__init__(*args, **kwargs)
         reload_queryset(self.fields)
         self.fields["employee_id"] = SolichMultiSelectField(
@@ -364,12 +292,12 @@ class OnboardingViewStageForm(ModelForm):
             widget=SolichMultiSelectWidget(
                 filter_route_name="employee-widget-filter",
                 filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
+                filter_instance_context_name="f",
                 filter_template_path="employee_filters.html",
                 required=True,
                 instance=self.instance,
             ),
-            label="Stage Managers",
+            label=self.fields["employee_id"].label,
         )
 
         # Loop through form fields and generate unique IDs for their attributes
@@ -384,7 +312,7 @@ class OnboardingViewStageForm(ModelForm):
         Render the form fields as HTML table rows with Bootstrap styling.
         """
         context = {"form": self}
-        table_html = render_to_string("common_form.html", context)
+        table_html = render_to_string("solich_form.html", context)
         return table_html
 
     def clean(self):
@@ -409,7 +337,7 @@ class EmployeeCreationForm(ModelForm):
     zip = forms.CharField(required=True, label=_("Zip"))
     qualification = forms.CharField(required=True, label=_("Qualification"))
     experience = forms.IntegerField(required=True, label=_("Experience"))
-    children = forms.IntegerField(required=True, label=_("Childrens"))
+    children = forms.IntegerField(required=True, label=_("Children"))
     emergency_contact = forms.CharField(
         required=True, label=_("Emergency Contact Number")
     )
@@ -433,6 +361,8 @@ class EmployeeCreationForm(ModelForm):
             "email",
             "is_active",
             "additional_info",
+            "is_from_onboarding",
+            "is_directly_converted",
         )
         widgets = {
             "dob": DateInput(attrs={"type": "date"}),
@@ -476,3 +406,42 @@ class BankDetailsCreationForm(ModelForm):
         fields = "__all__"
         exclude = ["employee_id", "additional_info", "is_active"]
 
+
+class StageChangeForm(forms.ModelForm):
+    """
+    StageChangeForm
+    """
+
+    class Meta:
+        """
+        Meta class for additional options
+        """
+
+        model = CandidateStage
+        fields = [
+            "onboarding_stage_id",
+        ]
+
+    def clean(self):
+        cleaned_data = super().clean()
+        new_stage = cleaned_data.get("onboarding_stage_id")
+        old_stage = self.instance.onboarding_stage_id
+        if (
+            new_stage
+            and old_stage
+            and new_stage.sequence is not None
+            and old_stage.sequence is not None
+        ):
+            pending_tasks = self.instance.pending_required_tasks(old_stage)
+            if pending_tasks.exists():
+                task_titles = ", ".join(
+                    pending_tasks.values_list("task_title", flat=True)
+                )
+                raise forms.ValidationError(
+                    _(
+                        "Complete the following required task(s) before "
+                        "moving to the next stage: %(tasks)s"
+                    )
+                    % {"tasks": task_titles}
+                )
+        return cleaned_data

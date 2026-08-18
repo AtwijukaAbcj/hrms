@@ -1,5 +1,5 @@
 {% load basefilters %}
-{% load i18n %}
+{% load i18n static %}
 
 {% if messages %}
 <div class="oh-wrapper">
@@ -19,7 +19,7 @@
     <div class="">
         <div>
             <span class="oh-timeoff-title fw-bold" style="display: block;">{% trans "There is no comments to show." %}</span>
-            <img style="display: block;width: 100px;margin: 20px auto ;" src="/static/images/ui/comment.png" class="">
+            <img style="display: block;width: 100px;margin: 20px auto ;" src="{% static "/images/ui/comment.png" %}" class="">
         </div>
     </div>
 </div>
@@ -32,7 +32,7 @@
                 <div>
                     <span class="oh-timeoff-modal__stat-title fw-bold">{% trans "Comment" %}
                     <a hx-get="{% url 'allocation-request-delete-comment' comment.id %}" hx-target="#shiftRequestDetailTarget" title="{% trans 'Delete Comment' %}">
-                        <ion-icon name="close-circle-outline" class="text-danger ms-3 mt-1" aria-label="close outline"></ion-icon></a>
+                        <ion-icon name="close-circle-outline" class="text-danger ms-3 mt-1" aria-label="{% trans 'close outline' %}"></ion-icon></a>
                     </span>
                     <div>
                         <span class="oh-timeoff-title fw-bold">{{comment.comment}}</span>
